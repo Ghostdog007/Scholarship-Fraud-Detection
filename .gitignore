@@ -1,0 +1,11 @@
+# Exclude datasets folder as requested by the user
+datasets/
+
+# Exclude virtual environment
+.venv/
+
+# Exclude python cache and notebooks checkpoints
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.ipynb
