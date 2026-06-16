@@ -380,7 +380,121 @@ in the related area, but do not resolve them autonomously:
   new data or use the saved `selected_features.json`?
 - [ ] **External data integration:** AISHE/DISE institute enrollment data would
   unlock rules UA–UI. This is out of scope for v1 but should be flagged.
+- [ ] **Focal Loss vs Binary Cross-Entropy:** Should LightGBM switch to Focal Loss
+  to reduce threshold strictness? Requires testing PR-AUC delta.
+- [ ] **SHAP-based second-pass feature pruning:** After the first full pipeline run,
+  mean SHAP values can be used to drop near-zero features from selected_features.json
+  for a tighter, self-validating feature set.
+
+---
+
+## 11. Research-Backed Improvement Decisions (Approved by Project Lead — v1.1)
+<!-- SOURCE: Researched June 2026 via PLOS 2024, ResearchGate, PoliMi DSAEE, TechScience 2024 -->
+<!-- STATUS: Pending implementation — do not implement without explicit instruction -->
+
+These are **locked-in next steps** approved after synthetic anomaly testing revealed
+specific model blind spots. All agents must be aware of these before touching either file.
+
+---
+
+### 11.1 Relational Boolean Flags (Target: `feature_selection.py`)
+
+**Problem identified:** `feature_selection.py` runs `select_dtypes(include=[np.number])`
+which permanently deletes all text and categorical columns before any model sees them.
+This made the model completely blind to identity-match fraud (applicant_name == father_name).
+
+**Research backing:** SCIRP 2024 and fraud-detection-handbook.github.io confirm that
+"relational aggregate features" are the highest-value feature category in tabular fraud.
+
+**Decision:** Add the following 6 boolean policy flags in `engineer_features()` inside
+`feature_selection.py`, BEFORE the `select_dtypes` call:
+
+```python
+# File: feature_selection.py — add inside engineer_features()
+df['is_name_match_father']  = (df['applicant_name'] == df['father_name']).astype(int)
+df['is_name_match_mother']  = (df['applicant_name'] == df['mother_name']).astype(int)
+df['is_income_below_10k']   = (pd.to_numeric(df['annual_family_income'], errors='coerce') <= 10000).astype(int)
+df['is_income_below_20k']   = (pd.to_numeric(df['annual_family_income'], errors='coerce') <= 20000).astype(int)
+df['is_prematric_overage']  = ((df['pre_post_matric'] == 1) & (df['age_at_registration'] > 20)).astype(int)
+df['is_postmatric_overage'] = ((df['pre_post_matric'] == 2) & (df['age_at_registration'] > 35)).astype(int)
+```
+
+**Agent rule:** These 6 flags must NEVER be dropped by the MI or mRMR filters.
+Add them to a `protected_features` list that bypasses the cutoff logic.
+
+---
+
+### 11.2 Loosen Feature Selection Cutoffs (Target: `feature_selection.py`)
+
+**Problem identified:** `MI_KEEP_RATIO = 0.5` and `MRMR_MAX_FEATURES = 20` discard
+critical fraud signals that have moderate MI scores but high domain relevance (e.g.
+`annual_family_income` which was lost in the synthetic test).
+
+**Research backing:** PoliMi Deep Sparse Autoencoder Ensemble (DSAEE 2024) recommends
+keeping features with reconstruction-error relevance, not just MI relevance. A hard cap
+of 20 on a 136-column dataset is overly aggressive.
+
+**Decision:** Update the constants in `feature_selection.py`:
+```python
+# Old values — too aggressive
+MI_KEEP_RATIO    = 0.5
+MRMR_MAX_FEATURES = 20
+
+# New values — approved v1.1
+MI_KEEP_RATIO    = 0.8
+MRMR_MAX_FEATURES = 40
+```
+
+---
+
+### 11.3 LightGBM Classifier Tuning (Target: `vae_detection.py`)
+
+**Problem identified:** Synthetic anomaly test returned an optimal threshold of `0.9935`.
+This extreme conservatism is caused by binary cross-entropy treating all 14,996 clean
+records with equal weight, drowning out the 750 fraud signals.
+
+**Research backing:** TechScience 2024 and ResearchGate (Cost-sensitive Focal Loss for
+fraud) confirm that `extra_trees=True` + increased `n_estimators` improves minority class
+recall without SMOTE. Focal Loss (Facebook AI, Lin et al. 2017) is the gold standard fix.
+
+**Decision:** Update `train_lgbm()` in `vae_detection.py`:
+```python
+# Old
+clf = lgb.LGBMClassifier(
+    n_estimators=100,
+    scale_pos_weight=scale_pos_weight,
+    random_state=42
+)
+
+# New — approved v1.1
+clf = lgb.LGBMClassifier(
+    n_estimators=200,
+    scale_pos_weight=scale_pos_weight,
+    extra_trees=True,
+    min_child_samples=5,
+    random_state=42
+)
+```
+
+**Future option (flag before implementing):** Switch to XGBoost with
+`eval_metric='aucpr'` and native Focal Loss for a further threshold improvement.
+
+---
+
+### 11.4 SHAP-Based Second-Pass Feature Pruning (Target: `evaluate_model.py`)
+
+**Research backing:** PoliMi DSAEE 2024 — using the downstream classifier's own
+attention (via SHAP) as a filter to remove features that the model never actually uses.
+
+**Decision:** After running the full pipeline once, `evaluate_model.py` should compute
+mean absolute SHAP values per feature across all 15,000 applications and output a
+pruned feature list, dropping anything with mean |SHAP| below a threshold (e.g., 0.001).
+This creates a self-validating, data-driven feature set for the next training cycle.
+
+**Status:** Not yet implemented. Flag this as an open question before implementing.
 
 ---
 <!-- END OF AGENT CONTEXT FILE -->
-<!-- Total sections: 10 | Estimated tokens: ~1,800 | Human-curated: YES -->
+<!-- Total sections: 11 | Estimated tokens: ~2,400 | Human-curated: YES -->
+<!-- Last updated: 2026-06 | Reason: Post synthetic anomaly test findings + research -->
+
