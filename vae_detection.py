@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import argparse
+from feature_selection import engineer_features
 
 # Rule Weights
 WEIGHTS = {
@@ -21,6 +22,8 @@ WEIGHTS = {
     'MOBILE_FATHER_MISMATCH': 2.0, # UN
     'BOARD_DUPLICATE': 2.0 # X9, X10
 }
+
+ALL_BRIDGES = {'IP_CONC_ENG', 'YF_ENG', 'YF_MOTHER_ENG', 'FM_ENG', 'FEE_ENG', 'INC_EXT_ENG', 'UN_FATHER_ENG', 'X1_ENG', 'X7_ENG'}
 
 class VAE(nn.Module):
     def __init__(self, input_dim, hidden_dim=64, latent_dim=16):
@@ -67,6 +70,13 @@ def vae_loss(recon_x, x, mu, logvar):
     return recon_loss + kl_divergence
 
 def train_vae(df_features, valid_mask, epochs=50, batch_size=256):
+    # Seed for reproducibility — ensures vae_reconstruction_prob is stable
+    # across runs so PR-AUC deltas reflect real changes, not random init noise.
+    torch.manual_seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"VAE Device: {device}")
     
@@ -78,7 +88,10 @@ def train_vae(df_features, valid_mask, epochs=50, batch_size=256):
     x_all = torch.tensor(x_scaled, dtype=torch.float32)
     
     dataset = TensorDataset(x_train)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    _generator = torch.Generator()
+    _generator.manual_seed(42)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                            generator=_generator)
     
     input_dim = x_train.shape[1]
     model = VAE(input_dim=input_dim).to(device)
@@ -106,7 +119,10 @@ def train_vae(df_features, valid_mask, epochs=50, batch_size=256):
         
     return recon_prob
 
-def apply_rules(df):
+def apply_rules(df, enabled_bridges=None):
+    if enabled_bridges is None:
+        enabled_bridges = ALL_BRIDGES
+        
     rules_fired = pd.Series('', index=df.index, dtype=object)
     rule_scores = pd.Series(0.0, index=df.index)
     
@@ -178,6 +194,51 @@ def apply_rules(df):
             cond_un = (mob_father_nunique > 1) & df['mobile_no'].notna()
             add_violation(cond_un, 'UN', WEIGHTS['MOBILE_FATHER_MISMATCH'])
 
+    # --- Layer 1 Relational Violations ---
+    if 'mobile_application_count' in df.columns:
+        cond_mob_agg = df['mobile_application_count'] >= 11
+        add_violation(cond_mob_agg, 'YK_AGG', WEIGHTS['MOBILE_CONCENTRATION'])
+
+    if 'ip_application_count' in df.columns and 'IP_CONC_ENG' in enabled_bridges:
+        cond_ip_agg = df['ip_application_count'] >= 15
+        add_violation(cond_ip_agg, 'IP_CONC', WEIGHTS['MOBILE_CONCENTRATION'])
+
+    if 'mobile_unique_fathers_count' in df.columns and 'UN_FATHER_ENG' in enabled_bridges:
+        cond_multi_father = df['mobile_unique_fathers_count'] > 1
+        add_violation(cond_multi_father, 'UN_AGG', WEIGHTS['MOBILE_FATHER_MISMATCH'])
+
+    if 'is_applicant_name_eq_father' in df.columns and 'YF_ENG' in enabled_bridges:
+        cond_name_flag = df['is_applicant_name_eq_father'] == 1
+        add_violation(cond_name_flag, 'YF_FLAG', WEIGHTS['NAME_MATCH'])
+
+    if 'is_applicant_name_eq_mother' in df.columns and 'YF_MOTHER_ENG' in enabled_bridges:
+        cond_name_mother = df['is_applicant_name_eq_mother'] == 1
+        add_violation(cond_name_mother, 'YF_MOTHER', WEIGHTS['NAME_MATCH'])
+
+    if 'is_father_name_eq_mother' in df.columns and 'FM_ENG' in enabled_bridges:
+        cond_father_mother = df['is_father_name_eq_mother'] == 1
+        add_violation(cond_father_mother, 'FM_ENG', WEIGHTS['NAME_MATCH'])
+
+    if 'flag_income_below_10000' in df.columns:
+        cond_income_flag = df['flag_income_below_10000'] == 1
+        add_violation(cond_income_flag, 'X13_FLAG', WEIGHTS['INCOME_VIOLATION'])
+
+    if 'flag_fee_exceeds_income' in df.columns and 'FEE_ENG' in enabled_bridges:
+        cond_fee_flag = df['flag_fee_exceeds_income'] == 1
+        add_violation(cond_fee_flag, 'FEE_EXCEED', WEIGHTS['INCOME_VIOLATION'])
+
+    if 'flag_postmatric_age_over35' in df.columns and 'X7_ENG' in enabled_bridges:
+        cond_age_flag = df['flag_postmatric_age_over35'] == 1
+        add_violation(cond_age_flag, 'X7_FLAG', WEIGHTS['AGE_VIOLATION'])
+
+    if 'flag_prematric_age_over20' in df.columns and 'X1_ENG' in enabled_bridges:
+        cond_age_flag2 = df['flag_prematric_age_over20'] == 1
+        add_violation(cond_age_flag2, 'X1_FLAG', WEIGHTS['AGE_VIOLATION'])
+
+    if 'flag_income_extreme_low' in df.columns and 'INC_EXT_ENG' in enabled_bridges:
+        cond_extreme_low = df['flag_income_extreme_low'] == 1
+        add_violation(cond_extreme_low, 'INCOME_EXTREME', WEIGHTS['INCOME_VIOLATION'])
+
     rules_fired = rules_fired.str.rstrip(',')
     return rule_scores, rules_fired
 
@@ -211,8 +272,10 @@ def train_lgbm(df_features, vae_prob, rule_scores):
         scale_pos_weight = num_neg / num_pos
         
     clf = lgb.LGBMClassifier(
-        n_estimators=100,
+        n_estimators=200,
         scale_pos_weight=scale_pos_weight,
+        extra_trees=True,
+        min_child_samples=5,
         random_state=42
     )
     clf.fit(X, y)
@@ -235,13 +298,17 @@ def train_lgbm(df_features, vae_prob, rule_scores):
         top_features = [feature_names[idx] for idx in top_indices]
         top_shap_features.append(','.join(top_features))
         
-    return preds, top_shap_features
+    mean_shap_values = np.abs(shap_vals).mean(axis=0)
+    shap_summary = {feature_names[i]: float(mean_shap_values[i]) for i in range(len(feature_names))}
+        
+    return preds, top_shap_features, shap_summary
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', type=str, default='datasets/data_for_ml_model.csv')
     parser.add_argument('--features_json', type=str, default='selected_features.json')
     parser.add_argument('--output_csv', type=str, default='risk_scores.csv')
+    parser.add_argument('--disabled_bridges', type=str, default='')
     args = parser.parse_args()
 
     print("Starting VAE Detection Pipeline...")
@@ -259,6 +326,39 @@ def main():
             
     with open(args.features_json, 'r') as f:
         feature_data = json.load(f)
+
+    # --- INTERFACE CONTRACT GUARD ---
+    if 'dropped_features' in feature_data:
+        raise RuntimeError(
+            f"CONTRACT VIOLATION: {args.features_json} contains a 'dropped_features' "
+            "key. This file was written by the SHAP pruner, not feature_selection.py. "
+            "Delete it and re-run feature_selection.py to regenerate a clean file. "
+            "The SHAP pruner must write to selected_features_shap_pruned.json instead."
+        )
+
+    REQUIRED_ENGINEERED = [
+        'mobile_application_count', 'ip_application_count',
+        'flag_income_below_10000', 'flag_income_below_20000',
+        'is_applicant_name_eq_father', 'is_applicant_name_eq_mother',
+        'flag_fee_exceeds_income', 'flag_postmatric_age_over35',
+        'flag_prematric_age_over20', 'name_similarity_score',
+        'mobile_unique_fathers_count'
+    ]
+    selected_features = feature_data.get('selected_features', [])
+    missing = [f for f in REQUIRED_ENGINEERED if f not in selected_features]
+    if len(missing) >= 4:
+        # 4+ missing = structural failure (file-overwrite bug or Fix B not applied)
+        raise RuntimeError(
+            f"CONTRACT VIOLATION: {args.features_json} is missing {len(missing)} "
+            f"engineered features: {missing}. Re-run feature_selection.py. If this "
+            "list is empty after re-running, Fix B has not been applied yet."
+        )
+    elif missing:
+        # 1-3 missing = legitimate correlation pruning on this dataset variant
+        print(f"WARNING: {len(missing)} engineered feature(s) were pruned by "
+              f"correlation filter (likely >0.98 correlated): {missing}")
+    # --- END GUARD ---
+
     selected_features = feature_data.get('selected_features', [])
     
     if not os.path.exists(args.data_path):
@@ -282,6 +382,11 @@ def main():
         
     print(f"Loaded dataset with {len(df)} records.")
     
+    # Engineer features so that columns like is_applicant_name_eq_father,
+    # ip_application_count, etc. exist in df before the feature filter runs.
+    # Without this, the raw CSV lacks these columns and they get silently dropped.
+    df = engineer_features(df)
+    
     available_features = [f for f in selected_features if f in df.columns]
     if not available_features:
         print("Error: None of the selected features are present in the dataset.")
@@ -292,19 +397,40 @@ def main():
     
     # Stage A: VAE
     print("Stage A: Training VAE...")
-    valid_mask = df['sanity'].isnull().values
-    if not valid_mask.any():
-        valid_mask = np.ones(len(df), dtype=bool)
+    # Treat all records as valid for VAE training as they do not violate rules locally
+    valid_mask = np.ones(len(df), dtype=bool)
         
     vae_prob = train_vae(df_features, valid_mask)
     
     # Stage B: Rule-Based Weak Label Generator
     print("Stage B: Generating rule-based weak labels...")
-    rule_scores, rules_fired = apply_rules(df)
+    
+    # Merge engineered columns into df for rule evaluation
+    # Only merge columns that apply_rules() now references
+    engineered_cols = [
+        'mobile_application_count', 'ip_application_count',
+        'mobile_unique_fathers_count', 'is_applicant_name_eq_father',
+        'is_applicant_name_eq_mother', 'flag_income_below_10000',
+        'flag_fee_exceeds_income', 'flag_postmatric_age_over35',
+        'flag_prematric_age_over20', 'flag_income_extreme_low'
+    ]
+    cols_to_merge = [c for c in engineered_cols if c in df_features.columns
+                     and c not in df.columns]
+    if cols_to_merge:
+        df = df.join(df_features[cols_to_merge])
+        
+    disabled_bridges = set([b.strip() for b in args.disabled_bridges.split(',') if b.strip()])
+    enabled_bridges = ALL_BRIDGES - disabled_bridges
+        
+    rule_scores, rules_fired = apply_rules(df, enabled_bridges=enabled_bridges)
     
     # Stage C: LightGBM Classifier
     print("Stage C: Training LightGBM classifier...")
-    lgbm_preds, shap_features = train_lgbm(df_features, vae_prob, rule_scores)
+    lgbm_preds, shap_features, shap_summary = train_lgbm(df_features, vae_prob, rule_scores)
+    
+    with open('shap_summary.json', 'w') as f:
+        json.dump(shap_summary, f, indent=2)
+    print("Saved SHAP summary to shap_summary.json")
     
     # Final Output
     app_ids = df['application_id'] if 'application_id' in df.columns else np.arange(len(df))

@@ -3,6 +3,7 @@ import numpy as np
 from sklearn.metrics import average_precision_score, f1_score, matthews_corrcoef, brier_score_loss, precision_recall_curve
 import os
 import argparse
+import json
 
 def main():
     parser = argparse.ArgumentParser()
@@ -86,6 +87,46 @@ def main():
             print(f"       VAE Normality:  {vae_prob:.4f} (Lower = more anomalous)")
             print(f"       Rules Fired:    {rules_fired if pd.notnull(rules_fired) and rules_fired != '' else 'None'}")
             print(f"       Top Explanations (SHAP): {shap_feats}")
+
+    # 3. SHAP-Based Second-Pass Feature Pruning
+    shap_summary_file = 'shap_summary.json'
+    features_json_file = 'selected_features.json'
+    if os.path.exists(shap_summary_file) and os.path.exists(features_json_file):
+        print(f"\n[3] SHAP-Based Second-Pass Feature Pruning")
+        with open(shap_summary_file, 'r') as f:
+            shap_summary = json.load(f)
+        with open(features_json_file, 'r') as f:
+            feature_data = json.load(f)
+            
+        original_features = feature_data.get('selected_features', [])
+        
+        pruned_features = []
+        dropped_features = []
+        for feat in original_features:
+            shap_val = shap_summary.get(feat, 0.0)
+            if shap_val >= 0.001:
+                pruned_features.append(feat)
+            else:
+                dropped_features.append(feat)
+                
+        print(f"    Original feature count: {len(original_features)}")
+        print(f"    Features dropped (mean |SHAP| < 0.001): {len(dropped_features)}")
+        if dropped_features:
+            for df_feat in dropped_features:
+                print(f"      - {df_feat} (SHAP: {shap_summary.get(df_feat, 0.0):.6f})")
+        print(f"    Pruned feature count: {len(pruned_features)}")
+        
+        pruned_data = {
+            "selected_features": pruned_features,
+            "dropped_features": dropped_features,
+            "mean_shap_per_feature": shap_summary,
+            "shap_prune_threshold": 0.001,
+            "source_file": "selected_features.json",
+            "pipeline_run_timestamp": feature_data.get("pipeline_run_timestamp", "")
+        }
+        with open('selected_features_shap_pruned.json', 'w') as f:
+            json.dump(pruned_data, f, indent=2)
+        print("    Saved pruned feature list to selected_features_shap_pruned.json")
 
     print("\nEvaluation complete.")
 
