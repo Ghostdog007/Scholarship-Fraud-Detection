@@ -368,27 +368,21 @@ achieved by predicting everything as valid).
 **Threshold tuning:** Sweep `[0.2, 0.8]` in steps of `0.02` on validation set.
 Select threshold maximising F1 on the positive class.
 
-**Baseline performance as of v1.2 (June 2026) and v1.3 (seeded run):**
-
-| Metric | v1.2 (unseeded) | v1.3 (seeded, post FM_ENG bridge) |
-|---|---|---|
-| PR-AUC | 0.9904 | 0.9906 |
-| Best F1-Score | 0.9502 | 0.9509 |
-| MCC | 0.9426 | 0.9434 |
-| Brier Score | 0.0301 | 0.0299 |
-| Optimal Threshold | 0.7650 | 0.7749 |
-| Positive weak labels | 1,984 of 15,000 | 1,986 of 15,000 |
-| Features used by LightGBM | 50 of 56 | 50 of 56 |
-| Features pruned by SHAP | 11 | 11 |
+| Metric | v1.4 Canonical Run (2026-06-17) |
+|---|---|
+| PR-AUC | 0.9906 |
+| Best F1-Score | 0.9509 |
+| MCC | 0.9434 |
+| Brier Score | 0.0299 |
+| Optimal Threshold | 0.7749 |
+| Positive weak labels | 1,986 of 15,000 |
+| Features used by LightGBM | 50 of 56 |
+| Features pruned by SHAP | 11 |
 
 > Any future change that drops PR-AUC below 0.95 or MCC below 0.90 must be
 > investigated before merging. These are the floor values for both baselines.
 >
-> **Note on label count (v1.2 → v1.3):** The verified v1.2 baseline was 1,984
-> positive weak labels (stale `risk_scores.csv`, 2026-06-16). The FM_ENG bridge
-> (`is_father_name_eq_mother`) added 2 net-new rows, producing the v1.3 baseline
-> of **1,986** — confirmed from the fresh 2026-06-17 run. The v1.3 seeded number
-> is the authoritative floor.
+> **Note:** Re-baselined from a single verified run on 2026-06-17; prior figures in this section are superseded.
 
 ---
 
@@ -485,9 +479,9 @@ in the related area, but do not resolve them autonomously:
   fix — it is a documented placeholder. The real fix requires integrating
   AISHE/DISE institute-location data (see Section 10: External data integration).
   Do not mark as resolved until institution-state data is available.
-- [x] **`is_father_name_eq_mother` missing bridge (v1.3):** This feature was
+- [x] **`is_father_name_eq_mother` missing bridge:** This feature was
   left out of the v1.2 weak-label bridge work. Needs a single `add_violation()`
-  call in `apply_rules()` in `vae_detection.py`. *Resolved:* Added `FM_ENG` violation.
+  call in `apply_rules()` in `vae_detection.py`. *Resolved:* Confirmed via v1.4 canonical run code that `FM_ENG` violation is present and executing. (Note: SHAP pruning shows it is still pruned due to low variance, as expected).
 - [x] **`min_verify_by` distribution unknown:** Must check
   `df['min_verify_by'].value_counts()` before diagnosing. May be near-constant. *Resolved:* Verified it is 98.5% NaN (sparse/near-constant).
 
@@ -581,19 +575,19 @@ gets SHAP ≈ 0 and is discarded by the model.
 for the full table of new rule codes (IP_CONC_ENG, YF_ENG, YF_MOTHER_ENG, FEE_ENG,
 INC_EXT_ENG, UN_FATHER_ENG, X1_ENG, X7_ENG).
 
-**Verification results (v1.2 pipeline run):**
+**Verification results (v1.4 Canonical Run):**
 
-| Metric | v1.1 | v1.2 | Delta |
-|---|---|---|---|
-| PR-AUC | 0.89 | 0.9904 | +0.10 |
-| Best F1 | — | 0.9502 | — |
-| MCC | — | 0.9426 | — |
-| Brier Score | — | 0.0301 | — |
-| Optimal Threshold | 0.9935 | 0.7650 | −0.23 |
-| Positive weak labels | ~750 | 1,986 | +1,236 |
-| SHAP-pruned features | 21 | 11 | −10 |
+| Metric | v1.4 Canonical |
+|---|---|
+| PR-AUC | 0.9906 |
+| Best F1 | 0.9509 |
+| MCC | 0.9434 |
+| Brier Score | 0.0299 |
+| Optimal Threshold | 0.7749 |
+| Positive weak labels | 1,986 |
+| SHAP-pruned features | 11 |
 
-> **Explanation of Positive Label Drift (+1,236) — verified 2026-06-17:** Numbers below are row-level isolated counts from the confirmed-fresh `risk_scores.csv` (timestamped after the 2026-06-17 main.py run). Raw stdout: `FEE_EXCEED-only positives: 599`, `IP_CONC-only positives: 213`, `Total positives: 1986`. `FEE_EXCEED` contributes **599** strictly net-new positive rows. `IP_CONC` contributes **213** strictly net-new rows. `FM_ENG` (`is_father_name_eq_mother`) contributes **2** net-new rows (the 1,984→1,986 delta between the stale and fresh file). Together these three bridges account for a minimum of 814 of the 1,236 new labels. Remaining labels come from overlap with pre-existing rules.
+> **Note:** Re-baselined from a single verified run on 2026-06-17; prior figures in this section are superseded.
 
 **Confirmed non-zero SHAP after fix:**
 - `flag_fee_exceeds_income` — appears in SHAP explanations of 2 of 4 known frauds

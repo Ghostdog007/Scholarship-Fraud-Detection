@@ -120,5 +120,5 @@
   },
   "shap_prune_threshold": 0.001,
   "source_file": "selected_features.json",
-  "pipeline_run_timestamp": "2026-06-17T14:18:32.115753"
+  "pipeline_run_timestamp": "2026-06-17T14:42:35.113222"
 }

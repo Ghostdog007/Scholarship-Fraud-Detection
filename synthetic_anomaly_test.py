@@ -9,40 +9,86 @@ ORIGINAL_DATA = 'datasets/data_for_ml_model.csv'
 SYNTHETIC_DATA = 'datasets/synthetic_data.csv'
 SYNTHETIC_FEATURES = 'synthetic_features.json'
 SYNTHETIC_SCORES = 'synthetic_scores.csv'
+SYNTHETIC_LABELS = 'datasets/synthetic_fraud_labels.csv'
 
 def inject_anomalies(df):
     """
     Injects realistic fraud patterns into perfectly clean records.
     Returns the corrupted dataframe and a list of injected application IDs.
     """
-    # Treat the entire dataset as clean for anomaly injection
     df_clean = df.copy()
-    
-    # We will inject fraud into 5% of the clean records
-    n_fraud = int(len(df_clean) * 0.05)
-    
-    # Randomly select records to corrupt
-    np.random.seed(42)
-    corrupt_indices = np.random.choice(df_clean.index, size=n_fraud, replace=False)
-    
-    # Split into 4 types of perturbations
-    splits = np.array_split(corrupt_indices, 4)
-    
+
+    # Determine which rows to corrupt based on frozen labels, if they exist
+    if os.path.exists(SYNTHETIC_LABELS):
+        print(f"Loading frozen synthetic labels from {SYNTHETIC_LABELS}...")
+        labels_df = pd.read_csv(SYNTHETIC_LABELS)
+        
+        # Merge to get the indices in the current df
+        merged = df_clean[['application_id']].reset_index().merge(labels_df, on='application_id')
+        
+        splits = {}
+        for category in labels_df['fraud_category'].unique():
+            splits[category] = merged[merged['fraud_category'] == category]['index'].values
+            
+        corrupt_indices = merged['index'].values
+        injected_app_ids = labels_df['application_id'].tolist()
+    else:
+        # We will inject fraud into 5% of the clean records
+        n_fraud = int(len(df_clean) * 0.05)
+        
+        # Randomly select records to corrupt
+        np.random.seed(42)
+        corrupt_indices = np.random.choice(df_clean.index, size=n_fraud, replace=False)
+        
+        # Split into 5 types of perturbations
+        split_arrays = np.array_split(corrupt_indices, 5)
+        
+        splits = {
+            'AGE_VIOLATION': split_arrays[0],
+            'INCOME_VIOLATION': split_arrays[1],
+            'IP_CONCENTRATION': split_arrays[2],
+            'MOTHER_NAME_COLLISION': split_arrays[3],
+            'FEE_INFLATION': split_arrays[4]
+        }
+        
+        # Save the mapping to disk
+        labels_list = []
+        for category, indices in splits.items():
+            for idx in indices:
+                labels_list.append({
+                    'application_id': df_clean.loc[idx, 'application_id'],
+                    'fraud_category': category
+                })
+                
+        labels_df = pd.DataFrame(labels_list)
+        labels_df.to_csv(SYNTHETIC_LABELS, index=False)
+        print(f"Generated and froze synthetic labels to {SYNTHETIC_LABELS}...")
+        injected_app_ids = labels_df['application_id'].tolist()
+
     # 1. Age Violation (Rule X7/X1 - Make them 40 years old)
-    # Registration date is around 2020/2021 usually, so setting DOB to 1980 makes them ~40
-    df_clean.loc[splits[0], 'date_of_birth'] = '1980-01-01'
+    if 'AGE_VIOLATION' in splits and len(splits['AGE_VIOLATION']) > 0:
+        df_clean.loc[splits['AGE_VIOLATION'], 'date_of_birth'] = '1980-01-01'
     
     # 2. Income Violation (Rule UW / X13 - Income < 10000)
-    df_clean.loc[splits[1], 'annual_family_income'] = 5000
-    
-    # 3. Mobile Concentration (Rules YK/YL - Over 15 applicants using the same mobile)
-    # Assign the same fake mobile number to all records in this split
-    df_clean.loc[splits[2], 'mobile_no'] = 9999999999
-    
-    # 4. Identity Match (Rule YF - Applicant name equals Father name)
-    df_clean.loc[splits[3], 'applicant_name'] = df_clean.loc[splits[3], 'father_name']
-    
-    injected_app_ids = df_clean.loc[corrupt_indices, 'application_id'].tolist()
+    if 'INCOME_VIOLATION' in splits and len(splits['INCOME_VIOLATION']) > 0:
+        df_clean.loc[splits['INCOME_VIOLATION'], 'annual_family_income'] = 5000
+        
+    # 3. IP Concentration (Bridge IP_CONC_ENG - same IP, distinct mobile)
+    if 'IP_CONCENTRATION' in splits and len(splits['IP_CONCENTRATION']) > 0:
+        df_clean.loc[splits['IP_CONCENTRATION'], 'ip_address'] = '192.168.99.99'
+        df_clean.loc[splits['IP_CONCENTRATION'], 'mobile_no'] = np.arange(len(splits['IP_CONCENTRATION'])) + 8000000000
+        
+    # 4. Mother Name Collision (Bridge FM_ENG - father_name == mother_name, distinct applicant_name)
+    if 'MOTHER_NAME_COLLISION' in splits and len(splits['MOTHER_NAME_COLLISION']) > 0:
+        df_clean.loc[splits['MOTHER_NAME_COLLISION'], 'father_name'] = df_clean.loc[splits['MOTHER_NAME_COLLISION'], 'mother_name']
+        df_clean.loc[splits['MOTHER_NAME_COLLISION'], 'applicant_name'] = df_clean.loc[splits['MOTHER_NAME_COLLISION'], 'applicant_name'].astype(str) + '_distinct'
+        
+    # 5. Fee Inflation (Bridge FEE_ENG - fee > income, income > 20000)
+    if 'FEE_INFLATION' in splits and len(splits['FEE_INFLATION']) > 0:
+        df_clean.loc[splits['FEE_INFLATION'], 'annual_family_income'] = 25000
+        df_clean.loc[splits['FEE_INFLATION'], 'admission_fee'] = 30000
+        df_clean.loc[splits['FEE_INFLATION'], 'tuition_fee'] = 0
+
     return df_clean, set(injected_app_ids)
 
 def run_pipeline():
