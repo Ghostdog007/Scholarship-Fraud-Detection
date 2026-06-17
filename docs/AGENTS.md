@@ -605,6 +605,8 @@ MOTHER_NAME_COLLISION: full=0.9733  ablated=0.0067  delta=0.9667
 FEE_INFLATION: full=1.0000  ablated=0.0000  delta=1.0000
 ```
 
+> *Caveat: because these three bridges are the sole source of positive labels for rows that dodge all legacy rules, the 0%→100% swing above is partly a mechanical consequence of label removal, not solely independent proof of necessity. See the VAE-alone PR-AUC figures below for the non-circular evidence behind the "essential" conclusion.*
+
 *VAE Independent Signal (ROC-AUC & PR-AUC):*
 ```text
 INCOME_VIOLATION (n=150) -> ROC-AUC: 0.9465 | PR-AUC: 0.1162
