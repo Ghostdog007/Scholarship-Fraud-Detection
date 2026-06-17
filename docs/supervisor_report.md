@@ -90,7 +90,7 @@ Now that the system is fully tuned and validated against the synthetic hacks, we
 **The system currently flags 1,986 applications as breaking one or more risk parameters.**
 
 Against this baseline, the final hybrid model achieves:
-* **PR-AUC:** **0.9906** (Exceptional. It means the system is separating high-risk from low-risk applications with almost zero false alarms among the flagged group).
+* **PR-AUC:** **0.9906** (Exceptional. *Caveat:* This metric measures how well the AI agrees with our business logic rules, not with historical real fraud. It proves the AI successfully learned to enforce the rules with almost zero false alarms, but true real-world PR-AUC cannot be measured until we gather live feedback).
 * **F1-Score:** **0.9509** (An excellent balance of catching fraud quickly without being overly aggressive).
 
 ## 8. Conclusion

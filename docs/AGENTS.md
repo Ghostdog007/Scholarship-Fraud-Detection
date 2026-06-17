@@ -383,6 +383,7 @@ Select threshold maximising F1 on the positive class.
 > investigated before merging. These are the floor values for both baselines.
 >
 > **Note:** Re-baselined from a single verified run on 2026-06-17; prior figures in this section are superseded.
+> **Caveat on PR-AUC:** The 0.9906 PR-AUC measures LightGBM's agreement with the system's own rule-based weak labels, *not* with confirmed real fraud. It proves the classifier successfully learned the rule boundaries, but true real-world fraud PR-AUC remains unmeasured due to lack of ground truth labels.
 
 ---
 
@@ -590,9 +591,31 @@ INC_EXT_ENG, UN_FATHER_ENG, X1_ENG, X7_ENG).
 > **Note:** Re-baselined from a single verified run on 2026-06-17; prior figures in this section are superseded.
 
 **Phase D Synthetic Ablation Findings (VAE vs Bridges):**
-Ablation testing on corrected synthetic fraud injections (IP clustering, mother-name collisions, fee inflation) reveals the structural relationship between the VAE and the rule bridges:
-- **VAE Independent Signal:** The VAE carries genuine, non-zero unsupervised signal across every fraud category (ROC-AUC 0.76 - 0.94 when scored independently). It is strongest on univariate violations (Income: ~0.94 AUC, Age: ~0.87 AUC) and weaker-to-moderate on relational fraud (IP clustering: ~0.76 AUC, Fee inflation: ~0.79 AUC, Name collision: ~0.80 AUC).
-- **Methodology Note (Conservative Estimate):** Because the VAE must be trained on the full dataset, its training data included the synthetic anomalies. It partially adapted to them, meaning its true held-out detection power is likely *stronger* than these figures suggest.
+
+**v1.4 Permanent Test Harness:** The corrected, properly-aligned synthetic dataset (Phase D) and fixed ablation methodology are the new permanent test harness going forward. They supersede all v1.x synthetic tests, as the old categories failed to correctly exercise the engineered bridges.
+
+Ablation testing on these corrected synthetic fraud injections (IP clustering, mother-name collisions, fee inflation) reveals the structural relationship between the VAE and the rule bridges. Raw stdout receipts:
+
+*Ablation Deltas (Recall at 0.9956 threshold):*
+```text
+AGE_VIOLATION: full=0.9533  ablated=0.9933  delta=-0.0400
+INCOME_VIOLATION: full=1.0000  ablated=1.0000  delta=0.0000
+IP_CONCENTRATION: full=1.0000  ablated=0.0000  delta=1.0000
+MOTHER_NAME_COLLISION: full=0.9733  ablated=0.0067  delta=0.9667
+FEE_INFLATION: full=1.0000  ablated=0.0000  delta=1.0000
+```
+
+*VAE Independent Signal (ROC-AUC & PR-AUC):*
+```text
+INCOME_VIOLATION (n=150) -> ROC-AUC: 0.9465 | PR-AUC: 0.1162
+AGE_VIOLATION (n=150) -> ROC-AUC: 0.8737 | PR-AUC: 0.0506
+MOTHER_NAME_COLLISION (n=150) -> ROC-AUC: 0.8012 | PR-AUC: 0.0258
+FEE_INFLATION (n=150) -> ROC-AUC: 0.7961 | PR-AUC: 0.0264
+IP_CONCENTRATION (n=150) -> ROC-AUC: 0.7672 | PR-AUC: 0.0239
+```
+
+- **VAE Independent Signal:** The VAE carries genuine, non-zero unsupervised signal across every fraud category (ROC-AUC 0.76 - 0.94 when scored independently). It is strongest on univariate violations and weaker-to-moderate on relational fraud.
+- **Methodology Note (Conservative Estimate):** Because the VAE must be trained on the full dataset, its training data *included* the synthetic anomalies (no held-out test yet). It partially adapted to them, meaning its true held-out detection power is likely *stronger* than these figures suggest.
 - **Role of the Bridges:** Because the relational fraud signals are moderate (PR-AUC < 0.10 when relying on VAE alone), the VAE alone cannot draw a clean threshold without unacceptable false alarms. The engineered rule bridges (`IP_CONC_ENG`, `FEE_ENG`, `FM_ENG`) are essential. They do not replace a "failed" VAE; instead, they convert the VAE's weaker relational signal into a usable, hard decision boundary for the supervised LightGBM classifier.
 
 **Confirmed non-zero SHAP after fix:**
