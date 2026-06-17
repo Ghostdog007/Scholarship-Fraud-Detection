@@ -589,6 +589,12 @@ INC_EXT_ENG, UN_FATHER_ENG, X1_ENG, X7_ENG).
 
 > **Note:** Re-baselined from a single verified run on 2026-06-17; prior figures in this section are superseded.
 
+**Phase D Synthetic Ablation Findings (VAE vs Bridges):**
+Ablation testing on corrected synthetic fraud injections (IP clustering, mother-name collisions, fee inflation) reveals the structural relationship between the VAE and the rule bridges:
+- **VAE Independent Signal:** The VAE carries genuine, non-zero unsupervised signal across every fraud category (ROC-AUC 0.76 - 0.94 when scored independently). It is strongest on univariate violations (Income: ~0.94 AUC, Age: ~0.87 AUC) and weaker-to-moderate on relational fraud (IP clustering: ~0.76 AUC, Fee inflation: ~0.79 AUC, Name collision: ~0.80 AUC).
+- **Methodology Note (Conservative Estimate):** Because the VAE must be trained on the full dataset, its training data included the synthetic anomalies. It partially adapted to them, meaning its true held-out detection power is likely *stronger* than these figures suggest.
+- **Role of the Bridges:** Because the relational fraud signals are moderate (PR-AUC < 0.10 when relying on VAE alone), the VAE alone cannot draw a clean threshold without unacceptable false alarms. The engineered rule bridges (`IP_CONC_ENG`, `FEE_ENG`, `FM_ENG`) are essential. They do not replace a "failed" VAE; instead, they convert the VAE's weaker relational signal into a usable, hard decision boundary for the supervised LightGBM classifier.
+
 **Confirmed non-zero SHAP after fix:**
 - `flag_fee_exceeds_income` — appears in SHAP explanations of 2 of 4 known frauds
 - `name_similarity_score` — survived pruning, present in known fraud explanations
