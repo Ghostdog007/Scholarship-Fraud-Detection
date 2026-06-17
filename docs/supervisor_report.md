@@ -71,7 +71,7 @@ We first tested the VAE completely on its own, without the Rule Bridges helping 
 | **Fee Inflation** | **0.7961** (Good) | 0.96 Sigma (Noticeable) |
 | **IP Concentration** | **0.7672** (Moderate) | 0.81 Sigma (Noticeable) |
 
-**What this means:** The AI doesn't need historical examples to spot fraud. It naturally realizes that IP clustering and identity swapping break the structural patterns of honest applications. *(Note: Because of how we trained the AI, these numbers are actually a conservative floor. In live production, the AI will likely be even sharper).*
+**What this means:** The AI doesn't need historical examples to spot fraud. It naturally realizes that IP clustering and identity swapping break the structural patterns of honest applications. *(Note: Because the AI was trained on a dataset that secretly included these 750 anomalies, it had a chance to slightly adapt to them. Since there is no completely held-out test yet, we cannot definitively say whether its ability to catch brand-new, never-before-seen fraud in production would be better or worse than what's shown here. The true real-world performance remains untested in either direction.)*
 
 ### Finding B: Why We Need the Rule Bridges
 If the VAE works so well, why not just use it alone? 

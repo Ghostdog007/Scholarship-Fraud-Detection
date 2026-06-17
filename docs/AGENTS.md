@@ -615,7 +615,7 @@ IP_CONCENTRATION (n=150) -> ROC-AUC: 0.7672 | PR-AUC: 0.0239
 ```
 
 - **VAE Independent Signal:** The VAE carries genuine, non-zero unsupervised signal across every fraud category (ROC-AUC 0.76 - 0.94 when scored independently). It is strongest on univariate violations and weaker-to-moderate on relational fraud.
-- **Methodology Note (Conservative Estimate):** Because the VAE must be trained on the full dataset, its training data *included* the synthetic anomalies (no held-out test yet). It partially adapted to them, meaning its true held-out detection power is likely *stronger* than these figures suggest.
+- **Methodology Note (Untested Variance):** Because the VAE must be trained on the full dataset, its training data *included* the synthetic anomalies (no held-out test yet). It had a chance to partially adapt to them, meaning we cannot say whether real-world performance on truly novel fraud would be better or worse than what is shown here. The result is untested in either direction.
 - **Role of the Bridges:** Because the relational fraud signals are moderate (PR-AUC < 0.10 when relying on VAE alone), the VAE alone cannot draw a clean threshold without unacceptable false alarms. The engineered rule bridges (`IP_CONC_ENG`, `FEE_ENG`, `FM_ENG`) are essential. They do not replace a "failed" VAE; instead, they convert the VAE's weaker relational signal into a usable, hard decision boundary for the supervised LightGBM classifier.
 
 **Confirmed non-zero SHAP after fix:**
