@@ -4,6 +4,7 @@ from sklearn.metrics import average_precision_score, f1_score, matthews_corrcoef
 import os
 import argparse
 import json
+import datetime
 
 def main():
     parser = argparse.ArgumentParser()
@@ -121,8 +122,9 @@ def main():
             "dropped_features": dropped_features,
             "mean_shap_per_feature": shap_summary,
             "shap_prune_threshold": 0.001,
-            "source_file": "selected_features.json",
-            "pipeline_run_timestamp": feature_data.get("pipeline_run_timestamp", "")
+            "source_file": features_json_file,
+            "pipeline_run_timestamp": feature_data.get("pipeline_run_timestamp", ""),
+            "shap_prune_run_timestamp": datetime.datetime.now().isoformat()
         }
         with open('selected_features_shap_pruned.json', 'w') as f:
             json.dump(pruned_data, f, indent=2)

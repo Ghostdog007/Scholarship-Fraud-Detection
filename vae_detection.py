@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import argparse
+import datetime
 from feature_selection import engineer_features
 
 # Rule Weights
@@ -445,6 +446,21 @@ def main():
     
     out_df.to_csv(args.output_csv, index=False)
     print(f"Finished successfully. Output saved to {args.output_csv}")
+
+    lineage = {
+        "source_data_path": args.data_path,
+        "source_row_count": len(df),
+        "features_json_path": args.features_json,
+        "features_pipeline_run_timestamp": feature_data.get("pipeline_run_timestamp", ""),
+        "n_selected_features": len(selected_features),
+        "bridges_enabled": sorted(list(enabled_bridges)),
+        "bridges_disabled": sorted(list(disabled_bridges)),
+        "run_timestamp": datetime.datetime.now().isoformat()
+    }
+    lineage_path = args.output_csv.replace('.csv', '.lineage.json')
+    with open(lineage_path, 'w') as f:
+        json.dump(lineage, f, indent=2)
+    print(f"Wrote lineage to {lineage_path}")
 
 if __name__ == '__main__':
     main()

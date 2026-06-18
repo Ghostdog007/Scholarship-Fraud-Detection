@@ -19,6 +19,73 @@ slice is treated as independent and these 4 are assumed clean for training and
 evaluation. Standard supervised classifiers fail on this kind of imbalance, so
 the system is built to work without reliable fraud labels.
 
+## Data Sources & Lineage
+
+### 2.1 Raw Source
+`data_for_ml_model.csv` is a 15,000-row slice of the NIC national scholarship portal's application database (Pre-Matric and Post-Matric), per AGENTS.md Section 1. This slice is treated as independent since the 4 known fraud records' duplicate counterparts exist outside this slice and thus trigger no rules locally.
+
+### 2.2 Transformation Chain (ordered)
+
+1. **`load_and_clean_data(filepath)` in `feature_selection.py`**
+   - Drops 100%-null columns: `updated_by`, `delete_record`, `deleted_by`, `delete_on`, `delete_ip_address`, `deleted_by_level`, `c_university_id`, `p_institution_id`, `x_institution_id`, `xii_institution_id`, `competitive_exam_score`, `xii_course_id`, `new_entitled_fee_amount_centre_share`, `sub_category_id`, `updated_by-2`, `updated_on-2`
+   - Drops duplicate spatial columns: `state_id-2`, `pfms_state_code`, `state_name-2`, `district_id`, `district_name-2`
+
+2. **`engineer_features(df)` in `feature_selection.py` (and `vae_detection.py`)**
+   - Layer 0 — Text-to-boolean identity flags: 
+     - `is_applicant_name_eq_father = (df['applicant_name'] == df['father_name']).astype(int)`
+     - `is_applicant_name_eq_mother = (df['applicant_name'] == df['mother_name']).astype(int)`
+     - `is_father_name_eq_mother = (df['father_name'] == df['mother_name']).astype(int)`
+     - `name_similarity_score` via `SequenceMatcher` fuzzy match on `applicant_name` vs `father_name`
+   - Layer 1 — Relational aggregates: 
+     - `mobile_application_count = df.groupby('mobile_no')['application_id'].transform('count')`
+     - `ip_application_count = df.groupby('ip_address')['application_id'].transform('count')`
+     - `mobile_unique_names_count`, `mobile_unique_fathers_count` (transform nunique)
+     - `institute_application_count` (conditional on `c_institution_id` present)
+     - `district_application_count` (conditional on `district_id` present — **note: absent in File 1 path due to `load_and_clean_data()` dropping `district_id` first; see discrepancy note below**)
+     - `ip_to_mobile_ratio = ip_application_count / (mobile_application_count + 1)`
+   - Layer 2 — Policy boundary flags:
+     - `flag_income_below_20000`: income < 20000
+     - `flag_income_below_10000`: income <= 10000
+     - `flag_income_extreme_low`: income < 1000
+     - `flag_prematric_age_over20`: pre_post_matric==1 AND age > 20
+     - `flag_postmatric_age_over35`: pre_post_matric==2 AND age > 35
+     - `flag_postmatric_age_under13`: pre_post_matric==2 AND age < 13
+     - `flag_fee_exceeds_income`: fee_income_ratio > 1.0
+
+3. **MI → Pearson → mRMR selection in `feature_selection.py` main()**
+   - MI\_KEEP\_RATIO = 0.8
+   - MI\_MAX\_FEATURES = 50
+   - MRMR\_MAX\_FEATURES = 40
+   - Pearson threshold = 0.90
+   - The protected features list bypasses the cutoff
+
+4. **`vae_detection.py` stages:**
+   - Stage A: Reads `selected_features.json`, trains VAE on all records (`valid_mask = all True`), produces `vae_reconstruction_prob` per row
+   - Stage B: Runs `apply_rules()` on the full dataframe, produces `rule_violation_score` and `rule_codes_fired`
+   - Stage C: Trains LightGBM on `[selected_features] + [vae_reconstruction_prob]` with `rule_violation_score > 0` as weak label. Excludes `rule_violation_score` from features (target leakage guard)
+
+5. **SHAP pruning in `evaluate_model.py`**
+   - Threshold: 0.001
+   - Input: `shap_summary.json` + `selected_features.json`
+   - Output: `selected_features_shap_pruned.json`
+
+### 2.3 Known Structural Discrepancy
+
+`vae_detection.py` calls `engineer_features()` directly on the raw CSV without first calling `load_and_clean_data()`. As a result, `district_id` is still present when `engineer_features()` runs in File 2, meaning `district_application_count` is computed and available to `apply_rules()`. However, in File 1's path (`feature_selection.py`), `load_and_clean_data()` drops `district_id` first, so `district_application_count` is never computed and therefore never appears in `selected_features.json`. Since LightGBM only sees features listed in that JSON, `district_application_count` is computable in the rule engine but invisible to the classifier. Verified with an actual run:
+```
+district_application_count in File 1 path: False
+district_application_count in File 2 path: True
+district_application_count selected: False
+```
+
+### 2.4 Lineage Table
+
+| Output Artifact | Source Data | Producing Script | Producing Function |
+|---|---|---|---|
+| `selected_features.json` | `datasets/data_for_ml_model.csv` | `feature_selection.py` | `main()` |
+| `risk_scores.csv` | `datasets/data_for_ml_model.csv` + `selected_features.json` | `vae_detection.py` | `main()` |
+| `selected_features_shap_pruned.json` | `risk_scores.csv` + `selected_features.json` + `shap_summary.json` | `evaluate_model.py` | `main()` |
+
 ## How it works — three stages, two files
 
 ```
