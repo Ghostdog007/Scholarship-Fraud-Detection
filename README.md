@@ -113,18 +113,39 @@ cutoff 0.90. The SHAP pruning threshold in `evaluate_model.py` is 0.001.
 `vae_detection.py` calls `engineer_features()` directly on the raw CSV
 without first running it through `load_and_clean_data()`. That means
 `district_id` is still present when File 2 engineers features, so
-`district_application_count` gets computed there — but File 1 already
-dropped `district_id` before engineering anything, so that same feature
-never exists in `selected_features.json`. Net effect: the rule engine could
-in principle see district-level concentration, but LightGBM never can,
-since it only sees what's listed in that JSON. Verified directly rather than
-assumed:
+`district_application_count` gets computed there in memory — but File 1
+already dropped `district_id` before engineering anything, so that same
+feature never exists in `selected_features.json`. Net effect: both the VAE
+and LightGBM train on `df_features`, which is built strictly from that JSON
+— so neither model ever sees `district_application_count`, regardless of
+the fact that it briefly exists as a column in File 2's dataframe. The rule
+engine is the only thing that touches the full, untrimmed dataframe, but no
+rule in `apply_rules()` currently checks this column either. In its current
+state, the feature is computed and then used by nothing. Verified directly
+rather than assumed:
 
 ```
 district_application_count in File 1 path: False
 district_application_count in File 2 path: True
 district_application_count selected: False
 ```
+
+**Why this is left as-is rather than fixed:** district-level concentration
+is weak fraud evidence on its own. A district is a large administrative
+region — it's normal and expected for thousands of legitimate applicants to
+share one, so a high count there doesn't distinguish fraud from ordinary
+demand the way a shared IP or mobile number does. `AGENTS.md`'s confirmed
+anomaly list backs this up with concrete numbers: a single IP submitting 39
+applications and a single mobile number shared by 6 applicants are both
+tied to one device or connection, a tight unit where concentration is
+genuinely suspicious. Nothing in the documented analysis suggests
+district-level concentration carries comparable signal, so it isn't being
+prioritized for a fix. If a future data slice makes this worth revisiting,
+the actual fix is changing the `groupby('district_id')` call in
+`engineer_features()` to key off `permanent_district_id` instead — the
+column that survives `load_and_clean_data()` — so the feature exists
+consistently in both files' paths and can compete fairly in MI/mRMR
+selection rather than going dead by accident.
 
 #### Lineage table
 
