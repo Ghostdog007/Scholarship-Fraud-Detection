@@ -6,19 +6,15 @@ import argparse
 import json
 import datetime
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', type=str, default='datasets/data_for_ml_model.csv')
-    parser.add_argument('--scores_csv', type=str, default='risk_scores.csv')
-    args = parser.parse_args()
-
-    if not os.path.exists(args.data_path) or not os.path.exists(args.scores_csv):
-        print(f"Error: Make sure both {args.data_path} and {args.scores_csv} exist.")
-        return
+def _load_and_merge(data_path, scores_csv):
+    if not os.path.exists(data_path) or not os.path.exists(scores_csv):
+        print(f"Error: Make sure both {data_path} and {scores_csv} exist.")
+        return None
 
     print("Loading data...")
-    df_raw = pd.read_csv(args.data_path)
-    df_scores = pd.read_csv(args.scores_csv)
+    # Add low_memory=False to suppress DtypeWarning
+    df_raw = pd.read_csv(data_path, low_memory=False)
+    df_scores = pd.read_csv(scores_csv)
 
     # Merge on application_id if it exists, otherwise assume parallel indexing
     if 'application_id' in df_raw.columns and 'application_id' in df_scores.columns:
@@ -27,8 +23,14 @@ def main():
         df = df_scores.copy()
         df['sanity'] = df_raw['sanity']
 
-    print(f"\n--- EVALUATION RESULTS ---")
-    
+    return df
+
+def _evaluate_weak_labels(df):
+    """
+    Evaluate model against weak rule-based labels.
+    PR-AUC is the primary metric because ROC-AUC is misleading on highly 
+    imbalanced data — per AGENTS.md Section 6.
+    """
     # 1. Evaluate against Weak Labels
     # Treat rule_violation_score > 0 as the "positive" weak label
     if 'rule_violation_score' in df.columns and 'lgbm_risk_score' in df.columns:
@@ -61,6 +63,7 @@ def main():
         else:
             print("\n[1] Weak Label Evaluation: No applications broke any rules. Cannot compute PR-AUC.")
 
+def _examine_known_frauds(df):
     # 2. Check the Known Fraud Cases
     print(f"\n[2] Ground-Truth Analysis (The known fraud records)")
     known_fraud_df = df[df['sanity'].notnull()].copy()
@@ -89,9 +92,13 @@ def main():
             print(f"       Rules Fired:    {rules_fired if pd.notnull(rules_fired) and rules_fired != '' else 'None'}")
             print(f"       Top Explanations (SHAP): {shap_feats}")
 
-    # 3. SHAP-Based Second-Pass Feature Pruning
-    shap_summary_file = 'shap_summary.json'
-    features_json_file = 'selected_features.json'
+def _run_shap_pruning(shap_summary_file, features_json_file):
+    """
+    Run SHAP-based feature pruning.
+    The threshold is 0.001.
+    The output path is 'selected_features_shap_pruned.json' and MUST NEVER overwrite 
+    'selected_features.json' — per AGENTS.md Section 7, Constraint 12.
+    """
     if os.path.exists(shap_summary_file) and os.path.exists(features_json_file):
         print(f"\n[3] SHAP-Based Second-Pass Feature Pruning")
         with open(shap_summary_file, 'r') as f:
@@ -123,12 +130,29 @@ def main():
             "mean_shap_per_feature": shap_summary,
             "shap_prune_threshold": 0.001,
             "source_file": features_json_file,
+            # pipeline_run_timestamp is sourced from the upstream selected_features.json 
+            # so the provenance chain is traceable.
             "pipeline_run_timestamp": feature_data.get("pipeline_run_timestamp", ""),
             "shap_prune_run_timestamp": datetime.datetime.now().isoformat()
         }
         with open('selected_features_shap_pruned.json', 'w') as f:
             json.dump(pruned_data, f, indent=2)
         print("    Saved pruned feature list to selected_features_shap_pruned.json")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_path', type=str, default='datasets/data_for_ml_model.csv')
+    parser.add_argument('--scores_csv', type=str, default='risk_scores.csv')
+    args = parser.parse_args()
+
+    df = _load_and_merge(args.data_path, args.scores_csv)
+    if df is None:
+        return
+
+    print(f"\n--- EVALUATION RESULTS ---")
+    _evaluate_weak_labels(df)
+    _examine_known_frauds(df)
+    _run_shap_pruning('shap_summary.json', 'selected_features.json')
 
     print("\nEvaluation complete.")
 

@@ -70,9 +70,20 @@ def vae_loss(recon_x, x, mu, logvar):
     kl_divergence = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     return recon_loss + kl_divergence
 
+def _score_vae(model, x_all, device):
+    model.eval()
+    with torch.no_grad():
+        x_all = x_all.to(device)
+        recon_all, _, _ = model(x_all)
+        mse = torch.mean((x_all - recon_all) ** 2, dim=1)
+        # Using negative MSE transformed to prob-like
+        recon_prob = torch.exp(-mse).cpu().numpy()
+    return recon_prob
+
 def train_vae(df_features, valid_mask, epochs=50, batch_size=256):
     # Seed for reproducibility — ensures vae_reconstruction_prob is stable
     # across runs so PR-AUC deltas reflect real changes, not random init noise.
+    # Required by reproducibility contract — AGENTS.md Section 0.1 Rule 3.
     torch.manual_seed(42)
     np.random.seed(42)
     if torch.cuda.is_available():
@@ -110,15 +121,13 @@ def train_vae(df_features, valid_mask, epochs=50, batch_size=256):
             train_loss += loss.item()
             optimizer.step()
             
-    model.eval()
-    with torch.no_grad():
-        x_all = x_all.to(device)
-        recon_all, _, _ = model(x_all)
-        mse = torch.mean((x_all - recon_all) ** 2, dim=1)
-        # Using negative MSE transformed to prob-like
-        recon_prob = torch.exp(-mse).cpu().numpy()
-        
+    recon_prob = _score_vae(model, x_all, device)
     return recon_prob
+
+def _add_violation(condition, rule_code, weight, rules_fired, rule_scores):
+    idx = condition[condition].index
+    rules_fired.loc[idx] = rules_fired.loc[idx].apply(lambda x: x + rule_code + ',' if x else rule_code + ',')
+    rule_scores.loc[idx] += weight
 
 def apply_rules(df, enabled_bridges=None):
     if enabled_bridges is None:
@@ -126,17 +135,13 @@ def apply_rules(df, enabled_bridges=None):
         
     rules_fired = pd.Series('', index=df.index, dtype=object)
     rule_scores = pd.Series(0.0, index=df.index)
-    
-    def add_violation(condition, rule_code, weight):
-        idx = condition[condition].index
-        rules_fired.loc[idx] = rules_fired.loc[idx].apply(lambda x: x + rule_code + ',' if x else rule_code + ',')
-        rule_scores.loc[idx] += weight
         
+    # --- NIC Rulebook Rules ---
     # Identity duplicate
     id_cols = ['applicant_name', 'father_name', 'mother_name', 'date_of_birth', 'mobile_no']
     if all(c in df.columns for c in id_cols):
         cond_id_dup = df.duplicated(subset=id_cols, keep=False)
-        add_violation(cond_id_dup, 'ID_DUP', WEIGHTS['IDENTITY_DUPLICATE'])
+        _add_violation(cond_id_dup, 'ID_DUP', WEIGHTS['IDENTITY_DUPLICATE'], rules_fired, rule_scores)
 
     # Age rules
     if 'pre_post_matric' in df.columns:
@@ -153,102 +158,127 @@ def apply_rules(df, enabled_bridges=None):
 
         if age_col is not None:
             cond_x1 = (df['pre_post_matric'] == 1) & (age_col > 20)
-            add_violation(cond_x1, 'X1', WEIGHTS['AGE_VIOLATION'])
+            _add_violation(cond_x1, 'X1', WEIGHTS['AGE_VIOLATION'], rules_fired, rule_scores)
             
             cond_x7 = (df['pre_post_matric'] == 2) & (age_col > 35)
-            add_violation(cond_x7, 'X7', WEIGHTS['AGE_VIOLATION'])
+            _add_violation(cond_x7, 'X7', WEIGHTS['AGE_VIOLATION'], rules_fired, rule_scores)
             
             cond_x8 = (df['pre_post_matric'] == 2) & (age_col < 13)
-            add_violation(cond_x8, 'X8', WEIGHTS['AGE_VIOLATION'])
+            _add_violation(cond_x8, 'X8', WEIGHTS['AGE_VIOLATION'], rules_fired, rule_scores)
             
     # Income rules
     if 'annual_family_income' in df.columns:
         cond_uw = (pd.to_numeric(df['annual_family_income'], errors='coerce') < 20000) & (pd.to_numeric(df['annual_family_income'], errors='coerce') > 10000)
-        add_violation(cond_uw, 'UW', WEIGHTS['INCOME_VIOLATION'])
+        _add_violation(cond_uw, 'UW', WEIGHTS['INCOME_VIOLATION'], rules_fired, rule_scores)
         
         cond_x13_21 = pd.to_numeric(df['annual_family_income'], errors='coerce') <= 10000
-        add_violation(cond_x13_21, 'X13_X21', WEIGHTS['INCOME_VIOLATION'])
+        _add_violation(cond_x13_21, 'X13_X21', WEIGHTS['INCOME_VIOLATION'], rules_fired, rule_scores)
         
     # Name match
     if all(c in df.columns for c in ['applicant_name', 'father_name', 'mother_name']):
         cond_yf = (df['applicant_name'] == df['father_name']) | (df['applicant_name'] == df['mother_name'])
         cond_yf = cond_yf.fillna(False)
-        add_violation(cond_yf, 'YF', WEIGHTS['NAME_MATCH'])
+        _add_violation(cond_yf, 'YF', WEIGHTS['NAME_MATCH'], rules_fired, rule_scores)
         
     # Board duplicate
     if 'x_roll_no' in df.columns and 'x_course_year' in df.columns:
         cond_x9 = df.duplicated(subset=['x_roll_no', 'x_course_year'], keep=False) & df['x_roll_no'].notna()
-        add_violation(cond_x9, 'X9', WEIGHTS['BOARD_DUPLICATE'])
+        _add_violation(cond_x9, 'X9', WEIGHTS['BOARD_DUPLICATE'], rules_fired, rule_scores)
     
     if 'xii_roll_no' in df.columns and 'xii_course_year' in df.columns:
         cond_x10 = df.duplicated(subset=['xii_roll_no', 'xii_course_year'], keep=False) & df['xii_roll_no'].notna()
-        add_violation(cond_x10, 'X10', WEIGHTS['BOARD_DUPLICATE'])
+        _add_violation(cond_x10, 'X10', WEIGHTS['BOARD_DUPLICATE'], rules_fired, rule_scores)
         
     # Mobile rules
     if 'mobile_no' in df.columns:
         mob_counts = df.groupby('mobile_no')['mobile_no'].transform('count')
         cond_yk = (mob_counts >= 11)
-        add_violation(cond_yk, 'YK_YL', WEIGHTS['MOBILE_CONCENTRATION'])
+        _add_violation(cond_yk, 'YK_YL', WEIGHTS['MOBILE_CONCENTRATION'], rules_fired, rule_scores)
         
         if 'father_name' in df.columns:
             mob_father_nunique = df.groupby('mobile_no')['father_name'].transform('nunique')
             cond_un = (mob_father_nunique > 1) & df['mobile_no'].notna()
-            add_violation(cond_un, 'UN', WEIGHTS['MOBILE_FATHER_MISMATCH'])
+            _add_violation(cond_un, 'UN', WEIGHTS['MOBILE_FATHER_MISMATCH'], rules_fired, rule_scores)
 
-    # --- Layer 1 Relational Violations ---
+    # --- Layer-1 Relational Violations ---
     if 'mobile_application_count' in df.columns:
         cond_mob_agg = df['mobile_application_count'] >= 11
-        add_violation(cond_mob_agg, 'YK_AGG', WEIGHTS['MOBILE_CONCENTRATION'])
+        _add_violation(cond_mob_agg, 'YK_AGG', WEIGHTS['MOBILE_CONCENTRATION'], rules_fired, rule_scores)
 
+    # --- Engineered Bridge Violations ---
+    # Bridges gate on `enabled_bridges` so the ablation harness can disable them 
+    # via `--disabled_bridges`. This makes Phase D testing reproducible.
     if 'ip_application_count' in df.columns and 'IP_CONC_ENG' in enabled_bridges:
         cond_ip_agg = df['ip_application_count'] >= 15
-        add_violation(cond_ip_agg, 'IP_CONC', WEIGHTS['MOBILE_CONCENTRATION'])
+        _add_violation(cond_ip_agg, 'IP_CONC', WEIGHTS['MOBILE_CONCENTRATION'], rules_fired, rule_scores)
 
     if 'mobile_unique_fathers_count' in df.columns and 'UN_FATHER_ENG' in enabled_bridges:
         cond_multi_father = df['mobile_unique_fathers_count'] > 1
-        add_violation(cond_multi_father, 'UN_AGG', WEIGHTS['MOBILE_FATHER_MISMATCH'])
+        _add_violation(cond_multi_father, 'UN_AGG', WEIGHTS['MOBILE_FATHER_MISMATCH'], rules_fired, rule_scores)
 
     if 'is_applicant_name_eq_father' in df.columns and 'YF_ENG' in enabled_bridges:
         cond_name_flag = df['is_applicant_name_eq_father'] == 1
-        add_violation(cond_name_flag, 'YF_FLAG', WEIGHTS['NAME_MATCH'])
+        _add_violation(cond_name_flag, 'YF_FLAG', WEIGHTS['NAME_MATCH'], rules_fired, rule_scores)
 
     if 'is_applicant_name_eq_mother' in df.columns and 'YF_MOTHER_ENG' in enabled_bridges:
         cond_name_mother = df['is_applicant_name_eq_mother'] == 1
-        add_violation(cond_name_mother, 'YF_MOTHER', WEIGHTS['NAME_MATCH'])
+        _add_violation(cond_name_mother, 'YF_MOTHER', WEIGHTS['NAME_MATCH'], rules_fired, rule_scores)
 
     if 'is_father_name_eq_mother' in df.columns and 'FM_ENG' in enabled_bridges:
         cond_father_mother = df['is_father_name_eq_mother'] == 1
-        add_violation(cond_father_mother, 'FM_ENG', WEIGHTS['NAME_MATCH'])
+        _add_violation(cond_father_mother, 'FM_ENG', WEIGHTS['NAME_MATCH'], rules_fired, rule_scores)
 
     if 'flag_income_below_10000' in df.columns:
         cond_income_flag = df['flag_income_below_10000'] == 1
-        add_violation(cond_income_flag, 'X13_FLAG', WEIGHTS['INCOME_VIOLATION'])
+        _add_violation(cond_income_flag, 'X13_FLAG', WEIGHTS['INCOME_VIOLATION'], rules_fired, rule_scores)
 
     if 'flag_fee_exceeds_income' in df.columns and 'FEE_ENG' in enabled_bridges:
         cond_fee_flag = df['flag_fee_exceeds_income'] == 1
-        add_violation(cond_fee_flag, 'FEE_EXCEED', WEIGHTS['INCOME_VIOLATION'])
+        _add_violation(cond_fee_flag, 'FEE_EXCEED', WEIGHTS['INCOME_VIOLATION'], rules_fired, rule_scores)
 
     if 'flag_postmatric_age_over35' in df.columns and 'X7_ENG' in enabled_bridges:
         cond_age_flag = df['flag_postmatric_age_over35'] == 1
-        add_violation(cond_age_flag, 'X7_FLAG', WEIGHTS['AGE_VIOLATION'])
+        _add_violation(cond_age_flag, 'X7_FLAG', WEIGHTS['AGE_VIOLATION'], rules_fired, rule_scores)
 
     if 'flag_prematric_age_over20' in df.columns and 'X1_ENG' in enabled_bridges:
         cond_age_flag2 = df['flag_prematric_age_over20'] == 1
-        add_violation(cond_age_flag2, 'X1_FLAG', WEIGHTS['AGE_VIOLATION'])
+        _add_violation(cond_age_flag2, 'X1_FLAG', WEIGHTS['AGE_VIOLATION'], rules_fired, rule_scores)
 
     if 'flag_income_extreme_low' in df.columns and 'INC_EXT_ENG' in enabled_bridges:
         cond_extreme_low = df['flag_income_extreme_low'] == 1
-        add_violation(cond_extreme_low, 'INCOME_EXTREME', WEIGHTS['INCOME_VIOLATION'])
+        _add_violation(cond_extreme_low, 'INCOME_EXTREME', WEIGHTS['INCOME_VIOLATION'], rules_fired, rule_scores)
 
     rules_fired = rules_fired.str.rstrip(',')
     return rule_scores, rules_fired
+
+def _compute_shap(clf, X):
+    explainer = shap.TreeExplainer(clf)
+    shap_values = explainer.shap_values(X)
+    
+    if isinstance(shap_values, list):
+        shap_vals = shap_values[1] 
+    else:
+        shap_vals = shap_values
+        
+    feature_names = X.columns.tolist()
+    top_shap_features = []
+    
+    for i in range(len(shap_vals)):
+        top_indices = np.argsort(-np.abs(shap_vals[i]))[:3]
+        top_features = [feature_names[idx] for idx in top_indices]
+        top_shap_features.append(','.join(top_features))
+        
+    mean_shap_values = np.abs(shap_vals).mean(axis=0)
+    shap_summary = {feature_names[i]: float(mean_shap_values[i]) for i in range(len(feature_names))}
+        
+    return top_shap_features, shap_summary
 
 def train_lgbm(df_features, vae_prob, rule_scores):
     X = df_features.copy()
     
     # Adding necessary fields to the model features
     X['vae_reconstruction_prob'] = vae_prob
-    # Removed rule_violation_score from X to prevent target leakage
+    # Removed rule_violation_score from X to prevent target leakage — per AGENTS.md Section 7, Constraint 11.
     
     # Ensure numerical dtypes
     for col in X.columns:
@@ -282,25 +312,7 @@ def train_lgbm(df_features, vae_prob, rule_scores):
     clf.fit(X, y)
     
     preds = clf.predict_proba(X)[:, 1]
-    
-    explainer = shap.TreeExplainer(clf)
-    shap_values = explainer.shap_values(X)
-    
-    if isinstance(shap_values, list):
-        shap_vals = shap_values[1] 
-    else:
-        shap_vals = shap_values
-        
-    feature_names = X.columns.tolist()
-    top_shap_features = []
-    
-    for i in range(len(shap_vals)):
-        top_indices = np.argsort(-np.abs(shap_vals[i]))[:3]
-        top_features = [feature_names[idx] for idx in top_indices]
-        top_shap_features.append(','.join(top_features))
-        
-    mean_shap_values = np.abs(shap_vals).mean(axis=0)
-    shap_summary = {feature_names[i]: float(mean_shap_values[i]) for i in range(len(feature_names))}
+    top_shap_features, shap_summary = _compute_shap(clf, X)
         
     return preds, top_shap_features, shap_summary
 
@@ -314,6 +326,7 @@ def main():
 
     print("Starting VAE Detection Pipeline...")
     
+    # 1. Load configuration and apply guards
     if not os.path.exists(args.features_json):
         print(f"Warning: {args.features_json} not found. Creating a dummy file to proceed.")
         dummy_features = {
@@ -330,6 +343,8 @@ def main():
 
     # --- INTERFACE CONTRACT GUARD ---
     if 'dropped_features' in feature_data:
+        # Prevent a feedback loop where each run prunes more features than the last, 
+        # making results unreproducible — per AGENTS.md Section 7, Constraint 12.
         raise RuntimeError(
             f"CONTRACT VIOLATION: {args.features_json} contains a 'dropped_features' "
             "key. This file was written by the SHAP pruner, not feature_selection.py. "
@@ -360,6 +375,7 @@ def main():
               f"correlation filter (likely >0.98 correlated): {missing}")
     # --- END GUARD ---
 
+    # 2. Load data
     selected_features = feature_data.get('selected_features', [])
     
     if not os.path.exists(args.data_path):
@@ -383,6 +399,7 @@ def main():
         
     print(f"Loaded dataset with {len(df)} records.")
     
+    # 3. Engineer features
     # Engineer features so that columns like is_applicant_name_eq_father,
     # ip_application_count, etc. exist in df before the feature filter runs.
     # Without this, the raw CSV lacks these columns and they get silently dropped.
@@ -396,14 +413,15 @@ def main():
         
     df_features = df[available_features]
     
-    # Stage A: VAE
+    # 4. Stage A: VAE
     print("Stage A: Training VAE...")
-    # Treat all records as valid for VAE training as they do not violate rules locally
+    # Treat all records as valid for VAE training because the 4 known fraud 
+    # records are treated as valid in this slice — AGENTS.md Section 7, Constraint 1.
     valid_mask = np.ones(len(df), dtype=bool)
         
     vae_prob = train_vae(df_features, valid_mask)
     
-    # Stage B: Rule-Based Weak Label Generator
+    # 5. Stage B: Rule-Based Weak Label Generator
     print("Stage B: Generating rule-based weak labels...")
     
     # Merge engineered columns into df for rule evaluation
@@ -425,7 +443,7 @@ def main():
         
     rule_scores, rules_fired = apply_rules(df, enabled_bridges=enabled_bridges)
     
-    # Stage C: LightGBM Classifier
+    # 6. Stage C: LightGBM Classifier
     print("Stage C: Training LightGBM classifier...")
     lgbm_preds, shap_features, shap_summary = train_lgbm(df_features, vae_prob, rule_scores)
     
@@ -433,7 +451,7 @@ def main():
         json.dump(shap_summary, f, indent=2)
     print("Saved SHAP summary to shap_summary.json")
     
-    # Final Output
+    # 7. Write Final Output
     app_ids = df['application_id'] if 'application_id' in df.columns else np.arange(len(df))
     out_df = pd.DataFrame({
         'application_id': app_ids,
