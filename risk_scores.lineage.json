@@ -1,0 +1,20 @@
+{
+  "source_data_path": "datasets/data_for_ml_model.csv",
+  "source_row_count": 15000,
+  "features_json_path": "selected_features.json",
+  "features_pipeline_run_timestamp": "2026-06-18T09:54:55.071916",
+  "n_selected_features": 56,
+  "bridges_enabled": [
+    "FEE_ENG",
+    "FM_ENG",
+    "INC_EXT_ENG",
+    "IP_CONC_ENG",
+    "UN_FATHER_ENG",
+    "X1_ENG",
+    "X7_ENG",
+    "YF_ENG",
+    "YF_MOTHER_ENG"
+  ],
+  "bridges_disabled": [],
+  "run_timestamp": "2026-06-18T09:55:27.372361"
+}
