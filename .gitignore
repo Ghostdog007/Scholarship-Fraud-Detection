@@ -9,3 +9,17 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 *.ipynb
+
+# V2 Generated Data and Models
+engineered_features_v2.csv
+identity_graph.pt
+synthetic_exposure_set.pt
+v2_feature_schema.json
+vae_v2_scores.csv
+graph_v2_scores.csv
+risk_scores_v2.csv
+pseudo_labels_v2.json
+explanation_cards_v2.json
+evt_thresholds_v2.json
+training_log.txt
+*.pth
