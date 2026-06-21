@@ -9,9 +9,9 @@ import itertools
 
 def build_graph():
     print("Loading data...")
-    df = pd.read_csv('engineered_features_v2.csv', low_memory=False)
+    df = pd.read_csv('data/processed/engineered_features_v2.csv', low_memory=False)
     
-    with open('v2_feature_schema.json', 'r') as f:
+    with open('data/processed/v2_feature_schema.json', 'r') as f:
         schema = json.load(f)
         
     feature_cols = schema['features'] + schema['aggregation_features']
@@ -83,7 +83,7 @@ def build_graph():
         print(f"Edge type '{edge_type}': {edge_index.size(1)} directed edges")
 
     print("Saving identity_graph.pt...")
-    torch.save(data, "identity_graph.pt")
+    torch.save(data, "data/processed/identity_graph.pt")
     print("Success")
 
 if __name__ == "__main__":

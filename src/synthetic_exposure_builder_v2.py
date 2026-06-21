@@ -6,9 +6,9 @@ import os
 
 def build_synthetic_exposure_set():
     print("Loading engineered features...")
-    df = pd.read_csv('engineered_features_v2.csv', low_memory=False)
+    df = pd.read_csv('data/processed/engineered_features_v2.csv', low_memory=False)
     
-    with open('v2_feature_schema.json', 'r') as f:
+    with open('data/processed/v2_feature_schema.json', 'r') as f:
         schema = json.load(f)
         
     features = schema.get('features', []) + schema.get('aggregation_features', [])
@@ -88,7 +88,7 @@ def build_synthetic_exposure_set():
     except Exception as e:
         pass # fallback to cpu if forced cuda fails
     
-    torch.save(tensor, 'synthetic_exposure_set.pt')
+    torch.save(tensor, 'data/processed/synthetic_exposure_set.pt')
     print("Saved to synthetic_exposure_set.pt")
 
 if __name__ == '__main__':

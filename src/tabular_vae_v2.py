@@ -58,9 +58,9 @@ def main():
     print(f"Using device: {device}")
     
     print("Loading features...")
-    df = pd.read_csv('engineered_features_v2.csv', low_memory=False)
+    df = pd.read_csv('data/processed/engineered_features_v2.csv', low_memory=False)
     
-    with open('v2_feature_schema.json', 'r') as f:
+    with open('data/processed/v2_feature_schema.json', 'r') as f:
         schema = json.load(f)
         
     features = schema.get('features', []) + schema.get('aggregation_features', [])
@@ -78,7 +78,7 @@ def main():
     
     # Load synthetic tensor
     print("Loading synthetic exposure tensor...")
-    synth_tensor = torch.load('synthetic_exposure_set.pt', map_location='cpu')
+    synth_tensor = torch.load('data/processed/synthetic_exposure_set.pt', map_location='cpu')
     synth_X = scaler.transform(synth_tensor.numpy())
     
     batch_size = 256
@@ -178,10 +178,10 @@ def main():
     recon_json = [json.dumps(dict(zip(numeric_cols, vec))) for vec in recon_vectors]
     df_out['recon_error_vector'] = recon_json
     
-    df_out.to_csv('vae_v2_scores.csv', index=False)
+    df_out.to_csv('outputs/vae_v2_scores.csv', index=False)
     print("Saved to vae_v2_scores.csv")
     
-    torch.save(model.state_dict(), 'tabular_vae_v2.pth')
+    torch.save(model.state_dict(), 'models/tabular_vae_v2.pth')
     print("Saved to tabular_vae_v2.pth")
 
 if __name__ == '__main__':

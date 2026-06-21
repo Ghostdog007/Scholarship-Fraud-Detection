@@ -27,7 +27,7 @@ def run_script(script_name):
             text=True, 
             capture_output=True
         )
-        if script_name == "evaluate_model_v2.py":
+        if script_name == "src/evaluate_model_v2.py":
             logging.info(f"Evaluation Results:\n{result.stdout}")
         logging.info(f"Successfully completed {script_name}.")
     except subprocess.CalledProcessError as e:
@@ -46,30 +46,30 @@ def main():
     
     # Phase A
     logging.info("--- Phase A: Feature Engineering ---")
-    run_script("tabular_feature_engine_v2.py")
+    run_script("src/tabular_feature_engine_v2.py")
     
     # Phase B
     logging.info("--- Phase B: Graph and Synthetic Data Builders ---")
-    run_script("graph_builder_v2.py")
-    run_script("synthetic_exposure_builder_v2.py")
+    run_script("src/graph_builder_v2.py")
+    run_script("src/synthetic_exposure_builder_v2.py")
     
     # Phase C
     logging.info("--- Phase C: VAE and Graph Autoencoder ---")
-    run_script("tabular_vae_v2.py")
-    run_script("graph_autoencoder_v2.py")
+    run_script("src/tabular_vae_v2.py")
+    run_script("src/graph_autoencoder_v2.py")
     
     # Phase D
     logging.info("--- Phase D: EVT and Self-Training Loop ---")
-    run_script("evt_scorer.py")
-    run_script("self_training_loop_v2.py")
+    run_script("src/evt_scorer.py")
+    run_script("src/self_training_loop_v2.py")
     
     # Phase E
     logging.info("--- Phase E: Fusion Classifier and XAI ---")
-    run_script("fusion_classifier_v2.py")
-    run_script("xai_layer_v2.py")
+    run_script("src/fusion_classifier_v2.py")
+    run_script("src/xai_layer_v2.py")
     # Phase F
     logging.info("--- Phase F: Evaluation Harness ---")
-    run_script("evaluate_model_v2.py")
+    run_script("src/evaluate_model_v2.py")
     
     logging.info("V2 Pipeline Orchestration Completed Successfully!")
 

@@ -10,9 +10,9 @@ def similar(a, b):
         return 0.0
     return SequenceMatcher(None, str(a).lower(), str(b).lower()).ratio()
 
-def engineer_features():
-    print("Loading data...")
-    df = pd.read_csv('datasets/data_for_ml_model.csv', low_memory=False)
+def build_tabular_features():
+    print("Loading raw data...")
+    df = pd.read_csv('data/raw/data_for_ml_model.csv', low_memory=False)
 
     # 1. Drop 100% null columns (§2.2)
     null_cols = [
@@ -92,7 +92,7 @@ def engineer_features():
 
     # Save outputs
     print("Saving outputs...")
-    output_csv = 'engineered_features_v2.csv'
+    output_csv = 'data/processed/engineered_features_v2.csv'
     df.to_csv(output_csv, index=False)
     
     excluded_cols = ['application_id', 'sanity', 'jwt']
@@ -144,10 +144,10 @@ def engineer_features():
         "timestamp": datetime.now().isoformat()
     }
     
-    with open('v2_feature_schema.json', 'w') as f:
+    with open('data/processed/v2_feature_schema.json', 'w') as f:
         json.dump(schema, f, indent=2)
         
     print("Done!")
 
 if __name__ == "__main__":
-    engineer_features()
+    build_tabular_features()

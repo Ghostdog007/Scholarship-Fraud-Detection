@@ -41,7 +41,7 @@ def main():
     q = 0.002
     thresholds = {}
     
-    vae_file = 'vae_v2_scores.csv'
+    vae_file = 'outputs/vae_v2_scores.csv'
     if os.path.exists(vae_file):
         df_vae = pd.read_csv(vae_file)
         if 'vae_anomaly_score' in df_vae.columns:
@@ -58,7 +58,7 @@ def main():
     else:
         print(f"{vae_file} not found")
             
-    graph_file = 'graph_v2_scores.csv'
+    graph_file = 'outputs/graph_v2_scores.csv'
     if os.path.exists(graph_file):
         df_graph = pd.read_csv(graph_file)
         if 'graph_anomaly_score' in df_graph.columns:
@@ -75,7 +75,7 @@ def main():
     else:
         print(f"{graph_file} not found")
 
-    with open('evt_thresholds_v2.json', 'w') as f:
+    with open('outputs/evt_thresholds_v2.json', 'w') as f:
         json.dump(thresholds, f, indent=2)
     
     print("evt_thresholds_v2.json created.")

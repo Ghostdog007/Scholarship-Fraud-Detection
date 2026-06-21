@@ -6,13 +6,13 @@ import shap
 
 def main():
     # 1. Load schema
-    with open('v2_feature_schema.json', 'r') as f:
+    with open('data/processed/v2_feature_schema.json', 'r') as f:
         schema = json.load(f)
     
     tabular_features = schema.get('features', []) + schema.get('aggregation_features', [])
     
     # 2. Load engineered features
-    df_eng = pd.read_csv('engineered_features_v2.csv')
+    df_eng = pd.read_csv('data/processed/engineered_features_v2.csv')
     valid_features = [f for f in tabular_features if f in df_eng.columns]
     df_tabular = df_eng[['application_id'] + valid_features].copy()
     
@@ -22,17 +22,17 @@ def main():
     df_tabular = df_tabular[numeric_cols].copy()
             
     # 3. Load VAE scores
-    df_vae = pd.read_csv('vae_v2_scores.csv')
+    df_vae = pd.read_csv('outputs/vae_v2_scores.csv')
     recon_df = pd.json_normalize(df_vae['recon_error_vector'].apply(json.loads))
     recon_df.columns = [f"recon_{c}" for c in recon_df.columns]
     df_vae = pd.concat([df_vae[['application_id', 'vae_anomaly_score']], recon_df], axis=1)
     
     # 4. Load Graph scores
-    df_graph = pd.read_csv('graph_v2_scores.csv')
+    df_graph = pd.read_csv('outputs/graph_v2_scores.csv')
     # Should contain application_id, graph_anomaly_score, attr_recon_error, struct_recon_error
     
     # 5. Load Pseudo Labels
-    with open('pseudo_labels_v2.json', 'r') as f:
+    with open('outputs/pseudo_labels_v2.json', 'r') as f:
         pseudo_labels = json.load(f)
     
     positives = pseudo_labels['positive_set']
@@ -93,7 +93,7 @@ def main():
     # 11. Prepare Output
     output_cols = ['application_id', 'vae_anomaly_score', 'graph_anomaly_score', 'lgbm_risk_score_v2', 'label_source', 'top_shap_features']
     df_output = df_merged[output_cols]
-    df_output.to_csv('risk_scores_v2.csv', index=False)
+    df_output.to_csv('outputs/risk_scores_v2.csv', index=False)
     print(f"Saved risk_scores_v2.csv with {len(df_output)} rows.")
 
 if __name__ == "__main__":

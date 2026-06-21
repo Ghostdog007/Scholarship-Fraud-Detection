@@ -12,10 +12,10 @@ def main():
     round_num = args.round
 
     # Read inputs
-    vae_df = pd.read_csv("vae_v2_scores.csv")
-    graph_df = pd.read_csv("graph_v2_scores.csv")
+    vae_df = pd.read_csv("outputs/vae_v2_scores.csv")
+    graph_df = pd.read_csv("outputs/graph_v2_scores.csv")
     
-    with open("evt_thresholds_v2.json", "r") as f:
+    with open("outputs/evt_thresholds_v2.json", "r") as f:
         evt_thresholds = json.load(f)
 
     vae_threshold = evt_thresholds["vae_anomaly_score"]["threshold"]
@@ -57,7 +57,7 @@ def main():
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }
 
-    with open("pseudo_labels_v2.json", "w") as f:
+    with open("outputs/pseudo_labels_v2.json", "w") as f:
         json.dump(output, f, indent=2)
 
     print(f"Round {round_num} complete. Promoted {len(positive_set)} pseudo-positives.")

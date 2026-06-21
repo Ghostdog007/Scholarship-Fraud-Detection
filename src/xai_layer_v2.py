@@ -6,10 +6,10 @@ import os
 
 def main():
     print("Loading risk scores...")
-    df_risk = pd.read_csv('risk_scores_v2.csv')
+    df_risk = pd.read_csv('outputs/risk_scores_v2.csv')
     
     print("Loading VAE scores...")
-    df_vae = pd.read_csv('vae_v2_scores.csv')
+    df_vae = pd.read_csv('outputs/vae_v2_scores.csv')
     
     # Filter flagged applications
     # e.g., lgbm_risk_score_v2 > 0.5 or label_source != 'negative'
@@ -17,14 +17,14 @@ def main():
     print(f"Found {len(df_flagged)} flagged applications.")
     
     print("Loading graph data...")
-    graph_path = 'identity_graph.pt'
+    graph_path = 'data/processed/identity_graph.pt'
     graph = None
     if os.path.exists(graph_path):
         graph = torch.load(graph_path, weights_only=False)
         
     print("Loading node mapping...")
     # Node index in graph corresponds to order in engineered_features_v2.csv
-    df_eng = pd.read_csv('engineered_features_v2.csv', low_memory=False)
+    df_eng = pd.read_csv('data/processed/engineered_features_v2.csv', low_memory=False)
     node_to_appid = df_eng['application_id'].values
     appid_to_node = {app_id: i for i, app_id in enumerate(node_to_appid)}
     
@@ -118,7 +118,7 @@ def main():
         }
         explanation_cards.append(card)
         
-    with open('explanation_cards_v2.json', 'w') as f:
+    with open('outputs/explanation_cards_v2.json', 'w') as f:
         json.dump(explanation_cards, f, indent=2)
         
     print(f"Saved {len(explanation_cards)} explanation cards to explanation_cards_v2.json")

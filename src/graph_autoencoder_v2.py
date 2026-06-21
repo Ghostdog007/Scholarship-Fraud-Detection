@@ -43,10 +43,10 @@ def main():
     
     print("Loading data...")
     # Load inputs
-    data = torch.load('identity_graph.pt', weights_only=False)
-    syn_x = torch.load('synthetic_exposure_set.pt', weights_only=False).to(device)
+    data = torch.load('data/processed/identity_graph.pt', weights_only=False)
+    syn_x = torch.load('data/processed/synthetic_exposure_set.pt', weights_only=False).to(device)
     
-    df = pd.read_csv('engineered_features_v2.csv', low_memory=False)
+    df = pd.read_csv('data/processed/engineered_features_v2.csv', low_memory=False)
     app_ids = df['application_id'].values
     
     # Extract homogeneous graph
@@ -188,14 +188,14 @@ def main():
         'struct_recon_error': struct_recon_error
     })
     
-    out_file = 'graph_v2_scores.csv'
+    out_file = 'outputs/graph_v2_scores.csv'
     out_df.to_csv(out_file, index=False)
     print(f"Wrote scores to {out_file}")
     
     torch.save({
         'model_state_dict': model.state_dict(),
         'centroid': centroid
-    }, 'graph_autoencoder_v2.pth')
+    }, 'models/graph_autoencoder_v2.pth')
     print("Saved to graph_autoencoder_v2.pth")
 
 if __name__ == '__main__':

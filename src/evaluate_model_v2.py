@@ -63,7 +63,7 @@ def evaluate_models():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Load original data
-    df_real = pd.read_csv('engineered_features_v2.csv', low_memory=False)
+    df_real = pd.read_csv('data/processed/engineered_features_v2.csv', low_memory=False)
     df_real['is_synthetic'] = 0
     df_real['synth_category'] = 'NORMAL'
     N_real = len(df_real)
@@ -108,7 +108,7 @@ def evaluate_models():
         
     df_combined = pd.concat([df_real] + synthetic_dfs, ignore_index=True)
     
-    with open('v2_feature_schema.json', 'r') as f:
+    with open('data/processed/v2_feature_schema.json', 'r') as f:
         schema = json.load(f)
     features = schema.get('features', []) + schema.get('aggregation_features', [])
     excluded = schema.get('excluded', [])
@@ -122,7 +122,7 @@ def evaluate_models():
     
     # 1. Evaluate Tabular VAE
     model_vae = TabularVAE(input_dim=len(numeric_cols), latent_dim=8).to(device)
-    model_vae.load_state_dict(torch.load('tabular_vae_v2.pth', map_location=device))
+    model_vae.load_state_dict(torch.load('models/tabular_vae_v2.pth', map_location=device))
     model_vae.eval()
     
     vae_scores = []
@@ -168,7 +168,7 @@ def evaluate_models():
     num_relations = h_data.edge_type.max().item() + 1
     
     # 2. Evaluate Graph AE
-    graph_checkpoint = torch.load('graph_autoencoder_v2.pth', map_location=device)
+    graph_checkpoint = torch.load('models/graph_autoencoder_v2.pth', map_location=device)
     model_graph = DOMINANT(x_tens.size(1), 64, 32, num_relations).to(device)
     model_graph.load_state_dict(graph_checkpoint['model_state_dict'])
     centroid = graph_checkpoint['centroid'].to(device)
