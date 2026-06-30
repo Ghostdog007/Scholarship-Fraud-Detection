@@ -25,7 +25,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.config_v3 import RANDOM_SEED
+from src.config_v3 import MIN_SIGNALS_FOR_PROMOTION, RANDOM_SEED
+from src.confirmed_fraud_store import load_confirmed, load_false_positive_ids
 
 np.random.seed(RANDOM_SEED)
 
@@ -47,6 +48,17 @@ def _extract_group_scores(subspace_df: pd.DataFrame, group: str) -> np.ndarray:
 
 def run_self_training(current_round: int = 0) -> None:
     print(f"[self_training] run_self_training() round={current_round} ...")
+
+    # ── Confirmed fraud: hard labels — bypass EVT entirely ──────────────────
+    confirmed_records  = load_confirmed()
+    confirmed_ids      = {r["application_id"] for r in confirmed_records}
+    confirmed_type_map = {r["application_id"]: r["fraud_type"] for r in confirmed_records}
+    false_positive_ids = load_false_positive_ids()
+
+    if confirmed_ids:
+        print(f"[self_training] {len(confirmed_ids)} confirmed fraud records loaded (bypass EVT)")
+    if false_positive_ids:
+        print(f"[self_training] {len(false_positive_ids)} confirmed false positives loaded (hard negatives)")
 
     hybrid_df   = pd.read_csv(HYBRID_CSV)
     subspace_df = pd.read_csv(SUBSPACE_CSV)
@@ -71,13 +83,15 @@ def run_self_training(current_round: int = 0) -> None:
         print(f"[self_training]   {name}: {flag.sum()} nodes above threshold")
 
     if current_round == 0:
-        # Code-enforced: classifier agreement is OFF at round 0
-        # Union of all EVT tails
-        any_evt = signal_flags["EVT_HYBRID"]
-        for flag in list(signal_flags.values())[1:]:
-            any_evt = any_evt | flag
-        promoted_mask = any_evt
-        print(f"[self_training] Round 0: union of 5 EVT tails (classifier OFF by design)")
+        # Code-enforced: classifier agreement is OFF at round 0.
+        # Multi-signal agreement required: a node must fire at least
+        # MIN_SIGNALS_FOR_PROMOTION EVT signals to be promoted.
+        # This reduces confirmation bias from single-signal noise (e.g. income=5 INR
+        # triggers only EVT_FINANCIAL but looks normal on all other dimensions).
+        signal_count = sum(flag.astype(int) for flag in signal_flags.values())
+        promoted_mask = signal_count >= MIN_SIGNALS_FOR_PROMOTION
+        print(f"[self_training] Round 0: requires >= {MIN_SIGNALS_FOR_PROMOTION} EVT signals "
+              f"(classifier OFF by design) — {promoted_mask.sum()} nodes qualify")
     else:
         if not RISK_CSV.exists():
             raise FileNotFoundError(
@@ -93,21 +107,33 @@ def run_self_training(current_round: int = 0) -> None:
         promoted_mask = any_evt & above_classifier
         print(f"[self_training] Round {current_round}: union EVT + classifier >= {CLASSIFIER_CONFIDENCE_MIN}")
 
+    # Exclude confirmed false positives from EVT promotions — hard negatives
+    promoted_mask = promoted_mask & ~merged["application_id"].isin(false_positive_ids)
+
     promoted_ids = merged.loc[promoted_mask, "application_id"].tolist()
-    negative_ids = merged.loc[~promoted_mask, "application_id"].tolist()
-    print(f"[self_training] Pseudo-positives: {len(promoted_ids)} | Negatives: {len(negative_ids)}")
+
+    # Negatives: not EVT-promoted AND not confirmed fraud
+    # (confirmed fraud in other cycles may not appear in this merged df at all)
+    negative_ids = merged.loc[
+        ~promoted_mask & ~merged["application_id"].isin(confirmed_ids), "application_id"
+    ].tolist()
+
+    print(f"[self_training] Pseudo-positives (EVT): {len(promoted_ids)} | Negatives: {len(negative_ids)}")
 
     # Build positive records with per-signal trigger info
     positive_records = []
+
+    # 1. EVT-promoted pseudo-positives
     for _, row in merged[promoted_mask].iterrows():
         triggers = [name for name, flag in signal_flags.items() if flag.loc[row.name]]
         rec = {
-            "application_id":       row["application_id"],
-            "round":                current_round,
-            "trigger":              triggers,
-            "hybrid_anomaly_score": float(round(row["hybrid_anomaly_score"], 6)),
-            "subspace_if_score":    float(round(row["subspace_if_score"], 6)),
-            "edge_pred_error":      float(round(row["edge_pred_error"], 6)),
+            "application_id":        row["application_id"],
+            "round":                 current_round,
+            "source":                "evt_pseudo",
+            "trigger":               triggers,
+            "hybrid_anomaly_score":  float(round(row["hybrid_anomaly_score"], 6)),
+            "subspace_if_score":     float(round(row["subspace_if_score"], 6)),
+            "edge_pred_error":       float(round(row["edge_pred_error"], 6)),
             "subspace_if_financial": float(round(row["subspace_if_financial"], 6)),
             "subspace_if_identity":  float(round(row["subspace_if_identity"], 6)),
             "subspace_if_network":   float(round(row["subspace_if_network"], 6)),
@@ -115,6 +141,31 @@ def run_self_training(current_round: int = 0) -> None:
         if current_round > 0 and "risk_score_v3" in row:
             rec["classifier_confidence"] = float(round(row["risk_score_v3"], 6))
         positive_records.append(rec)
+
+    # 2. Confirmed fraud: hard labels — added regardless of EVT threshold
+    #    Only include IDs that appear in the current scoring run
+    scored_ids = set(merged["application_id"].tolist())
+    for app_id in confirmed_ids:
+        if app_id not in scored_ids:
+            continue  # confirmed from a previous cycle not in this year's data
+        if any(r["application_id"] == app_id for r in positive_records):
+            continue  # already promoted by EVT — don't duplicate
+        row = merged[merged["application_id"] == app_id].iloc[0]
+        positive_records.append({
+            "application_id":        app_id,
+            "round":                 current_round,
+            "source":                "confirmed",   # hard label — not a pseudo-label
+            "trigger":               [f"CONFIRMED:{confirmed_type_map[app_id]}"],
+            "hybrid_anomaly_score":  float(round(row["hybrid_anomaly_score"], 6)),
+            "subspace_if_score":     float(round(row["subspace_if_score"], 6)),
+            "edge_pred_error":       float(round(row["edge_pred_error"], 6)),
+            "subspace_if_financial": float(round(row["subspace_if_financial"], 6)),
+            "subspace_if_identity":  float(round(row["subspace_if_identity"], 6)),
+            "subspace_if_network":   float(round(row["subspace_if_network"], 6)),
+        })
+
+    n_confirmed_in_run = sum(1 for r in positive_records if r["source"] == "confirmed")
+    print(f"[self_training] Hard-label confirmed fraud in this run: {n_confirmed_in_run}")
 
     # Breakdown by trigger type
     trigger_counts: dict[str, int] = {}

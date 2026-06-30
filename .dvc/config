@@ -1,0 +1,5 @@
+[core]
+    autostage = true
+    remote = localremote
+['remote "localremote"']
+    url = C:\Users\Lenovo\dvc-store

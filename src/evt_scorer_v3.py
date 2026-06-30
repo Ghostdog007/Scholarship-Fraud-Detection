@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import genpareto
 
-from src.config_v3 import RANDOM_SEED
+from src.config_v3 import EVT_SHAPE_MAX, EVT_SHAPE_MIN, RANDOM_SEED
 
 np.random.seed(RANDOM_SEED)
 
@@ -41,8 +41,23 @@ U_PERCENTILE_OVERRIDES: dict[str, int] = {
 
 
 def _fit_evt(scores: np.ndarray, score_name: str, u_percentile: int = U_PERCENTILE) -> dict:
+    # Jitter: smooth discrete cluster spikes (e.g. identical IP-cluster scores)
+    # before fitting GPD. Sigma=0.001 is negligible relative to score range [0,1]
+    # but breaks exact ties that violate GPD smoothness assumptions.
+    rng    = np.random.default_rng(seed=42)
+    scores = scores + rng.normal(0, 0.001, size=scores.shape)
+    scores = np.clip(scores, 0.0, None)
+
     u            = np.percentile(scores, u_percentile)
     exceedances  = scores[scores > u] - u
+
+    # Discreteness warning: if >50% of tail values are identical, distribution
+    # likely has a spike that will produce a poorly conditioned GPD fit.
+    if len(exceedances) > 0:
+        top_val_freq = (exceedances == exceedances.max()).mean()
+        if top_val_freq > 0.5:
+            print(f"[evt] WARNING: '{score_name}' tail is highly discrete "
+                  f"({top_val_freq:.0%} of exceedances share the max value) — GPD fit may be unreliable")
 
     if len(exceedances) < 10:
         print(f"[evt] WARNING: too few exceedances ({len(exceedances)}) for '{score_name}' -- percentile fallback")
@@ -54,6 +69,18 @@ def _fit_evt(scores: np.ndarray, score_name: str, u_percentile: int = U_PERCENTI
         }
 
     shape, _loc, scale = genpareto.fit(exceedances, floc=0)
+
+    # Shape validity check: ξ outside [-0.5, 1.0] indicates the distribution
+    # violates GPD regularity assumptions. Fall back to empirical quantile.
+    if not (EVT_SHAPE_MIN <= shape <= EVT_SHAPE_MAX):
+        print(f"[evt] WARNING: '{score_name}' GPD shape={shape:.4f} outside valid range "
+              f"[{EVT_SHAPE_MIN}, {EVT_SHAPE_MAX}] — falling back to empirical quantile")
+        threshold = np.percentile(scores, 100 * (1 - Q))
+        return {
+            "u": float(u), "scale": float(scale), "shape": float(shape),
+            "threshold": float(threshold), "method": "empirical_fallback_bad_shape",
+            "n_exceedances": int(len(exceedances)),
+        }
 
     n_total  = len(scores)
     n_exceed = len(exceedances)

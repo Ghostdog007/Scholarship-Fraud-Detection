@@ -1,5 +1,12 @@
 # NIC Scholarship Fraud Detection — V3 Hybrid GraphMCM
 
+> **For LLM agents:** Read `docs/AGENTS.md` before writing any code — start
+> with the **AGENT QUICK-START** block at the top, then §9 (module ownership)
+> and §10 (hard stops). This README is a human-readable overview; AGENTS.md is
+> the authoritative contract for all implementation decisions.
+
+---
+
 ## What This Is
 
 An unsupervised fraud detection system for 15,000 NIC scholarship applications.
@@ -200,7 +207,7 @@ data/raw/data_for_ml_model.csv  (15,000 × 136)
                │
                ▼
         Self-Training Loop
-        (human-gated, 1 round)
+        (human-gated, ≥2 EVT signals required)
                │
                ▼
         LightGBM Fusion
@@ -281,7 +288,7 @@ nodes and measure score retention. Validates whether the hybrid learned
 feature-based suspicion that persists without graph support, or whether
 detection is purely graph-dependent.
 
-### Achieved Results (full-trained model, round 0, 111 pseudo-positives)
+### Achieved Results (full-trained model, round 0)
 
 The evaluation uses per-category subspace IF as the primary scorer for injected
 isolated nodes. The hybrid model's `isolated_embedding` is a fixed shared vector
@@ -300,6 +307,13 @@ the relevant feature group is the correct tabular anomaly detector here.
 Isolated-node stratum PR-AUC: 0.47–1.00 across all categories.
 Edge-dropout score_retention = 3.6452 (feature-based suspicion persists without graph support).
 
+> **Self-training note (updated 2026-06-30):** Round 0 promotion now requires
+> ≥ 2 EVT signals to fire simultaneously (`MIN_SIGNALS_FOR_PROMOTION=2`).
+> The original OR logic promoted ~111 nodes; multi-signal agreement reduces
+> this to ~13 higher-confidence pseudo-positives per run. The PR-AUC figures
+> above were measured on the full-trained model and remain the current
+> evaluation baseline.
+
 ---
 
 ## Directory Layout
@@ -317,9 +331,9 @@ NIC fraud Detection Project/
 │   ├── hybrid_graphmcm_v3.py               # Core model: feature stream + graph stream
 │   ├── subspace_if_v3.py                   # 3-group subspace isolation forest
 │   ├── evt_scorer_v3.py                    # GPD tail fit on 6 signals (hybrid + 5 subspace)
-│   ├── self_training_loop_v3.py            # Pseudo-label promotion (human-gated, UNION of 5 EVT)
+│   ├── self_training_loop_v3.py            # Pseudo-label promotion (human-gated, ≥2 of 5 EVT signals)
 │   ├── fusion_classifier_v3.py             # LightGBM: hybrid + subspace IF → risk score
-│   ├── xai_layer_v3.py                     # Per-feature errors + actual values + trigger narratives
+│   ├── xai_layer_v3.py                     # Reviewer-ready explanation cards: readable feature labels, resolved neighbor IDs, actionable narratives
 │   └── evaluate_model_v3.py                # Category-specific subspace IF + degree-stratified PR-AUC
 │
 ├── data/
@@ -361,6 +375,130 @@ python main_v3.py
 # Evaluation only:
 .\.venv\Scripts\python.exe src/evaluate_model_v3.py
 ```
+
+---
+
+## MLflow Audit Guide
+
+Every pipeline run is logged to `mlflow.db` (SQLite, project root).
+This covers how to open the UI and where to find each auditable artefact.
+
+### Starting the UI
+
+```bat
+mlflow_ui.bat
+```
+
+Then open **http://localhost:5000** in your browser.
+The batch file always points the UI at the correct `mlflow.db` — do not
+run `mlflow ui` manually without it or runs will not appear.
+
+---
+
+### Navigation map
+
+```
+http://localhost:5000
+│
+├── Experiments (left sidebar)
+│   └── nic-fraud-detection-v3          ← click this
+│       └── Runs table (one row per pipeline execution)
+│           └── [click any run]
+│               ├── Overview tab        ← cycle label, duration, smoke-test flag
+│               ├── Model Metrics tab   ← PR-AUC per fraud category (chart view)
+│               ├── Parameters tab      ← all 23 config_v3 constants used for this run
+│               └── Artifacts tab       ← all output files (see below)
+```
+
+---
+
+### Artifacts tab — what to look at and why
+
+| Folder | File | What it tells you |
+|---|---|---|
+| `suspicious/` | `top_suspicious_v3.tsv` | **Start here.** Top 20 highest-risk applications with risk score, anomalous features (human-readable labels), linked application IDs, EVT triggers, and full narrative recommendation. Open in Excel for best readability. |
+| `xai/` | `explanation_cards_v3.json` | Full 500 explanation cards. Each card has `review_status`, `top_feature_errors` (with `feature_label`), `top_graph_neighbors` (with actual application IDs), and `narrative`. Download and open in VS Code — search by application ID. |
+| `scores/` | `risk_scores_v3.csv` | Risk score for all 15,000 applications. Columns: `application_id`, `risk_score_v3`, `label_source`. Sort descending to get the full ranked list beyond the top 500. |
+| `thresholds/` | `evt_thresholds_v3.json` | EVT threshold for each of the 6 signals (hybrid, subspace_if, financial, identity, network, edge). Records the GPD fit params (`scale`, `shape`) and how many applications crossed each threshold. Useful for auditing whether thresholds are reasonable. |
+| `labels/` | `pseudo_labels_v3.json` | The 13 applications promoted to pseudo-positive in Round 0 self-training. Each record shows which EVT signals fired. Review before any Round 1 is authorised. |
+| `checkpoints/` | `hybrid_graphmcm_v3.pth` | Model weights used for this run. Download to reproduce scores exactly on the same data. |
+
+---
+
+### Metrics tab — what the numbers mean
+
+| Metric | What it means | Pass threshold |
+|---|---|---|
+| `pr_auc_age_violation` | Precision-Recall AUC for detecting fake age fields | > 0.1466 (V2 floor) |
+| `pr_auc_income_violation` | PR-AUC for declared income anomalies | > 0.6503 |
+| `pr_auc_ip_concentration` | PR-AUC for IP address clustering fraud | > 0.0370 |
+| `pr_auc_mother_name_collision` | PR-AUC for shared mother-name rings | > 0.2869 |
+| `pr_auc_fee_inflation` | PR-AUC for inflated tuition fee declarations | > 0.4962 |
+| `score_retention` | How much risk score survives when graph edges are removed (isolated-node robustness). > 1.0 means feature signal alone is sufficient. | > 1.0 |
+| `n_categories_pass` | Number of fraud categories beating the V2 floor. Should be 5/5. | 5 |
+| `pipeline_duration_seconds` | Wall-clock time for the run | — |
+
+---
+
+### Comparing two runs
+
+1. In the runs table, tick the checkboxes on two rows.
+2. Click **Compare** (top of table).
+3. MLflow shows a side-by-side diff of all params and metrics — useful for
+   checking whether a config change improved PR-AUC or shifted thresholds.
+
+---
+
+### Re-running XAI only (without retraining)
+
+If you want a fresh MLflow run using existing scores (e.g. after editing
+the XAI layer), run:
+
+```bat
+.venv\Scripts\python.exe main_v3.py --steps=xai,evaluate --cycle=<label>
+```
+
+This completes in ~15 seconds and logs a new run with updated explanation
+cards and the top-suspicious TSV.
+
+---
+
+## Changelog
+
+### 2026-06-30 — XAI explanation card improvements
+
+Five readability and usability issues in `src/xai_layer_v3.py` fixed to make
+explanation cards usable by fraud reviewers (not just data scientists):
+
+| Issue | Fix |
+|---|---|
+| Raw database column names (`inst_verify_by`) unreadable by reviewers | Added `FEATURE_LABELS` dict mapping all 68 columns to human-readable display names (e.g. "Institution verifier code"). `feature_label` field added to every `top_feature_errors` entry. |
+| `label_source: "negative"` misleading when risk = 1.0 | Replaced with `review_status` field using plain-English strings (e.g. "Pending Review — no confirmed fraud label assigned yet"). |
+| `triggers: []` with high risk score unexplained | Narrative now explicitly states when the hybrid model's collective anomaly score drives suspicion without a single EVT threshold crossing. |
+| `neighbor_idx: 8534` (raw array index) unresolvable by reviewers | `top_graph_neighbors` now contains `application_id` (actual portal ID) instead of internal array index. Reviewers can cross-reference directly. |
+| Narrative described ML mechanics, not reviewer action | Narrative rewritten to explain WHY each field is suspicious ("the model could not predict this from the rest of the application"), include graph alert with linked application IDs, and end with a concrete recommended action (hold/request documents). |
+
+MLflow artifacts updated: `suspicious/top_suspicious_v3.tsv` now includes
+`review_status`, `linked_applications` (with actual IDs), and full narrative.
+
+### 2026-06-30 — Risk-mitigation hardening pass
+
+Five structural weaknesses identified in the MAR (Appendix D) were partially
+mitigated. All changes are additive or tighten existing thresholds — no
+architecture change, no new dependencies, no evaluation harness change.
+
+| Risk | Fix | File(s) |
+|---|---|---|
+| DeepSVDD centroid contamination | `init_centroid()` now excludes the top 5% of nodes by embedding norm before computing the mean. Prevents fraud-shaped embeddings from pulling the hypersphere centroid toward fraud. | `hybrid_graphmcm_v3.py`, `config_v3.py` (`CENTROID_CLEAN_PERCENTILE=95`) |
+| EVT GPD instability on discrete score distributions | Score jitter (σ=0.001 Gaussian) applied before fitting. GPD shape validation rejects fits outside `[-0.5, 1.0]` and falls back to empirical quantile. Discreteness spike warning added. | `evt_scorer_v3.py`, `config_v3.py` (`EVT_SHAPE_MIN`, `EVT_SHAPE_MAX`) |
+| Self-training confirmation bias | Round 0 promotion changed from OR-of-5-signals to requiring `MIN_SIGNALS_FOR_PROMOTION=2` simultaneous EVT signals. Single-signal noise hits (data-entry errors that trigger one detector) no longer promote to pseudo-positive. | `self_training_loop_v3.py`, `config_v3.py` |
+| Forensically clean isolated nodes (detection boundary) | No code fix possible — added diagnostic print: reports what fraction of top-100 risk scores are degree-0 nodes, making the gap observable. | `hybrid_graphmcm_v3.py` |
+| Narrow synthetic exposure archetypes | Each archetype now generates `N_CLEAN=50` peak-signal examples + `N_PERTURB=100` graduated variants spanning 85th–97th percentile signal strength. `_add_context_noise()` perturbs 25% of non-target features per row to widen geometric coverage. | `synthetic_exposure_builder_v3.py` |
+
+**Verified:** 5-step smoke test (exposure build → 2-epoch train → EVT → self-training → fusion)
+ran clean in 35.7 s. EVT shape fallback caught 2 real bad fits live (`subspace_if_score`,
+`subspace_if_network`). Promotion count moved from 111 (OR logic) to 13 (2-signal) on the
+smoke run.
 
 ---
 

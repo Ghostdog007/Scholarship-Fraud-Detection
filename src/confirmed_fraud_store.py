@@ -1,0 +1,169 @@
+"""
+confirmed_fraud_store.py
+
+Single source of truth for supervisor-confirmed fraud examples.
+
+The supervisor calls add_confirmed() after reviewing an XAI card.
+Everything downstream (LOE exposure, self-training labels, LightGBM
+sample weights) reads from this file — no other file needs to be touched.
+
+Writes: data/processed/confirmed_fraud.json
+"""
+
+import json
+from datetime import date
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+
+STORE_PATH   = Path("data/processed/confirmed_fraud.json")
+FEATURES_CSV = Path("data/processed/engineered_features_v3.csv")
+
+VALID_FRAUD_TYPES = {
+    "IP_CLUSTER",
+    "FEE_INFLATION",
+    "INCOME_VIOLATION",
+    "NAME_COLLISION",
+    "CROSS_CHANNEL",
+    "OTHER",
+}
+
+
+def _load_store() -> dict:
+    if STORE_PATH.exists():
+        return json.loads(STORE_PATH.read_text())
+    return {"confirmed": [], "false_positives": []}
+
+
+def _save_store(store: dict) -> None:
+    STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STORE_PATH.write_text(json.dumps(store, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Supervisor-facing API
+# ---------------------------------------------------------------------------
+
+def add_confirmed(
+    app_id: str,
+    fraud_type: str,
+    confirmed_by: str,
+    notes: str = "",
+    cycle: str = "",
+) -> None:
+    """
+    Supervisor marks an application as confirmed fraud.
+    Feature vector is pulled automatically from the engineered features CSV.
+
+    fraud_type must be one of VALID_FRAUD_TYPES.
+    """
+    if fraud_type not in VALID_FRAUD_TYPES:
+        raise ValueError(f"fraud_type must be one of {VALID_FRAUD_TYPES}, got '{fraud_type}'")
+
+    df = pd.read_csv(FEATURES_CSV)
+    row = df[df["application_id"] == app_id]
+    if row.empty:
+        raise ValueError(f"application_id '{app_id}' not found in {FEATURES_CSV}")
+
+    feat_cols   = [c for c in df.columns if c != "application_id"]
+    feature_vec = row[feat_cols].values[0].tolist()
+
+    store = _load_store()
+
+    # Avoid duplicate entries
+    existing_ids = {r["application_id"] for r in store["confirmed"]}
+    if app_id in existing_ids:
+        print(f"[confirmed_fraud] '{app_id}' already confirmed — skipping.")
+        return
+
+    store["confirmed"].append({
+        "application_id": app_id,
+        "cycle":          cycle,
+        "fraud_type":     fraud_type,
+        "feature_vec":    feature_vec,
+        "confirmed_by":   confirmed_by,
+        "confirmed_at":   str(date.today()),
+        "notes":          notes,
+    })
+
+    _save_store(store)
+    total = len(store["confirmed"])
+    print(f"[confirmed_fraud] Added '{app_id}' ({fraud_type}). Total confirmed: {total}")
+
+
+def add_false_positive(app_id: str, confirmed_by: str, notes: str = "") -> None:
+    """Supervisor marks a flag as a false positive — used as hard negative in LightGBM."""
+    store = _load_store()
+    existing_ids = {r["application_id"] for r in store["false_positives"]}
+    if app_id in existing_ids:
+        print(f"[confirmed_fraud] '{app_id}' already marked false positive — skipping.")
+        return
+
+    store["false_positives"].append({
+        "application_id": app_id,
+        "confirmed_by":   confirmed_by,
+        "confirmed_at":   str(date.today()),
+        "notes":          notes,
+    })
+    _save_store(store)
+    print(f"[confirmed_fraud] Marked '{app_id}' as false positive. Total FP: {len(store['false_positives'])}")
+
+
+# ---------------------------------------------------------------------------
+# Downstream consumers
+# ---------------------------------------------------------------------------
+
+def load_confirmed() -> list[dict]:
+    """Returns list of confirmed fraud records."""
+    return _load_store()["confirmed"]
+
+
+def load_false_positive_ids() -> set[str]:
+    """Returns set of application IDs confirmed as false positives."""
+    return {r["application_id"] for r in _load_store()["false_positives"]}
+
+
+def get_exposure_tensor(
+    synthetic_fallback: torch.Tensor,
+    min_real: int = 5,
+) -> tuple[torch.Tensor, str]:
+    """
+    Returns the LOE exposure tensor and a label describing its source.
+
+    If fewer than min_real confirmed fraud examples exist, returns synthetic_fallback.
+    If enough real examples exist, returns real feature vectors (better geometry).
+    If both exist, returns concatenation (real + synthetic as backup coverage).
+    """
+    records = load_confirmed()
+    if len(records) < min_real:
+        print(f"[confirmed_fraud] {len(records)} confirmed < {min_real} min — using synthetic exposure.")
+        return synthetic_fallback, "synthetic"
+
+    real_vecs = torch.tensor(
+        np.array([r["feature_vec"] for r in records], dtype=np.float32)
+    )
+
+    # Concatenate: real examples anchor the LOE; synthetic covers archetypes
+    # not yet seen in confirmed cases
+    combined = torch.cat([real_vecs, synthetic_fallback], dim=0)
+    print(f"[confirmed_fraud] Exposure set: {len(records)} real + {synthetic_fallback.shape[0]} synthetic = {combined.shape[0]} total")
+    return combined, "real+synthetic"
+
+
+def summary() -> None:
+    store = _load_store()
+    confirmed = store["confirmed"]
+    fp        = store["false_positives"]
+    print(f"[confirmed_fraud] Total confirmed fraud : {len(confirmed)}")
+    print(f"[confirmed_fraud] Total false positives : {len(fp)}")
+    if confirmed:
+        from collections import Counter
+        counts = Counter(r["fraud_type"] for r in confirmed)
+        for ftype, n in counts.most_common():
+            print(f"  {ftype}: {n}")
+
+
+if __name__ == "__main__":
+    summary()

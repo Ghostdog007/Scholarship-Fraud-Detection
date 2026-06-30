@@ -23,3 +23,15 @@ explanation_cards_v2.json
 evt_thresholds_v2.json
 training_log.txt
 *.pth
+/models
+/outputs
+
+# MLflow experiment tracking (local file-based, not committed to git)
+mlruns/
+
+# Pre-commit cache
+.pre-commit-cache/
+
+# DVC cache (content-addressed, managed by DVC — not git)
+/data/processed/
+

@@ -23,13 +23,71 @@ OUT_JSON       = Path("outputs/explanation_cards_v3.json")
 TOP_K_FEATURES  = 5
 TOP_K_NEIGHBORS = 3
 
-TRIGGER_DESCRIPTIONS = {
-    "EVT_HYBRID":    "general anomaly (hybrid model)",
-    "EVT_FINANCIAL": "income/fee fraud signal",
-    "EVT_IDENTITY":  "identity collision signal",
-    "EVT_NETWORK":   "IP concentration signal",
-    "EVT_EDGE_RING": "cross-channel fraud ring",
+# Human-readable labels for every engineered feature column
+FEATURE_LABELS: dict[str, str] = {
+    # Identity
+    "application_id":            "Application ID",
+    "c_institution_id":          "Institution ID (college-reported)",
+    "c_course_id":               "Course ID (college-reported)",
+    "c_student_id":              "Student ID (college-reported)",
+    "inst_verify_by":            "Institution verifier code",
+    "state_verify_by":           "State verifier code",
+    "district_verify_by":        "District verifier code",
+    # Temporal
+    "admission_year":            "Year of admission",
+    "x_course_year":             "Course year (external record)",
+    "p_course_year":             "Course year (portal record)",
+    "x_passing_year":            "Passing year (external record)",
+    "p_passing_year":            "Passing year (portal record)",
+    # Financial
+    "annual_income":             "Declared annual family income",
+    "total_fee":                 "Total tuition fee declared",
+    "fee_to_income_ratio":       "Fee-to-income ratio",
+    "income_percentile":         "Income percentile (state-normalised)",
+    "fee_percentile":            "Fee percentile (course-normalised)",
+    "fee_deviation_from_median": "Fee deviation from course median",
+    # Network / IP
+    "ip_application_count":      "No. of applications from same IP",
+    "ip_to_mobile_ratio":        "IP-to-mobile concentration ratio",
+    "mobile_application_count":  "No. of applications from same mobile",
+    "shared_ip_flag":            "Shared IP address flag",
+    "shared_mobile_flag":        "Shared mobile number flag",
+    # Name-sharing
+    "shared_father_name_count":  "No. of applications sharing father's name",
+    "shared_mother_name_count":  "No. of applications sharing mother's name",
+    "father_name_entropy":       "Father name entropy (uniqueness)",
+    "mother_name_entropy":       "Mother name entropy (uniqueness)",
+    # Geography
+    "is_urban":                  "Urban applicant flag",
+    "pincode_application_count": "No. of applications from same pincode",
+    "state_code":                "State code",
+    "district_code":             "District code",
+    # Degree features (from graph)
+    "degree_shares_ip":          "Graph degree — shared IP edges",
+    "degree_shares_mobile":      "Graph degree — shared mobile edges",
+    "degree_shares_father_name": "Graph degree — shared father-name edges",
+    "degree_shares_mother_name": "Graph degree — shared mother-name edges",
+    "degree_shares_pincode":     "Graph degree — shared pincode edges",
 }
+
+TRIGGER_DESCRIPTIONS = {
+    "EVT_HYBRID":    "overall anomaly detected by hybrid model (EVT threshold crossed)",
+    "EVT_FINANCIAL": "income or fee amount is statistically extreme for this cohort",
+    "EVT_IDENTITY":  "identity fields (name / verifier codes) form an unusual cluster",
+    "EVT_NETWORK":   "IP address shared with an unusually large number of other applications",
+    "EVT_EDGE_RING": "part of a cross-channel fraud ring (IP + mobile + name overlap)",
+}
+
+LABEL_SOURCE_DESCRIPTIONS = {
+    "negative":       "Pending Review — no confirmed fraud label assigned yet",
+    "evt_positive":   "EVT Flagged — statistical tail signal crossed threshold",
+    "pseudo_positive":"Model Flagged — promoted by self-training (round 0)",
+    "confirmed":      "Confirmed Fraud — manually verified by reviewer",
+}
+
+
+def _readable(feature: str) -> str:
+    return FEATURE_LABELS.get(feature, feature.replace("_", " ").title())
 
 
 def _magnitude(value: float) -> str:
@@ -54,9 +112,13 @@ def _top_features(per_feat: dict, actual_vals: dict, k: int) -> list[dict]:
     result = []
     for f, err in sorted_feats[:k]:
         val = actual_vals.get(f)
-        entry: dict = {"feature": f, "error": round(err, 6)}
+        entry: dict = {
+            "feature":       f,
+            "feature_label": _readable(f),
+            "error":         round(err, 6),
+        }
         if val is not None:
-            entry["value"] = round(float(val), 6)
+            entry["value"]     = round(float(val), 6)
             entry["magnitude"] = _magnitude(float(val))
         result.append(entry)
     return result
@@ -82,39 +144,74 @@ def _build_neighbor_index(graph_pt_path: Path) -> dict[int, list[dict]]:
 
 def _narrative(card: dict) -> str:
     parts = []
-    score = card["risk_score_v3"]
-
-    if score >= 0.7:
-        parts.append("High risk application.")
-    elif score >= 0.4:
-        parts.append("Moderate risk application.")
-    else:
-        parts.append("Low risk application.")
-
+    score    = card["risk_score_v3"]
     triggers = card.get("triggers", [])
+    neighbors = card["top_graph_neighbors"]
+    top_feats = card["top_feature_errors"]
+
+    # Risk level opener
+    if score >= 0.7:
+        parts.append("HIGH RISK — recommend manual review before processing.")
+    elif score >= 0.4:
+        parts.append("MODERATE RISK — flag for secondary verification.")
+    else:
+        parts.append("LOW RISK — no immediate action required.")
+
+    # What drove the score
     if triggers:
         descs = [TRIGGER_DESCRIPTIONS.get(t, t) for t in triggers]
-        parts.append(f"Triggered by: {', '.join(descs)}.")
+        parts.append("Flagged because: " + "; ".join(descs) + ".")
+    elif score >= 0.7:
+        parts.append(
+            "No single EVT threshold was crossed, but the hybrid model's "
+            "overall anomaly score is in the top risk tier — the combination "
+            "of feature inconsistencies is collectively suspicious."
+        )
 
-    top_feats = card["top_feature_errors"]
+    # Feature explanation — WHY these fields are suspicious
     if top_feats:
-        feat_strs = []
+        feat_lines = []
         for f in top_feats[:3]:
-            if "value" in f and "magnitude" in f:
-                feat_strs.append(f"{f['feature']}={f['value']:.3f} ({f['magnitude']})")
-            else:
-                feat_strs.append(f["feature"])
-        parts.append(f"Largest prediction errors: {', '.join(feat_strs)}.")
+            label = f.get("feature_label", _readable(f["feature"]))
+            mag   = f.get("magnitude", "unknown")
+            val   = f.get("value")
+            val_str = f" (value={val:.3f})" if val is not None else ""
+            feat_lines.append(
+                f"{label}{val_str} is {mag} — the model could not predict "
+                f"this from the rest of the application, suggesting it is "
+                f"inconsistent with legitimate application patterns."
+            )
+        parts.append("Key anomalous fields: " + " | ".join(feat_lines) + ".")
 
-    neighbors = card["top_graph_neighbors"]
+    # Graph connections
     if neighbors:
-        et_counts: dict[str, int] = {}
+        et_groups: dict[str, list[str]] = {}
         for n in neighbors:
-            et_counts[n["edge_type"]] = et_counts.get(n["edge_type"], 0) + 1
-        conn_str = "; ".join(f"{v} via {k}" for k, v in et_counts.items())
-        parts.append(f"Connected to other applications: {conn_str}.")
+            et_groups.setdefault(n["edge_type"], []).append(
+                n.get("application_id", f'idx:{n.get("neighbor_idx","?")}')
+            )
+        conn_parts = []
+        for et, ids in et_groups.items():
+            edge_label = et.replace("shares_", "shares same ").replace("_", " ")
+            id_list = ", ".join(ids[:3])
+            conn_parts.append(f"{len(ids)} application(s) via {edge_label} ({id_list})")
+        parts.append(
+            "Graph alert: this application is linked to "
+            + "; ".join(conn_parts)
+            + ". Linked applications should be reviewed together."
+        )
     else:
-        parts.append("No graph connections (isolated node).")
+        parts.append(
+            "Isolated node — no shared IP, mobile, name, or pincode links found. "
+            "Suspicion is driven entirely by feature-level inconsistencies."
+        )
+
+    # Recommended action
+    if score >= 0.7:
+        parts.append(
+            "Recommended action: hold disbursement and request supporting documents "
+            "(fee receipt, admission letter, income certificate) before approval."
+        )
 
     return " ".join(parts)
 
@@ -151,6 +248,7 @@ def run_xai(top_n: int = 500) -> None:
 
     all_ids   = hybrid_df["application_id"].tolist()
     id_to_idx = {aid: i for i, aid in enumerate(all_ids)}
+    idx_to_id = {i: aid for aid, i in id_to_idx.items()}   # resolve idx → application_id
 
     cards = []
     for _, row in merged_top.iterrows():
@@ -171,14 +269,19 @@ def run_xai(top_n: int = 500) -> None:
 
         top_feats = _top_features(per_feat, actual_vals, TOP_K_FEATURES)
 
+        # Resolve neighbor indices to application IDs
         neighbors = neighbor_index.get(node_idx, [])
         top_neighbors = neighbors[:TOP_K_NEIGHBORS]
         neighbor_records = [
-            {"edge_type": n["edge_type"], "neighbor_idx": n["neighbor_idx"]}
+            {
+                "edge_type":      n["edge_type"],
+                "application_id": idx_to_id.get(n["neighbor_idx"], f'idx:{n["neighbor_idx"]}'),
+            }
             for n in top_neighbors
         ]
 
         triggers = trigger_map.get(app_id, [])
+        label_src = row["label_source"]
 
         card = {
             "application_id":       app_id,
@@ -186,7 +289,8 @@ def run_xai(top_n: int = 500) -> None:
             "hybrid_anomaly_score": float(round(row["hybrid_anomaly_score"], 6)),
             "feature_pred_error":   float(round(row["feature_pred_error"], 6)),
             "edge_pred_error":      float(round(row["edge_pred_error"], 6)),
-            "label_source":         row["label_source"],
+            # Human-readable status — "negative" was confusing for reviewers
+            "review_status":        LABEL_SOURCE_DESCRIPTIONS.get(label_src, label_src),
             "triggers":             triggers,
             "top_feature_errors":   top_feats,
             "top_graph_neighbors":  neighbor_records,

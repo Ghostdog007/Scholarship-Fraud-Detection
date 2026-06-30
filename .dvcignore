@@ -1,0 +1,24 @@
+# Add patterns of files dvc should ignore, which could improve
+# the performance. Learn more at
+# https://dvc.org/doc/user-guide/dvcignore
+
+# Temporary and intermediate files
+*.tmp
+*.log
+*.pyc
+__pycache__/
+
+# Review/HTML build artifacts — no need to version these
+outputs/node_modules/
+outputs/*.html
+outputs/*.md
+outputs/*.js
+outputs/review_assets/
+outputs/package*.json
+
+# V2 outputs — historical, not part of V3 pipeline DVC lineage
+outputs/*_v2*
+data/processed/*_v2*
+
+# MLflow has its own run versioning
+mlruns/

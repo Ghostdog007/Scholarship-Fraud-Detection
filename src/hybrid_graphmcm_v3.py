@@ -30,10 +30,13 @@ from torch_geometric.nn import RGCNConv
 
 from src.config_v3 import (
     BATCH_SIZE,
+    CENTROID_CLEAN_PERCENTILE,
     EPOCHS_STAGE1,
     EPOCHS_STAGE2,
     GRAPH_EMB_DIM,
     GRAPH_HIDDEN,
+    INCREMENTAL_EPOCHS,
+    INCREMENTAL_LR,
     LAMBDA_EDGE,
     LAMBDA_EXPOSURE,
     LOE_MARGIN,
@@ -177,9 +180,19 @@ class HybridGraphMCM(nn.Module):
     ) -> None:
         self.eval()
         h = self.encode_graph(x, edge_index_list, edge_type_tensor, isolated_mask)
-        self.centroid = h.mean(dim=0).detach()
+        # Contamination-aware centroid: exclude top (100 - CENTROID_CLEAN_PERCENTILE)%
+        # of nodes by embedding norm before computing the mean. These are the most
+        # anomalous embeddings and likely include fraud — including them shifts the
+        # centroid toward fraud, causing DeepSVDD hypersphere inflation.
+        norms = h.norm(dim=1)
+        cutoff = torch.quantile(norms, CENTROID_CLEAN_PERCENTILE / 100.0)
+        clean_mask = norms <= cutoff
+        n_excluded = int((~clean_mask).sum().item())
+        self.centroid = h[clean_mask].mean(dim=0).detach()
         self.centroid_initialized = True
-        print(f"[hybrid] Centroid initialised, norm={self.centroid.norm():.4f}")
+        print(f"[hybrid] Centroid initialised (excluded {n_excluded} high-norm nodes, "
+              f"{CENTROID_CLEAN_PERCENTILE}th pct cutoff={cutoff:.4f}), "
+              f"norm={self.centroid.norm():.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +388,15 @@ def train(smoke_test: bool = False) -> None:
     print(f"[hybrid] Scores saved -> {OUT_CSV}")
     print(f"[hybrid] hybrid_anomaly_score range: [{hybrid_scores.min():.4f}, {hybrid_scores.max():.4f}]")
 
+    # Isolated-node diagnostic: report what fraction of top-100 are degree-0 nodes.
+    # A high fraction here means the model is primarily detecting isolated nodes, not
+    # relational fraud — this is the forensically-clean-node detection boundary.
+    iso_np = isolated_mask.cpu().numpy()
+    top100_idx = np.argsort(hybrid_scores)[-100:]
+    iso_in_top100 = iso_np[top100_idx].sum()
+    print(f"[hybrid] Isolated-node diagnostic: {iso_in_top100}/100 top-scoring nodes have degree=0 "
+          f"(detection for these relies on subspace IF, not graph signal)")
+
     # Save checkpoint
     centroid_val = model.centroid.cpu()
     MODEL_PTH.parent.mkdir(parents=True, exist_ok=True)
@@ -390,6 +412,161 @@ def train(smoke_test: bool = False) -> None:
                 "Z_DIM": Z_DIM,
                 "MASK_NUM": MASK_NUM,
                 "N_EDGE_TYPES": N_EDGE_TYPES,
+            },
+            "feature_names": features,
+        },
+        MODEL_PTH,
+    )
+    print(f"[hybrid] Checkpoint saved -> {MODEL_PTH}")
+
+
+def train_incremental(
+    exposure_tensor: torch.Tensor | None = None,
+    epochs: int = INCREMENTAL_EPOCHS,
+    lr: float = INCREMENTAL_LR,
+    freeze_rgcn: bool = True,
+    smoke_test: bool = False,
+) -> None:
+    """
+    CPU fine-tune for yearly incremental update.
+
+    Loads existing checkpoint, freezes the RGCN encoder (preserves graph
+    topology knowledge), and runs Stage 2 reconstruction loss for `epochs`
+    epochs on the current year's graph + feature data.
+
+    exposure_tensor: confirmed fraud + synthetic tensors from confirmed_fraud_store.
+                     If None, loads the default synthetic exposure set.
+    freeze_rgcn:     True = only update MLP prediction head (recommended for CPU).
+                     False = update all weights (use when confirmed fraud > 50).
+    """
+    print(f"[hybrid] train_incremental() | epochs={epochs} lr={lr} freeze_rgcn={freeze_rgcn} device={DEVICE}")
+
+    if not MODEL_PTH.exists():
+        raise FileNotFoundError(f"No checkpoint at {MODEL_PTH}. Run full train() first.")
+
+    schema    = json.loads(SCHEMA_JSON.read_text())
+    features  = schema["features"]
+    df        = pd.read_csv(FINAL_CSV)
+    feat_cols = [c for c in df.columns if c != "application_id"]
+    app_ids   = df["application_id"].values
+
+    x_all = torch.tensor(df[feat_cols].values, dtype=torch.float32).to(DEVICE)
+    data  = torch.load(GRAPH_PT, weights_only=False)
+
+    if exposure_tensor is None:
+        exposure_tensor = torch.load(EXPOSURE_PT, weights_only=True)
+    x_exposure = exposure_tensor.to(DEVICE)
+
+    edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, DEVICE)
+    isolated_mask = _compute_isolated_mask(edge_index_list, x_all.shape[0], DEVICE)
+
+    # Load existing weights
+    ckpt  = torch.load(MODEL_PTH, weights_only=False, map_location=DEVICE)
+    model = HybridGraphMCM().to(DEVICE)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.centroid = ckpt["centroid"].to(DEVICE)
+    print(f"[hybrid] Loaded checkpoint from {MODEL_PTH}")
+
+    if freeze_rgcn:
+        for param in model.rgcn.parameters():
+            param.requires_grad = False
+        print("[hybrid] RGCN encoder frozen — updating predictor + edge_predictor + mask_logits only")
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable, lr=lr)
+
+    run_epochs = 2 if smoke_test else epochs
+    model.train()
+    print(f"[hybrid] Incremental Stage 2: {run_epochs} epochs ...")
+    for epoch in range(run_epochs):
+        optimizer.zero_grad()
+
+        pred_x, edge_prob, h_n, _ = model(x_all, edge_index_list, edge_type_tensor, isolated_mask)
+        feat_loss = _feature_pred_loss(pred_x, x_all)
+        edge_loss = _edge_pred_loss(edge_prob, edge_index_list, x_all.shape[0], DEVICE)
+
+        # LOE on confirmed/synthetic exposure — keeps fraudster embeddings away from centroid
+        h_exp = _get_synth_h(model, x_exposure, edge_index_list, edge_type_tensor, DEVICE)
+        loe   = _loe_loss(h_exp, model.centroid, LAMBDA_EXPOSURE * 0.5)  # half weight during fine-tune
+
+        loss = feat_loss + LAMBDA_EDGE * edge_loss + loe
+        loss.backward()
+        optimizer.step()
+
+        if (epoch + 1) % max(1, run_epochs // 5) == 0 or smoke_test:
+            print(f"  epoch {epoch+1}/{run_epochs} | feat={feat_loss.item():.4f} edge={edge_loss.item():.4f} loe={loe.item():.4f}")
+
+    # Re-score and save checkpoint (overwrites — old checkpoint backed up)
+    _backup_checkpoint()
+    _score_and_save(model, x_all, edge_index_list, edge_type_tensor, isolated_mask, app_ids, features)
+    print("[hybrid] Incremental update complete.")
+
+
+def _backup_checkpoint() -> None:
+    if MODEL_PTH.exists():
+        backup = MODEL_PTH.with_suffix(".pth.bak")
+        import shutil
+        shutil.copy2(MODEL_PTH, backup)
+        print(f"[hybrid] Previous checkpoint backed up -> {backup}")
+
+
+def _score_and_save(
+    model: HybridGraphMCM,
+    x_all: torch.Tensor,
+    edge_index_list: list,
+    edge_type_tensor: torch.Tensor,
+    isolated_mask: torch.Tensor,
+    app_ids: np.ndarray,
+    features: list[str],
+) -> None:
+    """Shared scoring + checkpoint save logic used by train() and train_incremental()."""
+    model.eval()
+    with torch.no_grad():
+        pred_x, edge_prob, h_n, _ = model(x_all, edge_index_list, edge_type_tensor, isolated_mask)
+
+        per_feat_err       = (pred_x - x_all).abs()
+        feature_pred_error = per_feat_err.mean(dim=1)
+
+        target = torch.zeros(x_all.shape[0], N_EDGE_TYPES, device=x_all.device)
+        for rel_id, ei in enumerate(edge_index_list):
+            if ei.shape[1] > 0:
+                target[ei[0], rel_id] = 1.0
+                target[ei[1], rel_id] = 1.0
+        edge_pred_error = F.binary_cross_entropy(edge_prob, target, reduction="none").mean(dim=1)
+
+        hybrid_anomaly_score = feature_pred_error + LAMBDA_EDGE * edge_pred_error
+
+    def _norm(t: torch.Tensor) -> np.ndarray:
+        v = t.cpu().numpy()
+        lo, hi = v.min(), v.max()
+        return ((v - lo) / (hi - lo + 1e-8)).astype(np.float32)
+
+    per_feat_np = per_feat_err.cpu().numpy()
+    per_feature_error_json = [
+        json.dumps({features[j]: float(round(per_feat_np[i, j], 6)) for j in range(N_FEATURES)})
+        for i in range(len(app_ids))
+    ]
+
+    out_df = pd.DataFrame({
+        "application_id":         app_ids,
+        "hybrid_anomaly_score":   _norm(hybrid_anomaly_score),
+        "feature_pred_error":     _norm(feature_pred_error),
+        "edge_pred_error":        _norm(edge_pred_error),
+        "per_feature_error_json": per_feature_error_json,
+    })
+    OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(OUT_CSV, index=False)
+    print(f"[hybrid] Scores saved -> {OUT_CSV}")
+
+    MODEL_PTH.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "centroid":         model.centroid.cpu(),
+            "config": {
+                "N_FEATURES": N_FEATURES, "GRAPH_EMB_DIM": GRAPH_EMB_DIM,
+                "GRAPH_HIDDEN": GRAPH_HIDDEN, "MLP_HIDDEN": MLP_HIDDEN,
+                "Z_DIM": Z_DIM, "MASK_NUM": MASK_NUM, "N_EDGE_TYPES": N_EDGE_TYPES,
             },
             "feature_names": features,
         },

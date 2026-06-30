@@ -298,7 +298,7 @@ def _edge_dropout_test(
 # Main evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate() -> None:
+def evaluate() -> dict[str, float]:
     from src.hybrid_graphmcm_v3 import (
         HybridGraphMCM,
         _build_edge_index_and_types,
@@ -388,6 +388,11 @@ def evaluate() -> None:
         print(f"  {cat:<25}: {pr:.4f}  [{status}]")
     passed = sum(1 for cat, pr in results.items() if pr >= V2_FLOORS[cat])
     print(f"\n{passed}/{len(results)} categories beat V2 floor.")
+
+    metrics = {f"pr_auc_{cat.lower()}": pr for cat, pr in results.items()}
+    metrics["score_retention"]  = retention
+    metrics["n_categories_pass"] = float(passed)
+    return metrics
 
 
 if __name__ == "__main__":

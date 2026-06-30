@@ -90,3 +90,23 @@ wcwidth==0.8.1
 webencodings==0.5.1
 xxhash==3.7.0
 yarl==1.24.2
+
+# ── Deep learning (install separately — wheel is platform/CUDA specific) ──────
+# CPU server: pip install torch --index-url https://download.pytorch.org/whl/cpu
+# GPU laptop: pip install torch  (default index, picks CUDA wheel)
+torch>=2.0.0
+torch_geometric>=2.4.0
+
+# ── REST API / async job queue ─────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+celery>=5.4.0
+redis>=5.0.0
+psycopg[binary]>=3.1.0
+
+# ── MLOps ─────────────────────────────────────────────────────────────────────
+mlflow>=2.14.0
+
+# ── Structured logging ────────────────────────────────────────────────────────
+structlog>=24.0.0
+python-json-logger>=2.0.0

@@ -14,6 +14,17 @@ LR              = 1e-3
 BATCH_SIZE      = 256
 RANDOM_SEED     = 42
 
+# Incremental fine-tune (CPU server, post-cycle update)
+INCREMENTAL_EPOCHS = 10    # Stage 2 epochs only, RGCN frozen
+INCREMENTAL_LR     = 1e-4  # lower than full LR to avoid overwriting graph knowledge
+
+# Confirmed fraud sample weight in LightGBM fusion
+# Confirmed = hard label from supervisor; pseudo = EVT-promoted soft label
+CONFIRMED_WEIGHT = 3.0
+
+# KS test p-value below which full GPU retrain is recommended
+DRIFT_KS_THRESHOLD = 0.01
+
 EDGE_TYPES = [
     "shares_mobile",
     "shares_ip",
@@ -84,3 +95,18 @@ DUPLICATE_COLS_TO_DROP = [
 ]
 
 EXCLUDED_FROM_FEATURES = ["application_id", "sanity", "jwt"]
+
+# Self-training: minimum number of EVT signals that must fire for Round 0 promotion.
+# 1 = original OR logic (noisy); 2 = requires multi-signal agreement (recommended).
+MIN_SIGNALS_FOR_PROMOTION = 2
+
+# EVT GPD shape validity range. Fits outside this range are rejected and fall back
+# to empirical quantile. Values outside [-0.5, 1.0] indicate a distribution that
+# violates GPD regularity assumptions (heavy tails or discrete cluster spikes).
+EVT_SHAPE_MIN = -0.5
+EVT_SHAPE_MAX = 1.0
+
+# DeepSVDD centroid: fraction of highest-norm embeddings excluded before computing
+# the centroid mean. Excludes likely-contaminated nodes (potential fraud) from the
+# normal centroid definition.
+CENTROID_CLEAN_PERCENTILE = 95  # keep bottom 95% by embedding norm

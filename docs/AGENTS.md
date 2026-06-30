@@ -4,6 +4,58 @@
 
 ---
 
+## AGENT QUICK-START — Read This First
+
+**What this system is:** Unsupervised fraud detection for 15,000 NIC scholarship
+applications. Outputs a 0–1 risk score per application. No hardcoded rules allowed.
+
+**Current state:** V3 fully implemented and evaluated. MLOps Phase 1 complete
+(MLflow SQLite backend, DVC, pre-commit). XAI explanation cards improved
+(human-readable feature labels, resolved neighbor application IDs, actionable
+narratives, `review_status` replacing raw `label_source`). MLflow UI working
+via `mlflow_ui.bat` (port 5000, SQLite backend). README has full MLflow Audit
+Guide. AGENTS.md has LLM quick-start block and closing instruction.
+
+**Next task:** Phase 2 MLOps — build ADR-005 (FastAPI inference + supervisor
+server) and a Dockerfile together so the API can be tested via Docker Desktop
+on Windows (no WSL). Start with the FastAPI server in `src/api/`, then
+containerise immediately. Order: ADR-005 → Dockerfile → ADR-008
+(checkpoint manager) → ADR-007 (structured logging) → ADR-006 (Celery + Redis).
+
+**Three rules you must never break:**
+1. No domain-threshold rules anywhere in code (no `age > 35`, no rule codes). §10 stop #1.
+2. No raw GNN embeddings outside `hybrid_graphmcm_v3.py`. §10 stop #2.
+3. Never advance self-training rounds without project lead approval. §10 stop #5.
+
+**Jump to what you need:**
+- Your module boundary → §9 (Module Ownership table)
+- All hard stops → §10
+- File input/output contracts → §7
+- Dimension constants → §6 (import from `src/config_v3.py`, never hardcode)
+- Current evaluation results → §5.1
+- MLOps decisions → Appendix F
+
+---
+
+## AGENT CLOSING INSTRUCTION — Do This Before Every Session End
+
+Before ending any session, you MUST update the **AGENT QUICK-START** block
+above with the current state of the project. Specifically update these two lines:
+
+```
+**Current state:** <what is fully implemented and verified>
+**Next task:**     <exactly what the next session should start with>
+```
+
+Also update AGENTS.md and README.md to reflect any code changes made during
+the session (module boundaries, file contracts, hard stops, evaluation results).
+
+This is mandatory — not optional. A future agent reading this file cold must
+be able to pick up exactly where this session left off without asking the user
+to re-explain context.
+
+---
+
 ## 0. How to Use This File
 
 **Read this entire file before writing a single line of code.**
@@ -329,6 +381,28 @@ SUBSPACE_GROUPS = {
 
 # Log1p-transform these columns before MinMaxScaling
 LOG1P_COLS = ["annual_family_income", "admission_fee", "tution_fee", "misc_fee"]
+
+# ── Risk-mitigation constants (added 2026-06-30) ──────────────────────────────
+
+# Self-training: minimum number of EVT signals that must fire simultaneously
+# for a node to be promoted to pseudo-positive in Round 0.
+# 1 = original OR logic (any single signal promotes). 2 = multi-signal agreement.
+# Raised to 2 to reduce confirmation bias from single-signal data-entry noise
+# (e.g. income=5 INR fires EVT_FINANCIAL alone but passes no other signal).
+MIN_SIGNALS_FOR_PROMOTION = 2
+
+# EVT GPD shape validity range. Fits outside this range indicate a distribution
+# that violates GPD regularity assumptions (discrete cluster spikes, heavy-tailed
+# or bounded distributions). Bad fits fall back to empirical quantile.
+EVT_SHAPE_MIN = -0.5
+EVT_SHAPE_MAX = 1.0
+
+# DeepSVDD centroid: fraction of nodes KEPT when computing the initial centroid.
+# The top (100 - CENTROID_CLEAN_PERCENTILE)% of nodes by embedding norm are
+# excluded before averaging. These are the highest-anomaly embeddings and are
+# likely to include fraud — including them shifts the centroid toward fraud,
+# causing the DeepSVDD hypersphere to silently expand to accept fraud as normal.
+CENTROID_CLEAN_PERCENTILE = 95
 ```
 
 ### EVT per-signal threshold overrides
@@ -349,16 +423,24 @@ All other thresholds are GPD-derived.
 
 ### Self-training pseudo-label signals (Round 0)
 
-Round 0 promotes the **union** of 5 EVT tails (no classifier agreement required):
+Round 0 requires **at least `MIN_SIGNALS_FOR_PROMOTION` (= 2) EVT signals to
+fire simultaneously** (no classifier agreement required). A node is
+pseudo-positive if it clears the threshold on ≥ 2 of:
 - `EVT_HYBRID` — `hybrid_anomaly_score >= hybrid_threshold`
 - `EVT_FINANCIAL` — `subspace_if_financial >= financial_threshold`
 - `EVT_IDENTITY` — `subspace_if_identity >= identity_threshold`
 - `EVT_NETWORK` — `subspace_if_network >= network_threshold`
 - `EVT_EDGE_RING` — `edge_pred_error >= edge_pred_error_threshold`
 
+**Rationale for change (2026-06-30):** The original OR logic (any 1 of 5)
+promoted 111 nodes in the full-trained run. A meaningful fraction of these
+were single-signal hits driven by data-entry noise (e.g. `annual_family_income
+= 5 INR` fires `EVT_FINANCIAL` alone but looks normal on every other signal).
+Requiring 2 signals ensures each promoted node has independent corroboration
+from two different fraud-detection lenses before entering LightGBM training.
+
 Each positive record in `pseudo_labels_v3.json` carries a `trigger` field
-listing which signals fired for that application. Current round-0 result:
-111 pseudo-positives (FINANCIAL:27, IDENTITY:51, HYBRID:33, EDGE_RING:34, NETWORK:18).
+listing which signals fired for that application.
 
 ### Concat dimension check (all agents must verify)
 
@@ -394,7 +476,11 @@ another module's source files directly. No embeddings cross module boundaries.
 | `outputs/evt_thresholds_v3.json` | evt | self_training | 6 signals: `{hybrid, subspace_if, subspace_if_financial, subspace_if_identity, subspace_if_network, edge_pred_error}` each with `{u, scale, shape, threshold, n_flagged}` |
 | `outputs/pseudo_labels_v3.json` | self_training | fusion, xai | `positive_set` array, each record: `{application_id, round, trigger: [list of EVT signal names], hybrid_anomaly_score, subspace_if_*, edge_pred_error}` |
 | `outputs/risk_scores_v3.csv` | fusion | xai, evaluate | `application_id, risk_score_v3, label_source` |
-| `outputs/explanation_cards_v3.json` | xai | [end user] | per-application JSON; `top_feature_errors` entries include `{feature, error, value, magnitude}`; card includes `triggers` list |
+| `outputs/explanation_cards_v3.json` | xai | [end user] | per-application JSON. `top_feature_errors`: `{feature, feature_label, error, value, magnitude}` — `feature_label` is human-readable display name. `top_graph_neighbors`: `{edge_type, application_id}` — neighbor index resolved to actual application ID (no raw array indices). `review_status`: human-readable string replacing raw `label_source` (e.g. "Pending Review — no confirmed fraud label assigned yet"). `narrative`: full actionable prose including recommended action and explanation of why features are suspicious. |
+| `data/processed/confirmed_fraud.json` | API / supervisor endpoint | retraining_orchestrator, self_training, fusion | `{confirmed: [{application_id, fraud_type, confirmed_by, cycle, feature_vec, confirmed_at, notes}], false_positives: [{application_id, confirmed_by, confirmed_at, notes}]}` |
+| `models/checkpoints/hybrid_v3_<cycle>_<run_id>.pth` | checkpoint_manager | rollback command, MLflow | same schema as `hybrid_graphmcm_v3.pth` (`model_state_dict`, `centroid`, `config`); keep last 5; filename encodes cycle and mlflow_run_id |
+| `outputs/prev_cycle_scores_ks.json` | retraining_orchestrator (end of cycle) | next-cycle drift check | `{scores: [float, ...]}` — score distribution baseline for KS test; overwritten after every completed inference cycle |
+| `outputs/feature_drift_v3.json` | retraining_orchestrator | API `/monitoring/drift` endpoint | `{feature_name: {ks_stat, p_value, mean_prev, mean_curr}}` for all 68 engineered features |
 
 **Hard rule:** `per_feature_error_json` is a JSON string of
 `{feature_name: float}` for all 68 features. Downstream XAI reads this column
@@ -446,6 +532,7 @@ row, stop and confirm scope.
 | XAI | `src/xai_layer_v3.py` | `hybrid_scores_v3.csv`, `risk_scores_v3.csv`, `pseudo_labels_v3.json`, `engineered_features_v3.csv` | `explanation_cards_v3.json` | no training code |
 | Evaluate | `src/evaluate_model_v3.py` | `engineered_features_v3.csv`, `models/*.pth` | console stdout | no training code |
 | Orchestrator | `main_v3.py` | — | calls all modules | no business logic |
+| Checkpoint manager | `src/checkpoint_manager.py` | incoming `.pth` (temp path), `models/hybrid_graphmcm_v3.pth` | `models/hybrid_graphmcm_v3.pth` (live), `models/hybrid_graphmcm_v3.pth.bak`, `models/checkpoints/` | no training code; no model forward pass; validation and file operations only |
 
 ---
 
@@ -492,6 +579,24 @@ row, stop and confirm scope.
 13. **`score_retention` must be printed by `evaluate_model_v3.py`.** If
     `score_retention < 0.2`, print: "Graph-dependent detection: isolated node
     performance will be degraded."
+14. **`hybrid_graphmcm_v3.pth` is never written directly.** The live checkpoint
+    path is a read-only destination at runtime. All writes go to a temp path
+    (`models/incoming_<timestamp>_<uuid>.pth`) first. `checkpoint_manager.py`
+    performs the atomic rename after validation passes. Any code that calls
+    `torch.save(..., "models/hybrid_graphmcm_v3.pth")` directly is wrong —
+    route through `checkpoint_manager.validate_and_hotswap()` instead.
+15. **Checkpoint schema must embed a `config` dict.** `hybrid_graphmcm_v3.py`
+    must save checkpoints with exactly these top-level keys:
+    `{model_state_dict, centroid, config}`. The `config` dict must contain at
+    minimum `N_FEATURES`, `GRAPH_EMB_DIM`, and `N_EDGE_TYPES` sourced from
+    `config_v3.py`. This is the contract `checkpoint_manager.py` validates
+    against before any swap. A checkpoint missing these keys is rejected with
+    no change to the live model.
+16. **`nic-worker` replica count is fixed at 1.** Training jobs write to fixed
+    output paths (`outputs/*.csv`, `models/*.pth`). Scaling `nic-worker` to 2
+    causes concurrent runs to overwrite each other's intermediates. Enforce
+    in the k8s Deployment manifest with an explicit comment — `concurrency=1`
+    at the Celery level alone is not sufficient.
 
 ---
 
@@ -504,6 +609,12 @@ row, stop and confirm scope.
   need LOE. May need tuning.
 - Whether Subspace IF `network` group is final — degree features are untested
   as IF inputs.
+- Optimal `MIN_SIGNALS_FOR_PROMOTION` — currently 2; no ablation on whether
+  3-signal agreement would improve pseudo-label precision at the cost of recall.
+- Archetype expansion — `_add_context_noise()` widens existing archetype
+  geometry but the 5 archetype types are unchanged. 3–5 additional archetypes
+  (cross-cycle IP reuse, institute-cluster, income-rounding) should be evaluated
+  before the next full retrain. See Appendix B.
 
 ---
 
@@ -704,11 +815,11 @@ between them. V3 unifies them into a single joint model.
 
 | Component | Core Assumption | Failure Condition | Failure Mode | V3 Status |
 |---|---|---|---|---|
-| DeepSVDD / Hybrid centroid | Normal data density is clean | Fraud dominates the dataset | Hypersphere inflates to accept fraud as normal — silent | **Unmitigated** |
-| EVT Scorer | Tail fits GPD smoothly | Score distribution has extreme discontinuities | Threshold explodes or drops to 0 | **Unmitigated** |
-| Self-Training Loop | EVT tail contains true positives | EVT tail is mostly data entry typos (e.g., income = 5 INR) | Classifier anchors on typos, misses sophisticated fraud | **Unmitigated** |
-| Isolated nodes | Degree features make isolation visible | Applicant has unique values on all 5 edge fields AND normal-looking features | Statistically indistinguishable from a genuine isolated student | **Partially mitigated** (degree features help; forensically clean isolated fraud remains undetectable) |
-| Stage 1 Synthetic Exposure | Archetypes represent real fraud geometry | Archetypes are too narrow or obvious | Stage 2 biased toward obvious fraud; subtle patterns treated as normal | **Unmitigated** |
+| DeepSVDD / Hybrid centroid | Normal data density is clean | Fraud dominates the dataset | Hypersphere inflates to accept fraud as normal — silent | **Partially mitigated** — contamination-aware init excludes top 5% embedding-norm nodes before computing centroid (`CENTROID_CLEAN_PERCENTILE=95`). Does not eliminate risk if fraud fraction > 5%. |
+| EVT Scorer | Tail fits GPD smoothly | Score distribution has discrete cluster spikes or violates regularity | Threshold explodes or drops to 0 | **Partially mitigated** — score jitter (σ=0.001) smooths discrete spikes; shape validation rejects GPD fits outside `[EVT_SHAPE_MIN, EVT_SHAPE_MAX]` = `[-0.5, 1.0]` and falls back to empirical quantile. Verified live: caught `subspace_if_score` (shape=-0.513) and `subspace_if_network` (shape=-0.533) on first run. |
+| Self-Training Loop | EVT tail contains true positives | EVT tail is mostly data entry typos (e.g., income = 5 INR) | Classifier anchors on typos, misses sophisticated fraud | **Partially mitigated** — `MIN_SIGNALS_FOR_PROMOTION=2` requires independent corroboration from ≥2 EVT signals before promotion. Single-signal noise hits (e.g. income=5 INR firing EVT_FINANCIAL alone) no longer promoted. Human EVT-tail review before Round 1 remains mandatory. |
+| Isolated nodes | Degree features make isolation visible | Applicant has unique values on all 5 edge fields AND normal-looking features | Statistically indistinguishable from a genuine isolated student | **Partially mitigated** (degree features help; forensically clean isolated fraud remains undetectable). Diagnostic added: scoring pass prints isolated-node fraction in top-100 risk scores. |
+| Stage 1 Synthetic Exposure | Archetypes represent real fraud geometry | Archetypes are too narrow or obvious | Stage 2 biased toward obvious fraud; subtle patterns treated as normal | **Partially mitigated** — each archetype now produces `N_CLEAN=50` peak-signal examples + `N_PERTURB=100` graduated variants spanning 85th–97th percentile signal strength, plus `_add_context_noise()` perturbing 25% of non-target features per row. Wider geometry. Novel fraud archetypes remain unrepresented — still needs archetype expansion. |
 
 ## D.2 What Would Break First in Production
 
@@ -774,3 +885,391 @@ outside those specific synthetic topologies.
 
 **Do not introduce:** `tensorflow`, `keras`, `xgboost` (unless discussed),
 SMOTE/oversampling, any autoML library, any tabular GAN (Appendix B).
+
+---
+
+# Appendix F — MLOps Architecture Decisions (ADR Format)
+<!-- STATUS: Proposed | OWNER: Project Lead | DATE: 2026-06-29 -->
+<!-- These ADRs define the operational infrastructure for V3. -->
+<!-- No ADR is implemented until explicitly authorized by the project lead. -->
+
+## F.0 Context
+
+V3 has a well-designed ML architecture with zero MLOps infrastructure.
+There is no experiment tracking, model registry, artifact versioning, CI/CD,
+containerization, or observability. The file-based inter-module contracts
+(§8) are an MLOps asset — every improvement here wraps the existing `src/`
+modules without touching them.
+
+**Three-phase migration:**
+- **Phase 1 (zero-risk):** Fix the broken reproducibility baseline.
+- **Phase 2 (low-risk):** Operational layer — API, async jobs, registry, logging.
+- **Phase 3 (infrastructure):** Containerization, Kubernetes, PostgreSQL, CI/CD.
+
+**Invariant:** no `src/*.py` module is modified in any phase. Wrappers only.
+
+---
+
+## ADR-001 — Fix `requirements.txt` to declare all dependencies
+
+**Status:** Implemented (2026-06-29)
+**Context:** `requirements.txt` did not declare `torch`, `torch_geometric`, or
+any operational dependencies. A fresh `pip install -r requirements.txt` on the
+production server produced a broken environment.
+**Decision:** Add pinned minimum versions for PyTorch, PyG, FastAPI, Celery,
+Redis, psycopg3, MLflow, and structlog to `requirements.txt`. Add a separate
+`requirements-dev.txt` for DVC, ruff, mypy, pytest, and pre-commit.
+**Note on PyTorch install:** the wheel is platform-specific. CPU server:
+`pip install torch --index-url https://download.pytorch.org/whl/cpu`.
+GPU laptop: `pip install torch` (default index picks the CUDA wheel).
+**Consequences:** Reproducible environments. Docker builds will succeed.
+**Files changed:** `requirements.txt`, `requirements-dev.txt` (new).
+**Phase:** 1
+
+---
+
+## ADR-002 — MLflow experiment tracking
+
+**Status:** Proposed
+**Context:** Every training run overwrites `models/hybrid_graphmcm_v3.pth`
+in place. No hyperparameters, metrics, or run metadata are recorded.
+**Decision:** Wrap `main_v3.py` and `retraining_orchestrator.py` entry points
+in `mlflow.start_run()` context managers. Log all `config_v3.py` constants as
+params, all PR-AUC values from `evaluate_model_v3.py` as metrics, and model
+checkpoints as artifacts. Use local file-based MLflow tracking for Phase 1–2;
+migrate to a tracking server in Phase 3 if needed.
+**Technology chosen:** MLflow over W&B (W&B sends metadata to cloud — NIC
+data cannot leave premises) and Aim (smaller community, less mature registry).
+**Consequences:** Every run is reproducible by checkpoint. Year-over-year
+PR-AUC comparison is automatic. No `src/` module is modified.
+**Files to change:** `main_v3.py` (wrap), `retraining_orchestrator.py` (wrap),
+`src/evaluate_model_v3.py` (log metrics).
+**Phase:** 1
+
+---
+
+## ADR-003 — DVC for data and artifact versioning
+
+**Status:** Proposed
+**Context:** `data/processed/` artifacts change every cycle and are not
+version-controlled. `models/*.pth` are overwritten in place. No data lineage
+exists between a model checkpoint and the dataset that produced it.
+**Decision:** `dvc init` in the repository. Track `data/processed/`,
+`models/`, and `outputs/` under DVC. Use local remote storage initially;
+upgrade to Azure Blob or S3-compatible in Phase 3.
+**Technology chosen:** DVC over LakeFS (requires S3-compatible backend,
+adds infrastructure) and Delta Lake (requires Spark, Parquet-only).
+**Consequences:** Every artifact is content-addressed. `dvc checkout` reproduces
+any prior cycle's exact state. `dvc push` provides off-site backup.
+**Files to change:** `.dvc/` (new), `.dvcignore` (new), `.gitignore` (update).
+**Phase:** 1
+
+---
+
+## ADR-004 — Pre-commit hooks for code quality
+
+**Status:** Proposed
+**Context:** No automated code quality enforcement. A type error or import
+error in any `src/` module is discovered only at pipeline runtime — which may
+be months after the change was merged.
+**Decision:** Add `.pre-commit-config.yaml` with `ruff` (lint + format),
+`mypy` (type check), and `pytest --smoke` (2-epoch pipeline smoke test).
+**Consequences:** Breaking changes are caught before they reach `main`. The
+smoke test adds ~3 minutes to commit time but catches import errors immediately.
+**Files to change:** `.pre-commit-config.yaml` (new), `pyproject.toml` (new).
+**Phase:** 1
+
+---
+
+## ADR-005 — FastAPI inference and supervisor server
+
+**Status:** Proposed
+**Context:** The supervisor workflow (confirm fraud, mark false positives,
+trigger retraining) currently requires a developer to run Python scripts
+directly. This is a deployment blocker for any non-technical user.
+**Decision:** Implement a 20-endpoint REST API in `src/api/`. Six endpoint
+groups: inference, supervisor feedback, training, monitoring, configuration,
+health. All training commands return a `job_id` immediately (async via
+Celery — see ADR-006). No `src/` module is modified — handlers call the
+existing `confirmed_fraud_store`, `retraining_orchestrator`, and `evt_scorer`
+functions directly.
+**Key endpoints:**
+```
+POST /v3/supervisor/confirm-fraud        → confirmed_fraud_store.add_confirmed()
+POST /v3/supervisor/mark-false-positive  → confirmed_fraud_store.add_false_positive()
+POST /v3/training/incremental            → retraining_orchestrator [async]
+POST /v3/training/full                   → main_v3.run_pipeline() [async]
+GET  /v3/training/jobs/{job_id}          → Celery task status
+GET  /v3/monitoring/drift                → _check_drift() result
+GET  /v3/monitoring/fraud-store-summary  → confirmed_fraud_store.summary()
+GET  /health                             → 200 if model loaded
+GET  /ready                              → 200 if scores CSV exists
+POST /v3/training/upload-checkpoint      → checkpoint_manager.validate_and_hotswap() [multipart .pth]
+POST /v3/training/pull-checkpoint        → dvc pull + checkpoint_manager.validate_and_hotswap() [async]
+GET  /v3/model/checkpoint-info           → {version, loaded_at, mlflow_run_id, n_features, graph_emb_dim}
+POST /v3/model/rollback                  → checkpoint_manager.validate_and_hotswap(versioned_path) [async]
+```
+**Open question:** public-facing vs internal-only (VPN). If public, TLS
+termination and authentication (API keys or OAuth2) must be added. Resolve
+before Phase 2 implementation.
+**Files to change:** `src/api/main.py` (new), `src/api/handlers/` (new),
+`src/api/schemas.py` (new).
+**Phase:** 2
+
+---
+
+## ADR-006 — Celery + Redis for async job management
+
+**Status:** Proposed
+**Context:** `train_incremental()` runs ~15 minutes. `run_pipeline()` runs
+2–4 hours. HTTP endpoints cannot block for this duration.
+**Decision:** Celery with Redis as broker. Each training command returns a
+`job_id` immediately. Callers poll `GET /v3/training/jobs/{job_id}` for
+status. On the CPU server, a single Celery worker with `concurrency=1`
+serializes training jobs (training must not run concurrently).
+**Technology chosen:** Celery + Redis over Prefect (adds a UI server; overkill
+for twice-yearly jobs) and Kubeflow Pipelines (requires full K8s cluster,
+YAML pipelines, weeks of setup — too heavy for batch-once-per-year).
+**Files to change:** `src/api/tasks.py` (new), `celeryconfig.py` (new),
+`docker-compose.yml` (Redis service).
+**Phase:** 2
+
+---
+
+## ADR-007 — Structured logging with structlog
+
+**Status:** Proposed
+**Context:** All modules use `print()`. On a server with cron-scheduled runs,
+logs from different runs interleave without timestamps or module tags. There
+is no machine-parseable format for alerting or aggregation.
+**Decision:** Replace `print()` calls at orchestrator and API level with
+`structlog` JSON logging. Module internals may keep `print()` — only
+`main_v3.py`, `retraining_orchestrator.py`, and `src/api/main.py` are changed.
+`structlog` is drop-in compatible with Python's `logging` module.
+**Consequences:** Logs are shippable to ELK, Loki, or CloudWatch. Each log
+line includes timestamp, module name, cycle label, and log level.
+**Files to change:** `main_v3.py`, `retraining_orchestrator.py`,
+`src/api/main.py`.
+**Phase:** 2
+
+---
+
+## ADR-008 — Versioned model registry and rollback
+
+**Status:** Proposed
+**Context:** `train_incremental()` writes a single `.pth.bak` before
+overwriting. After two incremental runs the first checkpoint is gone. There
+is no way to roll back to a known-good model more than one step.
+**Decision:** After every training run, copy the checkpoint to a versioned
+path: `models/checkpoints/hybrid_graphmcm_v3_<cycle>_<mlflow_run_id>.pth`.
+Keep the last 5 versioned checkpoints. Register each in MLflow as an artifact
+with its associated PR-AUC and cycle label. Add
+`rollback_to_checkpoint(run_id)` to `retraining_orchestrator.py` that copies
+the versioned file back to `models/hybrid_graphmcm_v3.pth` and restores its
+DVC hash.
+**Consequences:** Any prior cycle's model can be restored in one command.
+PR-AUC regression is recoverable.
+**Files to change:** `retraining_orchestrator.py` (add rollback function),
+`src/hybrid_graphmcm_v3.py` (update `_backup_checkpoint()`).
+**Phase:** 2
+
+---
+
+## ADR-009 — Feature-level drift monitoring
+
+**Status:** Proposed
+**Context:** The existing KS test (in `retraining_orchestrator.py`) monitors
+`hybrid_anomaly_score` (output). Distribution shift in individual input
+features (e.g., a policy change that inflates all reported incomes by 2×) is
+not caught until it shows up as anomaly score drift — a lagging indicator.
+**Decision:** After each cycle, compute and store mean and standard deviation
+of each of the 68 engineered features. At the next cycle, compute KS
+statistics per feature and flag any feature where p < 0.01. Log to the MLflow
+run as a metric artifact `feature_drift_v3.json`. Alert but do not block
+inference — the supervisor decides whether to proceed or wait for full retrain.
+**Consequences:** Earlier warning of dataset shift. Preserves human-gated
+philosophy of the self-training loop.
+**Files to change:** `retraining_orchestrator.py` (add `_check_feature_drift()`),
+`outputs/feature_drift_v3.json` (new output artifact).
+**Phase:** 2
+
+---
+
+## ADR-010 — Docker containerization (two-image strategy)
+
+**Status:** Proposed — do not implement until Phase 1 is complete
+**Context:** The application runs only in the developer's Python environment.
+Deployment to the CPU server requires manual environment setup.
+**Decision:** Two Docker images:
+- `nic-fraud-trainer`: GPU-capable, includes PyTorch + PyG + full pipeline.
+  Used on the GPU laptop for initial training and full retrains.
+- `nic-fraud-server`: CPU-only, includes FastAPI + Celery worker + **full
+  pipeline** (`main_v3.py`). This image deploys to the production server and
+  supports both incremental fine-tune (~15 min) and full CPU retrain (8–16 hr
+  via `POST /v3/training/full`). GPU hardware is not required on the server.
+`WORKDIR /app` in both images ensures all `Path("outputs/...")` calls resolve
+correctly. The `.pth` checkpoint is transferred from trainer to server via
+`dvc push` (trainer) + `dvc pull` (server) after each full retrain.
+**Files to change:** `Dockerfile.trainer` (new), `Dockerfile.server` (new),
+`docker-compose.yml` (new), `.dockerignore` (new).
+**Phase:** 3
+
+---
+
+## ADR-011 — Kubernetes deployment on the CPU server
+
+**Status:** Proposed — do not implement until Docker images are stable
+**Context:** Docker Compose has no self-healing or health-check-based restart.
+The CPU server must run unattended for the year between cycles.
+**Decision:** Single-node Kubernetes (k3s) with three deployments:
+- `nic-api`: FastAPI, 2 replicas, request 2 vCPU / 8 GB, limit 4 vCPU / 16 GB
+- `nic-worker`: Celery worker, 1 replica, request 8 vCPU / 32 GB, limit 16 vCPU / 56 GB
+  (concurrency=1 — training must not run concurrently)
+- `mlflow`: 1 replica, limit 1 vCPU / 2 GB (local file-based tracking)
+- `redis`: single pod, 512 MB
+Liveness and readiness probes hit `/health` and `/ready`. Rolling deploy for
+`nic-api` on image update; `nic-worker` is restarted manually after training
+jobs (to avoid splitting a long-running job across deploys).
+**Files to change:** `k8s/` directory (new — Deployment, Service, ConfigMap
+manifests for each component).
+**Phase:** 3
+
+---
+
+## ADR-012 — PostgreSQL for ego-graph inference queries
+
+**Status:** Proposed
+**Context:** At inference time, a new application needs its relational
+neighbors (across 5 edge types) to build a mini-subgraph for the RGCN
+encoder. Querying a `.pt` file for this at inference time is not practical.
+**Decision:** Load `data/raw/data_for_ml_model.csv` into a PostgreSQL table
+(`applications`) with indexed columns for all 5 edge-type fields (`mobile_no`,
+`ip_address`, `father_name`, `mother_name`, `pincode`). At inference time,
+query neighbors per edge type, build a mini-subgraph, run RGCN, return
+`hybrid_anomaly_score` for the new node only.
+**Open question:** cross-cycle schema design — does the `applications` table
+accumulate across years (enabling cross-cycle IP cluster detection) or rebuild
+each year? No decision made. Resolve before Phase 3 implementation.
+**Files to change:** `src/inference_server_v3.py` (new), `db/schema.sql`
+(new), `docker-compose.yml` (postgres service).
+**Phase:** 3
+
+---
+
+## ADR-013 — CI/CD pipeline with GitHub Actions
+
+**Status:** Proposed
+**Context:** No automated validation of code changes. A change to any `src/`
+module goes directly to the main branch with no gate.
+**Decision:** Three GitHub Actions jobs:
+1. `lint` — ruff + mypy on every push to any branch.
+2. `smoke` — `python main_v3.py --smoke` (2-epoch run, CPU) on pull requests
+   to `main`.
+3. `docker-build` — build both Docker images on merge to `main`.
+No GPU in CI — smoke test uses CPU with synthetic data.
+**Consequences:** Breaking changes caught within minutes. Docker images always
+current on `main`.
+**Files to change:** `.github/workflows/ci.yml` (new).
+**Phase:** 3
+
+---
+
+## F.1 Open MLOps Questions — Do Not Resolve Autonomously
+
+- **OQ-1:** Where does the MLflow tracking server live in production? Options:
+  co-locate on CPU server (risk: single point of failure), separate VM,
+  or Azure ML as tracking backend. Depends on NIC IT constraints.
+- **OQ-2:** Is the FastAPI server public-facing or internal-only (VPN)?
+  If public: requires TLS termination, authentication, rate limiting.
+  The current API design does not include auth. Resolve before Phase 2.
+- **OQ-3:** Data retention policy for `confirmed_fraud.json` — should
+  confirmed fraud from prior years continue to influence the LOE exposure
+  set? No policy decision has been made.
+- **OQ-4:** Is `data/raw/data_for_ml_model.csv` manually exported or is there
+  an automated data ingestion step? If manual, the yearly pipeline has an
+  undocumented human dependency.
+- **OQ-5:** Should the PostgreSQL `applications` table accumulate cross-cycle
+  (enabling cross-cycle relational pattern detection) or rebuild each year?
+  Resolve before ADR-012 implementation.
+
+---
+
+## F.2 Migration Roadmap Summary
+
+| Phase | Duration | Key deliverables | Risk |
+|---|---|---|---|
+| 1 — Zero-risk | 1–2 weeks | Fix requirements.txt (done), DVC init, MLflow wrappers, pre-commit | Zero — additive only |
+| 2 — Operational | 2–4 weeks | FastAPI server, Celery worker, model registry, structured logging, feature drift | Low — new files only |
+| 3 — Infrastructure | 4–8 weeks | Docker images, Kubernetes, PostgreSQL, CI/CD | Medium — infrastructure |
+
+**Invariant across all phases:** no `src/*.py` module is modified.
+
+---
+
+# Appendix G — Production Server Environment
+<!-- These are fixed hardware and memory constraints for the target deployment. -->
+<!-- An agent must not make architectural choices that violate these bounds. -->
+
+> **Agent instruction:** read this appendix before choosing batch sizes,
+> deciding whether to load the full graph in memory, or designing any module
+> that runs on the production server. Violating the memory budget causes an
+> OOM kill that terminates the entire training run with no checkpoint saved.
+
+## G.1 Hardware
+
+| Parameter | Value |
+|---|---|
+| CPU | 16 vCPU |
+| RAM | 64 GB |
+| OS | Ubuntu 22.04 LTS |
+| GPU | None — CPU-only PyTorch build required on server |
+| PyTorch install | `pip install torch --index-url https://download.pytorch.org/whl/cpu` |
+| Storage | k3s local-path PersistentVolume mounted at `/app` |
+
+## G.2 Memory Budget
+
+| Operational mode | Peak RSS |
+|---|---|
+| Inference-only (`nic-api`, per replica) | ~1 GB |
+| Full pipeline training (`nic-worker`) | ~8–12 GB |
+| Both running simultaneously | ~14 GB — 4× safety margin within 64 GB |
+
+No module may hold more than one full copy of the feature matrix
+(15,000 × 68 float32 ≈ 4 MB) AND the full graph (`identity_graph_v3.pt`,
+≈ 400–800 MB) AND the model weights (≈ 300–600 MB) simultaneously in the
+same process outside of the training window.
+
+**At inference time the graph `.pt` file is not loaded.** Only the model
+weights and the feature schema are needed. The graph is rebuilt from the
+PostgreSQL ego-graph query (ADR-012) for individual-application scoring, or
+loaded once per batch for full-cycle scoring.
+
+## G.3 CPU Full Retrain Time Estimate
+
+| Stage | GPU laptop (CUDA) | Server 16 vCPU (CPU only) |
+|---|---|---|
+| Stage 1: LOE warm-start (80 epochs) | 30–60 min | 2–4 hr |
+| Stage 2: joint reconstruction (120 epochs) | 60–90 min | 4–8 hr |
+| All other pipeline steps combined | ~50 min | ~50 min |
+| **Total** | **~2–4 hr** | **~8–16 hr** |
+
+A full retrain on the server is a blocking operation for the `nic-worker` pod.
+`nic-api` (inference serving) continues uninterrupted in its own pod.
+The smoke test (`--smoke`, 2 epochs) completes in ~5 minutes on CPU and is
+the CI gate for every pull request (ADR-013).
+
+## G.4 PyTorch CPU Thread Configuration
+
+Set these at the top of any module that runs heavy tensor operations on the
+server. Omitting them lets PyTorch default to all 16 vCPU, which causes
+contention with the `nic-api` replicas.
+
+```python
+import torch
+torch.set_num_threads(8)          # intra-op parallelism (BLAS, matmul)
+torch.set_num_interop_threads(4)  # inter-op parallelism (async ops)
+```
+
+Do not call these inside `src/` modules — set them in the Celery task wrapper
+(`src/api/tasks.py`) so the values are applied once per worker process and
+do not affect local development or the GPU laptop.
