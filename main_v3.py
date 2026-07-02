@@ -104,9 +104,17 @@ def _log_top_suspicious(risk_path: Path, xai_path: Path, top_n: int = 20) -> Non
         for rank, (_, row) in enumerate(risk_df.iterrows(), start=1):
             app_id = str(row["application_id"])
             card   = narratives.get(app_id, {})
+            def _pct_note(e: dict) -> str:
+                # 2026-07-03: cards no longer carry the hand-bucketed 'magnitude'
+                # word — use the population value percentile instead.
+                vp = e.get("value_percentile")
+                if vp is None:
+                    return ""
+                return f" (>{vp:.1f} pct of applicants)" if vp >= 50.0 else f" (<{100.0 - vp:.1f} pct of applicants)"
+
             top_errors = "; ".join(
                 f"{e.get('feature_label', e.get('feature','?'))}={e.get('error', 0.0):.3f}"
-                f" ({e.get('magnitude','')})"
+                + _pct_note(e)
                 for e in card.get("top_feature_errors", [])[:3]
             )
             triggers = "; ".join(card.get("triggers", []))
