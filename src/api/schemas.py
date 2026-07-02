@@ -50,6 +50,38 @@ class FraudStoreSummaryResponse(BaseModel):
     by_fraud_type: dict[str, int]
 
 
+# ── Drift simulation / human-gated retraining ────────────────────────────────
+
+class EvaluateDatasetRequest(BaseModel):
+    dataset_path: str   # e.g. "data/raw/new_cohort_2026.csv" — raw schema, unseen application_ids
+
+
+class EvaluateDatasetResponse(BaseModel):
+    dataset_path: str
+    n_rows: int
+    p_value: float
+    recommendation: str    # incremental | full_retrain | first_run | no_scores
+    drift_detected: bool
+    staged_scores_path: str
+
+
+class DecisionRequest(BaseModel):
+    dataset_path: str
+    action: str             # none | incremental | full_retrain
+    cycle: str = "unknown"
+    decided_by: str
+    smoke_test: bool = False
+
+
+class DecisionResponse(BaseModel):
+    status: str
+    action: str
+    dataset_path: str
+    job_id: Optional[str] = None
+    backup_dir: Optional[str] = None
+    audit_log_path: str
+
+
 # ── Model / checkpoint ────────────────────────────────────────────────────────
 
 class CheckpointInfoResponse(BaseModel):

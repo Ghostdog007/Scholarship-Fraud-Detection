@@ -6,7 +6,10 @@ POST /v3/training/full               → Celery async full pipeline
 GET  /v3/training/jobs/{job_id}      → Poll Celery task status
 POST /v3/training/upload-checkpoint  → Multipart .pth upload → validate_and_hotswap
 POST /v3/training/pull-checkpoint    → dvc pull → validate_and_hotswap
+POST /v3/training/decision           → human picks none|incremental|full_retrain after
+                                        reviewing POST /v3/monitoring/evaluate-dataset
 """
+import json
 import shutil
 import time
 import uuid
@@ -15,10 +18,12 @@ from pathlib import Path
 import structlog
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from src.api.schemas import JobResponse, JobStatusResponse
+from src.api.schemas import DecisionRequest, DecisionResponse, JobResponse, JobStatusResponse
 
 log    = structlog.get_logger()
 router = APIRouter()
+
+_VALID_ACTIONS = {"none", "incremental", "full_retrain"}
 
 _CELERY_STATE_MAP = {
     "PENDING": "pending",
@@ -107,4 +112,81 @@ def pull_checkpoint():
         job_id=task.id,
         status="pending",
         message="DVC pull queued — will validate and hot-swap on completion",
+    )
+
+
+@router.post("/decision", response_model=DecisionResponse)
+def training_decision(req: DecisionRequest):
+    """
+    Human-gated action after reviewing POST /v3/monitoring/evaluate-dataset
+    (and GET /v3/monitoring/dataset-xai) for a given dataset_path.
+
+    - "none"          -> logs the decision only, no file or model change.
+    - "incremental"    -> merges dataset_path into the raw CSV (permanently),
+                          rebuilds features + graph, then fine-tunes the
+                          existing checkpoint (RGCN frozen unless >=50
+                          confirmed fraud) via the existing incremental job.
+    - "full_retrain"  -> merges dataset_path into the raw CSV (permanently,
+                          old + new combined), then dispatches the existing
+                          full-pipeline job, which rebuilds everything itself.
+
+    Every call appends one record to outputs/drift_audit_log.json regardless
+    of action, so "do nothing" decisions are as auditable as training ones.
+    """
+    from src.api import audit, dataset_ops
+
+    if req.action not in _VALID_ACTIONS:
+        raise HTTPException(status_code=422, detail=f"action must be one of {sorted(_VALID_ACTIONS)}, got '{req.action}'")
+
+    dataset_path = Path(req.dataset_path)
+    if req.action != "none" and not dataset_path.exists():
+        raise HTTPException(status_code=422, detail=f"dataset_path not found: {req.dataset_path}")
+
+    meta_path  = Path(f"outputs/staged_scores_meta_{dataset_path.stem}.json")
+    prior_eval = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+
+    job_id: str | None = None
+    backup_dir: Path | None = None
+
+    try:
+        if req.action == "incremental":
+            backup_dir = dataset_ops.backup_canonical_files(label=f"decision_{req.cycle}")
+            dataset_ops.merge_dataset_into_raw(dataset_path)
+            dataset_ops.rebuild_features_and_graph()
+
+            from src.api.tasks import run_incremental_task
+            task = run_incremental_task.delay(cycle=req.cycle, smoke_test=req.smoke_test)
+            job_id = task.id
+
+        elif req.action == "full_retrain":
+            backup_dir = dataset_ops.backup_canonical_files(label=f"decision_{req.cycle}")
+            dataset_ops.merge_dataset_into_raw(dataset_path)  # main_v3.py rebuilds features/graph itself
+
+            from src.api.tasks import run_full_pipeline_task
+            task = run_full_pipeline_task.delay(smoke_test=req.smoke_test)
+            job_id = task.id
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    record = audit.append_audit_record({
+        "dataset_path":   str(dataset_path),
+        "p_value":        prior_eval.get("p_value"),
+        "recommendation": prior_eval.get("recommendation"),
+        "action":         req.action,
+        "cycle":          req.cycle,
+        "decided_by":     req.decided_by,
+        "job_id":         job_id,
+        "backup_dir":     str(backup_dir) if backup_dir else None,
+    })
+
+    log.info("training.decision", action=req.action, dataset_path=str(dataset_path),
+             job_id=job_id, decided_by=req.decided_by)
+
+    return DecisionResponse(
+        status="ok",
+        action=req.action,
+        dataset_path=str(dataset_path),
+        job_id=job_id,
+        backup_dir=str(backup_dir) if backup_dir else None,
+        audit_log_path=str(audit.AUDIT_LOG),
     )

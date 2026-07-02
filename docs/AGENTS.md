@@ -11,7 +11,7 @@ applications. Outputs a 0–1 risk score per application. No hardcoded rules all
 
 **Current state:** V3 fully implemented and evaluated. MLOps Phase 1 complete
 (MLflow SQLite backend, DVC, pre-commit). MLOps Phase 2 complete — FastAPI
-REST server with 13 endpoints (`src/api/`), Celery + Redis async job queue
+REST server with 18 endpoints (`src/api/`), Celery + Redis async job queue
 (`celeryconfig.py`, `src/api/tasks.py`), atomic checkpoint manager with
 hot-swap and schema validation (`src/checkpoint_manager.py`), structlog JSON
 logging in all new API files, Dockerfile (`python:3.12-slim`, CPU-only, single
@@ -21,10 +21,20 @@ Note: `main_v3.py` and `retraining_orchestrator.py` were NOT modified for
 structlog (AGENTS.md invariant: no `src/*.py` modification). OQ-2 (auth/VPN)
 unresolved — CORS is `allow_origins=["*"]` until project lead decides.
 
-**Next task:** Phase 3 MLOps — do not begin without explicit project lead
-sign-off. Candidates: ADR-011 (Kubernetes / k3s single-node), ADR-012
-(PostgreSQL for ego-graph inference), ADR-013 (GitHub Actions CI/CD). Discuss
-scope and order before writing any code.
+ADR-014 (human-gated drift simulation) added 2026-07-02: `POST
+/v3/monitoring/evaluate-dataset`, `GET /v3/monitoring/dataset-xai`, `GET
+/v3/monitoring/top-suspicious`, `POST /v3/training/decision`. Business logic
+verified by calling the handler functions directly in Python (drift
+correctly detected on the test dataset, `p≈2.5e-39`; canonical files
+correctly restored after the read-only path) — **not yet exercised through
+the live Docker/Celery stack**. Project lead is running that validation next
+via `docs/API_TESTING_GUIDE.md` §9.
+
+**Next task:** validate ADR-014 end-to-end through the real Docker stack
+(§9 of the API testing guide). After that: Phase 3 MLOps — do not begin
+without explicit project lead sign-off. Candidates: ADR-011 (Kubernetes /
+k3s single-node), ADR-012 (PostgreSQL for ego-graph inference), ADR-013
+(GitHub Actions CI/CD). Discuss scope and order before writing any code.
 
 **On session start — read these, in order:**
 1. This AGENT QUICK-START block (already done)
@@ -499,6 +509,11 @@ another module's source files directly. No embeddings cross module boundaries.
 | `models/checkpoints/hybrid_v3_<cycle>_<run_id>.pth` | checkpoint_manager | rollback command, MLflow | same schema as `hybrid_graphmcm_v3.pth` (`model_state_dict`, `centroid`, `config`); keep last 5; filename encodes cycle and mlflow_run_id |
 | `outputs/prev_cycle_scores_ks.json` | retraining_orchestrator (end of cycle) | next-cycle drift check | `{scores: [float, ...]}` — score distribution baseline for KS test; overwritten after every completed inference cycle |
 | `outputs/feature_drift_v3.json` | retraining_orchestrator | API `/monitoring/drift` endpoint | `{feature_name: {ks_stat, p_value, mean_prev, mean_curr}}` for all 68 engineered features |
+| `outputs/staged_scores_<dataset_name>.csv` | `POST /v3/monitoring/evaluate-dataset` (ADR-014) | `GET /v3/monitoring/dataset-xai` | same schema as `hybrid_scores_v3.csv`, filtered to only the staged dataset's rows; read-only preview, not fused into `risk_scores_v3.csv` |
+| `outputs/staged_features_<dataset_name>.csv` | `POST /v3/monitoring/evaluate-dataset` (ADR-014) | `GET /v3/monitoring/dataset-xai` | scaled feature values for the staged rows, captured before canonical files are restored |
+| `outputs/staged_scores_meta_<dataset_name>.json` | `POST /v3/monitoring/evaluate-dataset` (ADR-014) | `POST /v3/training/decision` | `{dataset_path, n_rows, p_value, recommendation, drift_detected}` — carries the drift result into the audit log at decision time |
+| `outputs/drift_audit_log.json` | `POST /v3/training/decision` (ADR-014) | human review, MLflow-adjacent audit trail | append-only list of `{timestamp, dataset_path, p_value, recommendation, action, cycle, decided_by, job_id, backup_dir}` — one record per decision call, including `action: "none"` |
+| `data/backups/<timestamp>_<label>/` | `src/api/dataset_ops.backup_canonical_files()` (ADR-014) | `restore_canonical_files()`, manual rollback | snapshot of `RAW_CSV, NODEG_CSV, FINAL_CSV, SCHEMA_JSON, GRAPH_PT, DEGREE_CSV` before any merge; `evaluate-dataset` deletes its own backup after restoring, `decision` (incremental/full_retrain) keeps it |
 
 **Hard rule:** `per_feature_error_json` is a JSON string of
 `{feature_name: float}` for all 68 features. Downstream XAI reads this column
@@ -1018,8 +1033,12 @@ POST /v3/supervisor/mark-false-positive  → confirmed_fraud_store.add_false_pos
 POST /v3/training/incremental            → retraining_orchestrator [async]
 POST /v3/training/full                   → main_v3.run_pipeline() [async]
 GET  /v3/training/jobs/{job_id}          → Celery task status
+POST /v3/training/decision               → human-gated none|incremental|full_retrain [ADR-014]
 GET  /v3/monitoring/drift                → _check_drift() result
 GET  /v3/monitoring/fraud-store-summary  → confirmed_fraud_store.summary()
+POST /v3/monitoring/evaluate-dataset     → read-only staged scoring + KS drift check [ADR-014]
+GET  /v3/monitoring/dataset-xai          → top-N XAI preview on staged data [ADR-014]
+GET  /v3/monitoring/top-suspicious       → top-N from outputs/top_suspicious_v3.tsv [ADR-014]
 GET  /health                             → 200 if model loaded
 GET  /ready                              → 200 if scores CSV exists
 POST /v3/training/upload-checkpoint      → checkpoint_manager.validate_and_hotswap() [multipart .pth]
@@ -1034,7 +1053,13 @@ before Phase 2 implementation.
 `src/api/handlers/training.py`, `src/api/handlers/monitoring.py`,
 `src/api/handlers/model.py`, `src/api/schemas.py`, `src/api/__init__.py`,
 `src/api/handlers/__init__.py` (all new).
-**Actual endpoint count:** 13 (health + ready + 4 supervisor + 5 training + 2 monitoring + 2 model).
+**Actual endpoint count:** 18 (health + ready + 2 supervisor + 6 training + 5 monitoring + 2 model).
+Corrected from the original count of 13 documented above — the original
+breakdown said "4 supervisor," but only 2 supervisor endpoints (`confirm-fraud`,
+`mark-false-positive`) were ever implemented; the arithmetic was wrong even
+before ADR-014 added the 5 drift-simulation endpoints (+1 training, +3
+monitoring; `/v3/training/decision` and `/v3/monitoring/evaluate-dataset` +
+`dataset-xai` + `top-suspicious`).
 **Open question (OQ-2):** auth/VPN decision pending — CORS is `allow_origins=["*"]` until resolved.
 **Phase:** 2
 
@@ -1205,6 +1230,68 @@ current on `main`.
 
 ---
 
+## ADR-014 — Human-gated drift simulation and dataset evaluation
+
+**Status:** Implemented (2026-07-02)
+**Context:** There was no way to test a new/unseen dataset against the live
+model before committing it to the pipeline, and no way to trigger retraining
+in response to observed drift without a developer manually editing files and
+running `retraining_orchestrator.py` or `main_v3.py` by hand. A fully
+automatic drift→retrain loop was considered and rejected — it would override
+the documented policy in `docs/API_TESTING_GUIDE.md` §2.2 ("If
+`drift_detected: true` — stop and call the project lead before running any
+update"). ADR-014 keeps the human gate but removes the manual-file-editing
+friction.
+**Decision:** Three-step human-in-the-loop workflow, all new files under
+`src/api/` — no existing `src/*.py` pipeline module modified:
+1. `POST /v3/monitoring/evaluate-dataset` — **read-only**. Temporarily merges
+   the caller-supplied dataset into the canonical raw CSV, reruns
+   `build_base()` / `build_graph()` / `add_degree_features()` unchanged, scores
+   the new rows with the **existing** checkpoint (`src/api/inference.py`,
+   no training), computes a KS test against `outputs/prev_cycle_scores_ks.json`,
+   then restores every canonical file from a pre-merge backup
+   (`src/api/dataset_ops.py`) — leaves no lasting change, safe to re-run.
+2. `GET /v3/monitoring/dataset-xai` — reuses `xai_layer_v3._top_features()` /
+   `_narrative()` (imported, not modified) against the staged scores, so a
+   human can read explanations before deciding anything.
+3. `POST /v3/training/decision` — the only endpoint that can change state.
+   Requires an explicit `action` ∈ `{none, incremental, full_retrain}` and a
+   `decided_by` field. Every call — including `none` — appends one record to
+   `outputs/drift_audit_log.json` (`src/api/audit.py`), so "do nothing" is
+   as auditable as training. `incremental` and `full_retrain` both
+   **permanently** merge the dataset into the raw CSV (backed up first to
+   `data/backups/<timestamp>_decision_<cycle>/`) before dispatching the
+   existing (unmodified) Celery tasks — `incremental` fine-tunes on the
+   combined population, `full_retrain` rebuilds everything from combined
+   old+new data via the existing `main_v3.py` pipeline.
+**Why merge-into-canonical-path instead of a dataset parameter:** the
+pipeline invariant (F.0) prohibits modifying `src/*.py` modules in any phase,
+and `RAW_CSV` / `FINAL_CSV` / `GRAPH_PT` are hardcoded module-level constants
+in `tabular_feature_engine_v3.py`, `graph_builder_v3.py`, and
+`hybrid_graphmcm_v3.py`. Swapping the file at the canonical path (with a
+verified backup/restore or backup/keep cycle) lets every existing pipeline
+function run completely unmodified.
+**Test dataset:** `scripts/generate_drift_dataset.py` builds
+`data/raw/new_cohort_2026.csv` (600 rows) programmatically from real rows —
+an institute-cluster + income-rounding pattern, deliberately not one of the
+5 existing synthetic exposure archetypes, per Appendix B's GAN prohibition
+and the archetype-expansion open item in §11. Verified live: KS test against
+this dataset returned `p≈2.5e-39` (`drift_detected: true`), and the
+`dataset-xai` preview correctly surfaced `inst_verify_by` / `admission_year`
+/ `village_id` as the top anomalous fields.
+**Files changed:** `src/api/dataset_ops.py`, `src/api/inference.py`,
+`src/api/audit.py` (all new); `src/api/schemas.py`,
+`src/api/handlers/monitoring.py`, `src/api/handlers/training.py` (extended,
+no existing endpoint logic changed); `docs/API_TESTING_GUIDE.md` §9 (new,
+step-by-step curl walkthrough); `scripts/generate_drift_dataset.py` (new).
+**Open question:** `evaluate-dataset` is synchronous (blocks the HTTP
+response for ~30–90s on the current 15,600-row scale) rather than dispatched
+as a Celery job. Acceptable at current scale; revisit if dataset size or
+call frequency grows enough that this becomes a real request-timeout risk.
+**Phase:** 2
+
+---
+
 ## F.1 Open MLOps Questions — Do Not Resolve Autonomously
 
 - **OQ-1:** Where does the MLflow tracking server live in production? Options:
@@ -1222,6 +1309,12 @@ current on `main`.
 - **OQ-5:** Should the PostgreSQL `applications` table accumulate cross-cycle
   (enabling cross-cycle relational pattern detection) or rebuild each year?
   Resolve before ADR-012 implementation.
+- **OQ-6:** `POST /v3/training/decision` merges the caller-supplied dataset
+  into the raw CSV permanently for `incremental`/`full_retrain` actions.
+  There is no endpoint to *undo* this beyond manually restoring from the
+  `backup_dir` the response returns. Should a `POST /v3/training/undo-decision`
+  endpoint be added, or is manual restore from `data/backups/` sufficient?
+  No decision made (ADR-014).
 
 ---
 
@@ -1230,7 +1323,7 @@ current on `main`.
 | Phase | Duration | Key deliverables | Risk | Status |
 |---|---|---|---|---|
 | 1 — Zero-risk | 1–2 weeks | Fix requirements.txt, DVC init, MLflow wrappers, pre-commit | Zero — additive only | **Complete** |
-| 2 — Operational | 2–4 weeks | FastAPI server, Celery worker, checkpoint manager, structured logging, Docker | Low — new files only | **Complete (2026-07-02)** |
+| 2 — Operational | 2–4 weeks | FastAPI server, Celery worker, checkpoint manager, structured logging, Docker, human-gated drift simulation (ADR-014) | Low — new files only | **Complete (2026-07-02)** |
 | 3 — Infrastructure | 4–8 weeks | Kubernetes, PostgreSQL, CI/CD | Medium — infrastructure | Not started — needs project lead sign-off |
 
 **Invariant across all phases:** no `src/*.py` module is modified.
