@@ -1,0 +1,64 @@
+# NIC Fraud Detection V3 — local dev stack (ADR-006 + ADR-010)
+# Starts: Redis broker + FastAPI server + Celery worker
+#
+# Usage:
+#   docker compose up --build          # full stack
+#   docker compose up redis nic-api    # API only (no async training)
+#
+# Test endpoints:
+#   curl http://localhost:8000/health
+#   curl http://localhost:8000/docs     (Swagger UI)
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  nic-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./outputs:/app/outputs
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nic-worker:
+    build: .
+    # concurrency=1 is MANDATORY — training writes to fixed output paths.
+    # Never scale this service above 1 replica. See AGENTS.md hard stop #16.
+    command: >
+      celery -A src.api.tasks.celery_app worker
+      --loglevel=info
+      --concurrency=1
+      -Q nic_fraud
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./outputs:/app/outputs
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 1   # NEVER increase — concurrent training corrupts fixed-path outputs

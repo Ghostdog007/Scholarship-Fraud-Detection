@@ -10,17 +10,35 @@
 applications. Outputs a 0–1 risk score per application. No hardcoded rules allowed.
 
 **Current state:** V3 fully implemented and evaluated. MLOps Phase 1 complete
-(MLflow SQLite backend, DVC, pre-commit). XAI explanation cards improved
-(human-readable feature labels, resolved neighbor application IDs, actionable
-narratives, `review_status` replacing raw `label_source`). MLflow UI working
-via `mlflow_ui.bat` (port 5000, SQLite backend). README has full MLflow Audit
-Guide. AGENTS.md has LLM quick-start block and closing instruction.
+(MLflow SQLite backend, DVC, pre-commit). MLOps Phase 2 complete — FastAPI
+REST server with 13 endpoints (`src/api/`), Celery + Redis async job queue
+(`celeryconfig.py`, `src/api/tasks.py`), atomic checkpoint manager with
+hot-swap and schema validation (`src/checkpoint_manager.py`), structlog JSON
+logging in all new API files, Dockerfile (`python:3.12-slim`, CPU-only, single
+image), `docker-compose.yml` (Redis + nic-api + nic-worker). Full stack tested
+end-to-end via Docker Desktop. Manual testing guide at `docs/API_TESTING_GUIDE.md`.
+Note: `main_v3.py` and `retraining_orchestrator.py` were NOT modified for
+structlog (AGENTS.md invariant: no `src/*.py` modification). OQ-2 (auth/VPN)
+unresolved — CORS is `allow_origins=["*"]` until project lead decides.
 
-**Next task:** Phase 2 MLOps — build ADR-005 (FastAPI inference + supervisor
-server) and a Dockerfile together so the API can be tested via Docker Desktop
-on Windows (no WSL). Start with the FastAPI server in `src/api/`, then
-containerise immediately. Order: ADR-005 → Dockerfile → ADR-008
-(checkpoint manager) → ADR-007 (structured logging) → ADR-006 (Celery + Redis).
+**Next task:** Phase 3 MLOps — do not begin without explicit project lead
+sign-off. Candidates: ADR-011 (Kubernetes / k3s single-node), ADR-012
+(PostgreSQL for ego-graph inference), ADR-013 (GitHub Actions CI/CD). Discuss
+scope and order before writing any code.
+
+**On session start — read these, in order:**
+1. This AGENT QUICK-START block (already done)
+2. `docs/OPERATIONS_RUNBOOK.md` §0–§2 (operational context, 2-minute read)
+3. The specific module file you are assigned to — nothing else in `src/`
+
+**Do NOT read on session start (waste of context):**
+- All of `docs/AGENTS.md` in one pass — use the §jump-links below instead
+- `src/` modules you are not assigned to
+- `outputs/*.json` or `outputs/*.csv` — too large; use `head` if a sample is needed
+- `data/processed/` files — same
+- `docs/API_TESTING_GUIDE.md` — only relevant for manual API testing
+- Appendix A–G of this file — look up on demand, do not pre-read
+- `.venv/` — never
 
 **Three rules you must never break:**
 1. No domain-threshold rules anywhere in code (no `age > 35`, no rule codes). §10 stop #1.
@@ -983,7 +1001,7 @@ smoke test adds ~3 minutes to commit time but catches import errors immediately.
 
 ## ADR-005 — FastAPI inference and supervisor server
 
-**Status:** Proposed
+**Status:** Implemented (2026-07-02)
 **Context:** The supervisor workflow (confirm fraud, mark false positives,
 trigger retraining) currently requires a developer to run Python scripts
 directly. This is a deployment blocker for any non-technical user.
@@ -1012,15 +1030,19 @@ POST /v3/model/rollback                  → checkpoint_manager.validate_and_hot
 **Open question:** public-facing vs internal-only (VPN). If public, TLS
 termination and authentication (API keys or OAuth2) must be added. Resolve
 before Phase 2 implementation.
-**Files to change:** `src/api/main.py` (new), `src/api/handlers/` (new),
-`src/api/schemas.py` (new).
+**Files changed:** `src/api/main.py`, `src/api/handlers/supervisor.py`,
+`src/api/handlers/training.py`, `src/api/handlers/monitoring.py`,
+`src/api/handlers/model.py`, `src/api/schemas.py`, `src/api/__init__.py`,
+`src/api/handlers/__init__.py` (all new).
+**Actual endpoint count:** 13 (health + ready + 4 supervisor + 5 training + 2 monitoring + 2 model).
+**Open question (OQ-2):** auth/VPN decision pending — CORS is `allow_origins=["*"]` until resolved.
 **Phase:** 2
 
 ---
 
 ## ADR-006 — Celery + Redis for async job management
 
-**Status:** Proposed
+**Status:** Implemented (2026-07-02)
 **Context:** `train_incremental()` runs ~15 minutes. `run_pipeline()` runs
 2–4 hours. HTTP endpoints cannot block for this duration.
 **Decision:** Celery with Redis as broker. Each training command returns a
@@ -1030,15 +1052,16 @@ serializes training jobs (training must not run concurrently).
 **Technology chosen:** Celery + Redis over Prefect (adds a UI server; overkill
 for twice-yearly jobs) and Kubeflow Pipelines (requires full K8s cluster,
 YAML pipelines, weeks of setup — too heavy for batch-once-per-year).
-**Files to change:** `src/api/tasks.py` (new), `celeryconfig.py` (new),
-`docker-compose.yml` (Redis service).
+**Files changed:** `src/api/tasks.py` (new), `celeryconfig.py` (new),
+`docker-compose.yml` (Redis + nic-api + nic-worker services).
+**Worker concurrency:** fixed at 1 — hard stop #16. Never scale `nic-worker` above 1 replica.
 **Phase:** 2
 
 ---
 
 ## ADR-007 — Structured logging with structlog
 
-**Status:** Proposed
+**Status:** Implemented (partial, 2026-07-02)
 **Context:** All modules use `print()`. On a server with cron-scheduled runs,
 logs from different runs interleave without timestamps or module tags. There
 is no machine-parseable format for alerting or aggregation.
@@ -1048,15 +1071,17 @@ is no machine-parseable format for alerting or aggregation.
 `structlog` is drop-in compatible with Python's `logging` module.
 **Consequences:** Logs are shippable to ELK, Loki, or CloudWatch. Each log
 line includes timestamp, module name, cycle label, and log level.
-**Files to change:** `main_v3.py`, `retraining_orchestrator.py`,
-`src/api/main.py`.
+**Files changed:** `src/api/main.py` and all `src/api/handlers/*.py` (new files — structlog added).
+**NOT changed:** `main_v3.py` and `retraining_orchestrator.py` — AGENTS.md invariant
+prohibits modifying existing `src/*.py` modules. ADR-007 is partially complete until
+the project lead decides whether to override the invariant for these two orchestrator files.
 **Phase:** 2
 
 ---
 
 ## ADR-008 — Versioned model registry and rollback
 
-**Status:** Proposed
+**Status:** Implemented (2026-07-02)
 **Context:** `train_incremental()` writes a single `.pth.bak` before
 overwriting. After two incremental runs the first checkpoint is gone. There
 is no way to roll back to a known-good model more than one step.
@@ -1069,8 +1094,10 @@ the versioned file back to `models/hybrid_graphmcm_v3.pth` and restores its
 DVC hash.
 **Consequences:** Any prior cycle's model can be restored in one command.
 PR-AUC regression is recoverable.
-**Files to change:** `retraining_orchestrator.py` (add rollback function),
-`src/hybrid_graphmcm_v3.py` (update `_backup_checkpoint()`).
+**Files changed:** `src/checkpoint_manager.py` (new — atomic validation, hot-swap,
+versioned copy to `models/checkpoints/`, prune to MAX_VERSIONED=5, `.bak` backup).
+Validates `{model_state_dict, centroid, config}` keys and `N_FEATURES`/`GRAPH_EMB_DIM`/`N_EDGE_TYPES`
+against `config_v3.py` before any swap. Rollback dispatched via `POST /v3/model/rollback`.
 **Phase:** 2
 
 ---
@@ -1095,30 +1122,34 @@ philosophy of the self-training loop.
 
 ---
 
-## ADR-010 — Docker containerization (two-image strategy)
+## ADR-010 — Docker containerization (single-image strategy)
 
-**Status:** Proposed — do not implement until Phase 1 is complete
+**Status:** Implemented (2026-07-02)
 **Context:** The application runs only in the developer's Python environment.
 Deployment to the CPU server requires manual environment setup.
-**Decision:** Two Docker images:
-- `nic-fraud-trainer`: GPU-capable, includes PyTorch + PyG + full pipeline.
-  Used on the GPU laptop for initial training and full retrains.
-- `nic-fraud-server`: CPU-only, includes FastAPI + Celery worker + **full
-  pipeline** (`main_v3.py`). This image deploys to the production server and
-  supports both incremental fine-tune (~15 min) and full CPU retrain (8–16 hr
-  via `POST /v3/training/full`). GPU hardware is not required on the server.
-`WORKDIR /app` in both images ensures all `Path("outputs/...")` calls resolve
-correctly. The `.pth` checkpoint is transferred from trainer to server via
-`dvc push` (trainer) + `dvc pull` (server) after each full retrain.
-**Files to change:** `Dockerfile.trainer` (new), `Dockerfile.server` (new),
-`docker-compose.yml` (new), `.dockerignore` (new).
-**Phase:** 3
+**Decision (revised):** Single Docker image (`nic-fraud-server`) — CPU-only,
+includes FastAPI + Celery worker + full pipeline (`main_v3.py`). The original
+two-image strategy was simplified: a separate GPU trainer image is deferred
+until a GPU server is provisioned. The single image supports both incremental
+fine-tune (~15 min on CPU) and full CPU retrain (8–16 hr via
+`POST /v3/training/full`).
+**Key implementation notes:**
+- Base image: `python:3.12-slim` — NOT 3.11. `shap>=0.52.0` requires Python ≥3.12.
+- `requirements-docker.txt` created with Linux min-version pins. The Windows
+  `requirements.txt` pip freeze cannot be used in Linux containers (Windows-specific
+  wheels cause `ResolutionImpossible`).
+- PyTorch installed separately via CPU index before `requirements-docker.txt`.
+- `WORKDIR /app` ensures all `Path("outputs/...")` calls resolve correctly.
+- `docker-compose.yml` version line omitted (obsolete in Docker Compose v2+).
+**Files changed:** `Dockerfile` (new), `docker-compose.yml` (new),
+`requirements-docker.txt` (new).
+**Phase:** 2 (brought forward from Phase 3 — needed for Phase 2 API testing)
 
 ---
 
 ## ADR-011 — Kubernetes deployment on the CPU server
 
-**Status:** Proposed — do not implement until Docker images are stable
+**Status:** Proposed — do not implement until project lead sign-off. Docker images stable as of 2026-07-02.
 **Context:** Docker Compose has no self-healing or health-check-based restart.
 The CPU server must run unattended for the year between cycles.
 **Decision:** Single-node Kubernetes (k3s) with three deployments:
@@ -1138,7 +1169,7 @@ manifests for each component).
 
 ## ADR-012 — PostgreSQL for ego-graph inference queries
 
-**Status:** Proposed
+**Status:** Proposed — do not implement until project lead sign-off
 **Context:** At inference time, a new application needs its relational
 neighbors (across 5 edge types) to build a mini-subgraph for the RGCN
 encoder. Querying a `.pt` file for this at inference time is not practical.
@@ -1158,7 +1189,7 @@ each year? No decision made. Resolve before Phase 3 implementation.
 
 ## ADR-013 — CI/CD pipeline with GitHub Actions
 
-**Status:** Proposed
+**Status:** Proposed — do not implement until project lead sign-off
 **Context:** No automated validation of code changes. A change to any `src/`
 module goes directly to the main branch with no gate.
 **Decision:** Three GitHub Actions jobs:
@@ -1196,11 +1227,11 @@ current on `main`.
 
 ## F.2 Migration Roadmap Summary
 
-| Phase | Duration | Key deliverables | Risk |
-|---|---|---|---|
-| 1 — Zero-risk | 1–2 weeks | Fix requirements.txt (done), DVC init, MLflow wrappers, pre-commit | Zero — additive only |
-| 2 — Operational | 2–4 weeks | FastAPI server, Celery worker, model registry, structured logging, feature drift | Low — new files only |
-| 3 — Infrastructure | 4–8 weeks | Docker images, Kubernetes, PostgreSQL, CI/CD | Medium — infrastructure |
+| Phase | Duration | Key deliverables | Risk | Status |
+|---|---|---|---|---|
+| 1 — Zero-risk | 1–2 weeks | Fix requirements.txt, DVC init, MLflow wrappers, pre-commit | Zero — additive only | **Complete** |
+| 2 — Operational | 2–4 weeks | FastAPI server, Celery worker, checkpoint manager, structured logging, Docker | Low — new files only | **Complete (2026-07-02)** |
+| 3 — Infrastructure | 4–8 weeks | Kubernetes, PostgreSQL, CI/CD | Medium — infrastructure | Not started — needs project lead sign-off |
 
 **Invariant across all phases:** no `src/*.py` module is modified.
 

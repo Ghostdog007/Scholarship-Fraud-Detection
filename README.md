@@ -322,6 +322,10 @@ Edge-dropout score_retention = 3.6452 (feature-based suspicion persists without 
 NIC fraud Detection Project/
 ├── main_v3.py                              # Pipeline orchestrator (V3)
 ├── README.md                               # This file
+├── Dockerfile                              # CPU image (python:3.12-slim)
+├── docker-compose.yml                      # Redis + nic-api + nic-worker
+├── celeryconfig.py                         # Celery broker/worker config (concurrency=1)
+├── requirements-docker.txt                 # Linux min-version pins for Docker builds
 │
 ├── src/
 │   ├── config_v3.py                        # All dimension constants (single source of truth)
@@ -334,7 +338,17 @@ NIC fraud Detection Project/
 │   ├── self_training_loop_v3.py            # Pseudo-label promotion (human-gated, ≥2 of 5 EVT signals)
 │   ├── fusion_classifier_v3.py             # LightGBM: hybrid + subspace IF → risk score
 │   ├── xai_layer_v3.py                     # Reviewer-ready explanation cards: readable feature labels, resolved neighbor IDs, actionable narratives
-│   └── evaluate_model_v3.py                # Category-specific subspace IF + degree-stratified PR-AUC
+│   ├── evaluate_model_v3.py                # Category-specific subspace IF + degree-stratified PR-AUC
+│   ├── checkpoint_manager.py               # ADR-008: atomic checkpoint validation + hot-swap
+│   └── api/
+│       ├── main.py                         # FastAPI app entry point + structlog setup
+│       ├── schemas.py                      # Pydantic request/response models
+│       ├── tasks.py                        # Celery task definitions (5 tasks)
+│       └── handlers/
+│           ├── supervisor.py               # POST confirm-fraud, mark-false-positive
+│           ├── training.py                 # POST incremental/full, GET jobs/{id}, upload/pull checkpoint
+│           ├── monitoring.py               # GET drift, fraud-store-summary
+│           └── model.py                    # GET checkpoint-info, POST rollback
 │
 ├── data/
 │   ├── raw/data_for_ml_model.csv           # 15,000 × 136 (unchanged)
@@ -343,10 +357,12 @@ NIC fraud Detection Project/
 │       ├── v3_feature_schema.json
 │       ├── identity_graph_v3.pt
 │       ├── degree_features_v3.csv          # N × 5 per-edge-type degrees
-│       └── synthetic_exposure_set_v3.pt    # 750 × 68
+│       ├── synthetic_exposure_set_v3.pt    # 750 × 68
+│       └── confirmed_fraud.json            # Supervisor feedback store (confirmed + false positives)
 │
 ├── models/
-│   └── hybrid_graphmcm_v3.pth             # {model_state_dict, centroid, config}
+│   ├── hybrid_graphmcm_v3.pth             # {model_state_dict, centroid, config} — live checkpoint
+│   └── checkpoints/                        # Versioned checkpoints (last 5 kept by checkpoint_manager)
 │
 ├── outputs/
 │   ├── hybrid_scores_v3.csv
@@ -357,13 +373,16 @@ NIC fraud Detection Project/
 │   └── explanation_cards_v3.json
 │
 └── docs/
-    └── AGENTS.md                           # Architecture contract (do not edit autonomously)
-                                            # Includes V2 history, MAR critique, research citations
+    ├── AGENTS.md                           # Architecture contract (do not edit autonomously)
+    ├── OPERATIONS_RUNBOOK.md               # Yearly operational cycle guide
+    └── API_TESTING_GUIDE.md                # Manual curl testing guide for all 13 endpoints
 ```
 
 ---
 
 ## How to Run
+
+### Local (Python venv)
 
 ```bash
 # Full V3 pipeline:
@@ -375,6 +394,27 @@ python main_v3.py
 # Evaluation only:
 .\.venv\Scripts\python.exe src/evaluate_model_v3.py
 ```
+
+### Docker (API + async worker)
+
+```powershell
+# First time — builds the image (~5 min):
+docker compose up --build
+
+# Every subsequent start:
+docker compose up -d
+
+# API is now at http://localhost:8000
+# Swagger UI (all 13 endpoints): http://localhost:8000/docs
+# Full manual testing guide: docs/API_TESTING_GUIDE.md
+
+# Stop:
+docker compose down
+```
+
+Docker starts three containers: `redis` (broker), `nic-api` (FastAPI on port 8000),
+`nic-worker` (Celery, concurrency=1). Training jobs dispatched via the API run
+inside `nic-worker` and write to the mounted `data/`, `models/`, `outputs/` volumes.
 
 ---
 
@@ -464,6 +504,21 @@ cards and the top-suspicious TSV.
 ---
 
 ## Changelog
+
+### 2026-07-02 — MLOps Phase 2: REST API, async jobs, checkpoint manager, Docker
+
+FastAPI server (`src/api/`) with 13 endpoints across 4 groups — supervisor
+feedback, async training, monitoring, and model/checkpoint management.
+Celery + Redis for async job dispatch (`celeryconfig.py`, `src/api/tasks.py`):
+training jobs return a `job_id` immediately; callers poll
+`GET /v3/training/jobs/{job_id}` for status. Atomic checkpoint hot-swap with
+schema validation (`src/checkpoint_manager.py`): validates
+`{model_state_dict, centroid, config}` keys and dimension constants before
+replacing the live model, keeps last 5 versioned checkpoints, `.bak` fallback.
+Structlog JSON logging in all new API files. Single Docker image
+(`python:3.12-slim`, CPU-only) with `docker-compose.yml` running Redis,
+API server, and Celery worker. Full stack tested end-to-end via Docker Desktop.
+See `docs/API_TESTING_GUIDE.md` for manual curl testing of all endpoints.
 
 ### 2026-06-30 — XAI explanation card improvements
 

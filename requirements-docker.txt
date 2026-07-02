@@ -1,0 +1,31 @@
+# Requirements for the nic-fraud-server Docker image (Linux/CPU).
+# Uses minimum version pins from AGENTS.md §E.2 so pip resolves
+# compatible Linux wheels. The Windows requirements.txt freeze
+# cannot be used directly in the Linux container.
+
+# ── Core ML stack ─────────────────────────────────────────────────────────────
+pandas>=1.5
+numpy>=1.23
+scikit-learn>=1.2
+scipy>=1.11
+lightgbm>=4.0
+shap>=0.44
+networkx>=3.0
+
+# ── Deep learning (CPU wheel installed separately in Dockerfile) ───────────────
+# torch installed via CPU index before this file; torch_geometric installed here
+torch_geometric>=2.4.0
+
+# ── REST API / async job queue ─────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+celery>=5.4.0
+redis>=5.0.0
+
+# ── MLOps ─────────────────────────────────────────────────────────────────────
+mlflow>=2.14.0
+
+# ── Structured logging ────────────────────────────────────────────────────────
+structlog>=24.0.0
+python-json-logger>=2.0.0
