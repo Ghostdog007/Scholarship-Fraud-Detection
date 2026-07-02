@@ -337,7 +337,7 @@ NIC fraud Detection Project/
 │   ├── evt_scorer_v3.py                    # GPD tail fit on 6 signals (hybrid + 5 subspace)
 │   ├── self_training_loop_v3.py            # Pseudo-label promotion (human-gated, ≥2 of 5 EVT signals)
 │   ├── fusion_classifier_v3.py             # LightGBM: hybrid + subspace IF → risk score
-│   ├── xai_layer_v3.py                     # Reviewer-ready explanation cards: readable feature labels, resolved neighbor IDs, actionable narratives
+│   ├── xai_layer_v3.py                     # Evidence-first explanation cards: population percentiles, expected-vs-actual values, EVT-threshold quotes, deterministic narratives
 │   ├── evaluate_model_v3.py                # Category-specific subspace IF + degree-stratified PR-AUC
 │   ├── checkpoint_manager.py               # ADR-008: atomic checkpoint validation + hot-swap
 │   └── api/
@@ -457,7 +457,7 @@ http://localhost:5000
 | Folder | File | What it tells you |
 |---|---|---|
 | `suspicious/` | `top_suspicious_v3.tsv` | **Start here.** Top 20 highest-risk applications with risk score, anomalous features (human-readable labels), linked application IDs, EVT triggers, and full narrative recommendation. Open in Excel for best readability. |
-| `xai/` | `explanation_cards_v3.json` | Full 500 explanation cards. Each card has `review_status`, `top_feature_errors` (with `feature_label`), `top_graph_neighbors` (with actual application IDs), and `narrative`. Download and open in VS Code — search by application ID. |
+| `xai/` | `explanation_cards_v3.json` | Full 500 explanation cards. Each card has `review_status`, `top_feature_errors` (with `feature_label`, model-`expected` value, and population percentiles), `top_graph_neighbors` (with actual application IDs), an `evidence` object (risk rank/percentile, EVT crossings vs thresholds, subspace detector scores, graph-degree percentiles), and a `narrative` composed deterministically from that evidence. Download and open in VS Code — search by application ID. |
 | `scores/` | `risk_scores_v3.csv` | Risk score for all 15,000 applications. Columns: `application_id`, `risk_score_v3`, `label_source`. Sort descending to get the full ranked list beyond the top 500. |
 | `thresholds/` | `evt_thresholds_v3.json` | EVT threshold for each of the 6 signals (hybrid, subspace_if, financial, identity, network, edge). Records the GPD fit params (`scale`, `shape`) and how many applications crossed each threshold. Useful for auditing whether thresholds are reasonable. |
 | `labels/` | `pseudo_labels_v3.json` | The 13 applications promoted to pseudo-positive in Round 0 self-training. Each record shows which EVT signals fired. Review before any Round 1 is authorised. |
@@ -519,6 +519,87 @@ Structlog JSON logging in all new API files. Single Docker image
 (`python:3.12-slim`, CPU-only) with `docker-compose.yml` running Redis,
 API server, and Celery worker. Full stack tested end-to-end via Docker Desktop.
 See `docs/API_TESTING_GUIDE.md` for manual curl testing of all endpoints.
+
+### 2026-07-03 — Evidence-first XAI narratives
+
+Narratives no longer come from a fixed lookup table of canned sentences —
+every claim is now a statistic measured against the scored population
+(15,000 applications) or an EVT-derived threshold. `hybrid_scores_v3.csv`
+gained a `per_feature_predicted_json` column (the model's expected value per
+feature) so the narrative can state expected-vs-actual with direction, not
+just "this field is unusual." Hand-set narrative cuts (fixed 0.7/0.4 risk
+tiers, `_magnitude` word buckets) were removed; the only numeric gates quoted
+anywhere are EVT-fitted thresholds. Two real cards from the current run:
+
+**Case 1 — promoted to pseudo-positive (2 EVT signals agreed):**
+
+> Risk score 1.0000 — higher than 99.9+% of the 15,000 scored applications
+> (rank 1). Crossed 2 independent extreme-value thresholds, fitted to the
+> score tails at a 0.2% target false-positive rate: overall anomaly detected
+> by hybrid model (observed 0.908 vs threshold 0.860); IP/mobile sharing
+> pattern statistically extreme (observed 0.930 vs threshold 0.925). Key
+> evidence: IP-to-mobile concentration ratio is higher than 99.9% of
+> applicants (scaled value 1.000, population median 0.017); given the other
+> declared fields and the application's network context, the model expected
+> about -0.061 — the declared value is above expectation; this prediction
+> miss is larger than 99.9+% of all applications' misses on this field | No.
+> of applications from same IP is higher than 99.9% of applicants (scaled
+> value 1.000, population median 0.000); given the other declared fields and
+> the application's network context, the model expected about -0.038 — the
+> declared value is above expectation; this prediction miss is larger than
+> 99.9% of all applications' misses on this field | Year of admission matches
+> the population median (scaled value 1.000); given the other declared
+> fields and the application's network context, the model expected about
+> -0.035 — the declared value is above expectation; this prediction miss is
+> larger than 85.9% of all applications' misses on this field. Network
+> links: shares the same IP address with 38 other application(s), more
+> connected than 99.9% of applicants (e.g. GJ202526000019733,
+> GJ202526000029086, GJ202526000029074); shares the same mother's name with
+> 8 other application(s), more connected than 85.5% of applicants; shares
+> the same father's name with 1 other application(s), more connected than
+> 81.7% of applicants. Linked applications should be reviewed together.
+> Recommended action: hold disbursement and request supporting documents
+> (fee receipt, admission letter, income certificate); review linked
+> applications together before approval.
+
+**Case 2 — one signal crossed, below the 2-signal promotion bar (isolated node):**
+
+> Risk score 0.0001 — higher than 99.7% of the 15,000 scored applications
+> (rank 45). Crossed 1 extreme-value threshold: financial-features detector
+> (observed 0.931 vs threshold 0.923) — below the 2-signal agreement
+> required for automatic flag promotion. Key evidence: Institution verifier
+> code is higher than 99.7% of applicants (scaled value 1.000, population
+> median 0.183); given the other declared fields and the application's
+> network context, the model expected about -0.139 — the declared value is
+> above expectation; this prediction miss is larger than 97.6% of all
+> applications' misses on this field | Course year (external record) is
+> lower than 60.5% of applicants (scaled value 0.997, population median
+> 0.999); the model expected about -0.113 — the declared value is above
+> expectation; this prediction miss is larger than 78.5% of all
+> applications' misses on this field | Course ID (college-reported) is
+> higher than 76.0% of applicants (scaled value 0.999, population median
+> 0.001); the model expected about -0.080 — the declared value is above
+> expectation; this prediction miss is larger than 85.4% of all
+> applications' misses on this field. No shared IP, mobile, parent-name, or
+> pincode links found — 9.7% of applicants are similarly isolated.
+> Suspicion rests on feature-level evidence and the subspace detectors.
+> Recommended action: not auto-flagged (signal agreement below the
+> promotion requirement), but the crossed threshold above warrants
+> secondary verification before disbursement.
+
+Notice the second case shows the system correctly *not* over-flagging: one
+crossed threshold is reported honestly as insufficient for automatic
+promotion, with a softer recommendation, instead of being silently upgraded
+or silently dropped. Every card also carries a structured `evidence` object
+(`risk_rank`, `risk_percentile`, `evt_crossings`, `subspace_groups`,
+`graph_connections`, `isolated_population_pct`) alongside the prose, so a UI
+can render the numbers directly instead of re-parsing the sentence.
+Deterministic by design — no LLM in the loop, so the same evidence always
+produces the same words, which matters for appeals/audit trails.
+
+LLM-based narrative rendering was considered and explicitly rejected: NIC
+data cannot leave premises, and non-deterministic wording is a liability
+when a flagged application needs a reproducible explanation.
 
 ### 2026-06-30 — XAI explanation card improvements
 

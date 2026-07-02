@@ -256,6 +256,129 @@ def _loe_loss(
 
 
 # ---------------------------------------------------------------------------
+# Shared inference — single source of truth for the hybrid_scores_v3.csv schema
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_score_frame(
+    model: "HybridGraphMCM",
+    x_all: torch.Tensor,
+    edge_index_list: list,
+    edge_type_tensor: torch.Tensor,
+    isolated_mask: torch.Tensor,
+    app_ids: np.ndarray,
+    features: list[str],
+) -> pd.DataFrame:
+    """
+    Score every node and return the full hybrid_scores_v3.csv frame.
+
+    Used by train(), train_incremental() (via _score_and_save) and the API's
+    read-only staged scoring (src/api/inference.py) so the schema — including
+    per_feature_predicted_json — cannot drift between the three paths.
+
+    per_feature_predicted_json holds the model's predicted (scaled) value for
+    each feature given the rest of the application and its neighborhood. The
+    XAI layer pairs it with the actual value to state expected-vs-actual with
+    direction. Predictions are exported as-is (the decoder head is a plain
+    Linear layer, so values may fall slightly outside [0, 1]).
+    """
+    model.eval()
+    pred_x, edge_prob, h_n, _ = model(x_all, edge_index_list, edge_type_tensor, isolated_mask)
+
+    per_feat_err       = (pred_x - x_all).abs()          # (N, N_FEATURES)
+    feature_pred_error = per_feat_err.mean(dim=1)        # (N,)
+
+    target = torch.zeros(x_all.shape[0], N_EDGE_TYPES, device=x_all.device)
+    for rel_id, ei in enumerate(edge_index_list):
+        if ei.shape[1] > 0:
+            target[ei[0], rel_id] = 1.0
+            target[ei[1], rel_id] = 1.0
+    edge_pred_error = F.binary_cross_entropy(edge_prob, target, reduction="none").mean(dim=1)
+
+    hybrid_anomaly_score = feature_pred_error + LAMBDA_EDGE * edge_pred_error
+
+    def _norm(t: torch.Tensor) -> np.ndarray:
+        v = t.cpu().numpy()
+        lo, hi = v.min(), v.max()
+        return ((v - lo) / (hi - lo + 1e-8)).astype(np.float32)
+
+    per_feat_np = per_feat_err.cpu().numpy()
+    pred_np     = pred_x.cpu().numpy()
+
+    per_feature_error_json = [
+        json.dumps({features[j]: float(round(per_feat_np[i, j], 6)) for j in range(N_FEATURES)})
+        for i in range(len(app_ids))
+    ]
+    per_feature_predicted_json = [
+        json.dumps({features[j]: float(round(pred_np[i, j], 6)) for j in range(N_FEATURES)})
+        for i in range(len(app_ids))
+    ]
+
+    return pd.DataFrame({
+        "application_id":             app_ids,
+        "hybrid_anomaly_score":       _norm(hybrid_anomaly_score),
+        "feature_pred_error":         _norm(feature_pred_error),
+        "edge_pred_error":            _norm(edge_pred_error),
+        "per_feature_error_json":     per_feature_error_json,
+        "per_feature_predicted_json": per_feature_predicted_json,
+    })
+
+
+def load_model_and_inputs(device: torch.device = DEVICE):
+    """
+    Load the existing checkpoint plus canonical inputs for inference-only
+    scoring. Returns (model, x_all, edge_index_list, edge_type_tensor,
+    isolated_mask, app_ids, features). No training, no writes.
+    """
+    if not MODEL_PTH.exists():
+        raise FileNotFoundError(f"No checkpoint at {MODEL_PTH}. Run full train() first.")
+
+    schema    = json.loads(SCHEMA_JSON.read_text())
+    features  = schema["features"]
+    if len(features) != N_FEATURES:
+        raise DimensionError(f"Schema has {len(features)} features, expected {N_FEATURES}")
+
+    df        = pd.read_csv(FINAL_CSV)
+    feat_cols = [c for c in df.columns if c != "application_id"]
+    app_ids   = df["application_id"].values
+
+    x_all = torch.tensor(df[feat_cols].values, dtype=torch.float32).to(device)
+    _check_shape(x_all, (None, N_FEATURES), "x_all")
+
+    data = torch.load(GRAPH_PT, weights_only=False)
+    edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, device)
+    isolated_mask = _compute_isolated_mask(edge_index_list, x_all.shape[0], device)
+
+    ckpt  = torch.load(MODEL_PTH, weights_only=False, map_location=device)
+    model = HybridGraphMCM().to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.centroid = ckpt["centroid"].to(device)
+
+    return model, x_all, edge_index_list, edge_type_tensor, isolated_mask, app_ids, features
+
+
+def score_only() -> None:
+    """
+    Regenerate outputs/hybrid_scores_v3.csv from the existing checkpoint.
+    No training, no checkpoint write. Added alongside the
+    per_feature_predicted_json export (2026-07-02) so the schema change does
+    not force a retrain — the same weights produce identical scores plus the
+    new column.
+    """
+    print(f"[hybrid] score_only() | device={DEVICE}")
+    model, x_all, edge_index_list, edge_type_tensor, isolated_mask, app_ids, features = load_model_and_inputs()
+    print(f"[hybrid] Isolated nodes: {isolated_mask.sum().item()} / {x_all.shape[0]}")
+
+    out_df = compute_score_frame(model, x_all, edge_index_list, edge_type_tensor, isolated_mask, app_ids, features)
+
+    OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(OUT_CSV, index=False)
+    scores = out_df["hybrid_anomaly_score"].values
+    print(f"[hybrid] Scores saved -> {OUT_CSV}")
+    print(f"[hybrid] hybrid_anomaly_score range: [{scores.min():.4f}, {scores.max():.4f}]")
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -343,45 +466,8 @@ def train(smoke_test: bool = False) -> None:
 
     # ---- Scoring ----
     print("[hybrid] Scoring all nodes ...")
-    model.eval()
-    with torch.no_grad():
-        pred_x, edge_prob, h_n, _ = model(x_all, edge_index_list, edge_type_tensor, isolated_mask)
-
-        per_feat_err = (pred_x - x_all).abs()                    # (N, 68)
-        feature_pred_error = per_feat_err.mean(dim=1)            # (N,)
-
-        target = torch.zeros(x_all.shape[0], N_EDGE_TYPES, device=DEVICE)
-        for rel_id, ei in enumerate(edge_index_list):
-            if ei.shape[1] > 0:
-                target[ei[0], rel_id] = 1.0
-                target[ei[1], rel_id] = 1.0
-        edge_pred_error = F.binary_cross_entropy(edge_prob, target, reduction="none").mean(dim=1)
-
-        hybrid_anomaly_score = feature_pred_error + LAMBDA_EDGE * edge_pred_error
-
-    # Normalise scores to [0, 1]
-    def _norm(t: torch.Tensor) -> np.ndarray:
-        v = t.cpu().numpy()
-        lo, hi = v.min(), v.max()
-        return ((v - lo) / (hi - lo + 1e-8)).astype(np.float32)
-
-    hybrid_scores  = _norm(hybrid_anomaly_score)
-    feat_err_arr   = _norm(feature_pred_error)
-    edge_err_arr   = _norm(edge_pred_error)
-    per_feat_np    = per_feat_err.cpu().numpy()
-
-    per_feature_error_json = [
-        json.dumps({features[j]: float(round(per_feat_np[i, j], 6)) for j in range(N_FEATURES)})
-        for i in range(len(app_ids))
-    ]
-
-    out_df = pd.DataFrame({
-        "application_id":      app_ids,
-        "hybrid_anomaly_score": hybrid_scores,
-        "feature_pred_error":   feat_err_arr,
-        "edge_pred_error":      edge_err_arr,
-        "per_feature_error_json": per_feature_error_json,
-    })
+    out_df = compute_score_frame(model, x_all, edge_index_list, edge_type_tensor, isolated_mask, app_ids, features)
+    hybrid_scores = out_df["hybrid_anomaly_score"].values
 
     OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(OUT_CSV, index=False)
@@ -520,40 +606,7 @@ def _score_and_save(
     features: list[str],
 ) -> None:
     """Shared scoring + checkpoint save logic used by train() and train_incremental()."""
-    model.eval()
-    with torch.no_grad():
-        pred_x, edge_prob, h_n, _ = model(x_all, edge_index_list, edge_type_tensor, isolated_mask)
-
-        per_feat_err       = (pred_x - x_all).abs()
-        feature_pred_error = per_feat_err.mean(dim=1)
-
-        target = torch.zeros(x_all.shape[0], N_EDGE_TYPES, device=x_all.device)
-        for rel_id, ei in enumerate(edge_index_list):
-            if ei.shape[1] > 0:
-                target[ei[0], rel_id] = 1.0
-                target[ei[1], rel_id] = 1.0
-        edge_pred_error = F.binary_cross_entropy(edge_prob, target, reduction="none").mean(dim=1)
-
-        hybrid_anomaly_score = feature_pred_error + LAMBDA_EDGE * edge_pred_error
-
-    def _norm(t: torch.Tensor) -> np.ndarray:
-        v = t.cpu().numpy()
-        lo, hi = v.min(), v.max()
-        return ((v - lo) / (hi - lo + 1e-8)).astype(np.float32)
-
-    per_feat_np = per_feat_err.cpu().numpy()
-    per_feature_error_json = [
-        json.dumps({features[j]: float(round(per_feat_np[i, j], 6)) for j in range(N_FEATURES)})
-        for i in range(len(app_ids))
-    ]
-
-    out_df = pd.DataFrame({
-        "application_id":         app_ids,
-        "hybrid_anomaly_score":   _norm(hybrid_anomaly_score),
-        "feature_pred_error":     _norm(feature_pred_error),
-        "edge_pred_error":        _norm(edge_pred_error),
-        "per_feature_error_json": per_feature_error_json,
-    })
+    out_df = compute_score_frame(model, x_all, edge_index_list, edge_type_tensor, isolated_mask, app_ids, features)
     OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(OUT_CSV, index=False)
     print(f"[hybrid] Scores saved -> {OUT_CSV}")
@@ -576,4 +629,8 @@ def _score_and_save(
 
 
 if __name__ == "__main__":
-    train(smoke_test=False)
+    import sys
+    if "--score-only" in sys.argv:
+        score_only()
+    else:
+        train(smoke_test=False)

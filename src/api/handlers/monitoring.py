@@ -156,13 +156,18 @@ def dataset_xai(dataset_path: str, top_n: int = 20):
     cards = []
     for _, row in scores_df.iterrows():
         per_feat = json.loads(row["per_feature_error_json"])
+        predicted = (
+            json.loads(row["per_feature_predicted_json"])
+            if "per_feature_predicted_json" in scores_df.columns
+            else None
+        )
         actual_vals = {}
         if not features_df.empty:
             match = features_df[features_df["application_id"].astype(str) == str(row["application_id"])]
             if not match.empty:
                 actual_vals = match.iloc[0].to_dict()
 
-        top_feats = _top_features(per_feat, actual_vals, k=5)
+        top_feats = _top_features(per_feat, actual_vals, k=5, predicted=predicted)
         pseudo_card = {
             "risk_score_v3": float(row["hybrid_anomaly_score"]),
             "triggers": [],

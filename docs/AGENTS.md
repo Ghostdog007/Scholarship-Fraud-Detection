@@ -30,11 +30,27 @@ correctly restored after the read-only path) — **not yet exercised through
 the live Docker/Celery stack**. Project lead is running that validation next
 via `docs/API_TESTING_GUIDE.md` §9.
 
+Evidence-first XAI narratives added 2026-07-03 (project-lead approved
+two-module change): `hybrid_scores_v3.csv` gained `per_feature_predicted_json`
+(model-expected value per feature; hard stop #2 export list amended); all
+three scoring paths route through `hybrid_graphmcm_v3.compute_score_frame()`;
+new `score_only()` entry point (`python -m src.hybrid_graphmcm_v3
+--score-only`) regenerates scores from the existing checkpoint without
+retraining — parity vs the prior CSV verified at ≤1.5e-6. `xai_layer_v3.py`
+rewritten: narratives are deterministic prose composed from measured evidence
+(value/error/degree percentiles vs the 15,000-application population,
+expected-vs-actual with direction, subspace IF group scores vs EVT
+thresholds, risk rank). Hand-set narrative cuts (0.7/0.4 tiers, `_magnitude`
+buckets) removed; the only numeric gates quoted are EVT-derived. Narratives
+distinguish "crossed an EVT threshold" from "promoted" (2-signal rule).
+Cards regenerated (500), incl. `evidence` object per card.
+
 **Next task:** validate ADR-014 end-to-end through the real Docker stack
-(§9 of the API testing guide). After that: Phase 3 MLOps — do not begin
-without explicit project lead sign-off. Candidates: ADR-011 (Kubernetes /
-k3s single-node), ADR-012 (PostgreSQL for ego-graph inference), ADR-013
-(GitHub Actions CI/CD). Discuss scope and order before writing any code.
+(§9 of the API testing guide) — the Docker image should be rebuilt first so
+it picks up the new XAI/hybrid/inference code. After that: Phase 3 MLOps —
+do not begin without explicit project lead sign-off. Candidates: ADR-011
+(Kubernetes / k3s single-node), ADR-012 (PostgreSQL for ego-graph inference),
+ADR-013 (GitHub Actions CI/CD). Discuss scope and order before writing any code.
 
 **On session start — read these, in order:**
 1. This AGENT QUICK-START block (already done)
@@ -214,7 +230,7 @@ src/hybrid_graphmcm_v3.py          ← THE CORE MODEL
         │  outputs/hybrid_scores_v3.csv
         │    columns: application_id, hybrid_anomaly_score,
         │             feature_pred_error, edge_pred_error,
-        │             per_feature_error_json
+        │             per_feature_error_json, per_feature_predicted_json
         ▼
 src/subspace_if_v3.py
         │  outputs/subspace_if_scores_v3.csv
@@ -499,12 +515,12 @@ another module's source files directly. No embeddings cross module boundaries.
 | `data/processed/degree_features_v3.csv` | graph_builder | feature_engine (written back) | N×5, cols=`degree_shares_*` |
 | `data/processed/synthetic_exposure_set_v3.pt` | synthetic_builder | hybrid | (750, 68) float32 tensor |
 | `models/hybrid_graphmcm_v3.pth` | hybrid | xai, evaluate | `{model_state_dict, centroid, config}` |
-| `outputs/hybrid_scores_v3.csv` | hybrid | evt, self_training, fusion, xai | `application_id, hybrid_anomaly_score, feature_pred_error, edge_pred_error, per_feature_error_json` |
+| `outputs/hybrid_scores_v3.csv` | hybrid | evt, self_training, fusion, xai | `application_id, hybrid_anomaly_score, feature_pred_error, edge_pred_error, per_feature_error_json, per_feature_predicted_json` — predicted column added 2026-07-03 (project-lead approved) so XAI states expected-vs-actual with direction; all three scoring paths (train, incremental, API staged) emit it via `hybrid_graphmcm_v3.compute_score_frame()` |
 | `outputs/subspace_if_scores_v3.csv` | subspace_if | fusion, xai | `application_id, subspace_if_score, group_scores_json` |
-| `outputs/evt_thresholds_v3.json` | evt | self_training | 6 signals: `{hybrid, subspace_if, subspace_if_financial, subspace_if_identity, subspace_if_network, edge_pred_error}` each with `{u, scale, shape, threshold, n_flagged}` |
+| `outputs/evt_thresholds_v3.json` | evt | self_training, xai (read-only, quotes thresholds in narratives) | 6 signals: `{hybrid, subspace_if, subspace_if_financial, subspace_if_identity, subspace_if_network, edge_pred_error}` each with `{u, scale, shape, threshold, n_flagged}` |
 | `outputs/pseudo_labels_v3.json` | self_training | fusion, xai | `positive_set` array, each record: `{application_id, round, trigger: [list of EVT signal names], hybrid_anomaly_score, subspace_if_*, edge_pred_error}` |
 | `outputs/risk_scores_v3.csv` | fusion | xai, evaluate | `application_id, risk_score_v3, label_source` |
-| `outputs/explanation_cards_v3.json` | xai | [end user] | per-application JSON. `top_feature_errors`: `{feature, feature_label, error, value, magnitude}` — `feature_label` is human-readable display name. `top_graph_neighbors`: `{edge_type, application_id}` — neighbor index resolved to actual application ID (no raw array indices). `review_status`: human-readable string replacing raw `label_source` (e.g. "Pending Review — no confirmed fraud label assigned yet"). `narrative`: full actionable prose including recommended action and explanation of why features are suspicious. |
+| `outputs/explanation_cards_v3.json` | xai | [end user] | per-application JSON, evidence-first (2026-07-03). `top_feature_errors`: `{feature, feature_label, error, value, expected, value_percentile, population_median, error_percentile}` — `expected` is the model's predicted value; percentiles are computed against the full scored population (replaces the old hand-bucketed `magnitude`). `top_graph_neighbors`: `{edge_type, application_id}` — resolved to actual application IDs. `evidence`: `{population_size, risk_rank, risk_percentile, label_source, evt_signals, evt_crossings, subspace_groups, graph_connections, isolated_population_pct}` — every quantity measured from data or EVT thresholds, no hand-set narrative cuts. `review_status`: human-readable string replacing raw `label_source`. `narrative`: deterministic prose composed from `evidence` (same evidence ⇒ same words; auditable for appeals); distinguishes EVT-threshold crossings from multi-signal promotion. |
 | `data/processed/confirmed_fraud.json` | API / supervisor endpoint | retraining_orchestrator, self_training, fusion | `{confirmed: [{application_id, fraud_type, confirmed_by, cycle, feature_vec, confirmed_at, notes}], false_positives: [{application_id, confirmed_by, confirmed_at, notes}]}` |
 | `models/checkpoints/hybrid_v3_<cycle>_<run_id>.pth` | checkpoint_manager | rollback command, MLflow | same schema as `hybrid_graphmcm_v3.pth` (`model_state_dict`, `centroid`, `config`); keep last 5; filename encodes cycle and mlflow_run_id |
 | `outputs/prev_cycle_scores_ks.json` | retraining_orchestrator (end of cycle) | next-cycle drift check | `{scores: [float, ...]}` — score distribution baseline for KS test; overwritten after every completed inference cycle |
@@ -515,10 +531,32 @@ another module's source files directly. No embeddings cross module boundaries.
 | `outputs/drift_audit_log.json` | `POST /v3/training/decision` (ADR-014) | human review, MLflow-adjacent audit trail | append-only list of `{timestamp, dataset_path, p_value, recommendation, action, cycle, decided_by, job_id, backup_dir}` — one record per decision call, including `action: "none"` |
 | `data/backups/<timestamp>_<label>/` | `src/api/dataset_ops.backup_canonical_files()` (ADR-014) | `restore_canonical_files()`, manual rollback | snapshot of `RAW_CSV, NODEG_CSV, FINAL_CSV, SCHEMA_JSON, GRAPH_PT, DEGREE_CSV` before any merge; `evaluate-dataset` deletes its own backup after restoring, `decision` (incremental/full_retrain) keeps it |
 
-**Hard rule:** `per_feature_error_json` is a JSON string of
-`{feature_name: float}` for all 68 features. Downstream XAI reads this column
-— its key set must exactly match the feature names in `v3_feature_schema.json`.
-If they diverge, the XAI layer must raise, not silently skip unknown keys.
+**Hard rule:** `per_feature_error_json` and `per_feature_predicted_json` are
+each a JSON string of `{feature_name: float}` for all 68 features. Downstream
+XAI reads these columns — their key sets must exactly match the feature names
+in `v3_feature_schema.json`. If they diverge, the XAI layer must raise, not
+silently skip unknown keys. Note: predicted values come from an unbounded
+Linear decoder head and may fall slightly outside [0, 1]; export them as-is.
+
+**Clarification (2026-07-03) — `identity_graph_v3.pt` is not preserved across
+cycles, and that is correct behavior, not a gap.** Every retraining cycle
+(`src/api/dataset_ops.rebuild_features_and_graph()`, and the equivalent
+`build_base() → build_graph() → add_degree_features()` order in `main_v3.py`)
+overwrites `identity_graph_v3.pt` in place from whatever is currently in
+`data/raw/data_for_ml_model.csv`. There is no versioned or archived copy of a
+prior cycle's graph anywhere in the pipeline (contrast with model checkpoints,
+which ARE versioned — see `models/checkpoints/` above and ADR-008). This is
+intentional: the RGCN encoder learns to interpret structural *patterns*
+(unusual IP concentration, name-sharing density, degree distributions) at
+training time, not the identity of specific IPs/mobiles/names present in any
+one batch's edges. Those identities are meaningless outside the batch they
+came from — next cycle's fraud rings use different IPs. What must persist
+across cycles is the learned weights (`hybrid_graphmcm_v3.pth` /
+`models/checkpoints/`), not the graph tensor. `train_incremental()` reflects
+this directly: it loads the checkpoint, optionally freezes the RGCN encoder
+(`freeze_rgcn=True` when confirmed fraud < 50 — see `retraining_orchestrator.py`),
+and re-scores against the freshly rebuilt graph for the current batch only.
+Do not add graph versioning/archival as a "fix" — there is nothing to fix here.
 
 ---
 
@@ -562,7 +600,7 @@ row, stop and confirm scope.
 | EVT scorer | `src/evt_scorer_v3.py` | `hybrid_scores_v3.csv`, `subspace_if_scores_v3.csv` | `evt_thresholds_v3.json` | no model training |
 | Self-training | `src/self_training_loop_v3.py` | score CSVs, `evt_thresholds_v3.json` | `pseudo_labels_v3.json` | no architecture changes |
 | Fusion | `src/fusion_classifier_v3.py` | score CSVs, `pseudo_labels_v3.json` | `risk_scores_v3.csv` | no raw embeddings |
-| XAI | `src/xai_layer_v3.py` | `hybrid_scores_v3.csv`, `risk_scores_v3.csv`, `pseudo_labels_v3.json`, `engineered_features_v3.csv` | `explanation_cards_v3.json` | no training code |
+| XAI | `src/xai_layer_v3.py` | `hybrid_scores_v3.csv`, `risk_scores_v3.csv`, `pseudo_labels_v3.json`, `engineered_features_v3.csv`, `subspace_if_scores_v3.csv`, `evt_thresholds_v3.json` (read-only) | `explanation_cards_v3.json` | no training code |
 | Evaluate | `src/evaluate_model_v3.py` | `engineered_features_v3.csv`, `models/*.pth` | console stdout | no training code |
 | Orchestrator | `main_v3.py` | — | calls all modules | no business logic |
 | Checkpoint manager | `src/checkpoint_manager.py` | incoming `.pth` (temp path), `models/hybrid_graphmcm_v3.pth` | `models/hybrid_graphmcm_v3.pth` (live), `models/hybrid_graphmcm_v3.pth.bak`, `models/checkpoints/` | no training code; no model forward pass; validation and file operations only |
@@ -578,8 +616,11 @@ row, stop and confirm scope.
    encodes a policy boundary. The only allowed thresholds are EVT-derived or
    learned from synthetic exposure.
 2. **No raw GNN embeddings leave `hybrid_graphmcm_v3.py`.** Only
-   `hybrid_anomaly_score`, `feature_pred_error`, `edge_pred_error`, and
-   `per_feature_error_json` are valid exports.
+   `hybrid_anomaly_score`, `feature_pred_error`, `edge_pred_error`,
+   `per_feature_error_json`, and `per_feature_predicted_json` are valid
+   exports. (`per_feature_predicted_json` added 2026-07-03 with project-lead
+   approval — predicted feature values are decoder outputs, not embeddings;
+   `h_N(i)` and all latent vectors remain forbidden.)
 3. **Score direction: higher = more anomalous.** Any module that inverts this
    must document the inversion explicitly at the point of inversion.
 4. **`sanity` column is never used.** Drop at load time in every pipeline file.
