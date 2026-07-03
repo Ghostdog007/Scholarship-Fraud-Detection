@@ -1,0 +1,15 @@
+{
+  "conn_pr_auc_age_violation": 0.04176172896209262,
+  "conn_pr_auc_income_violation": 0.04433059838769707,
+  "conn_pr_auc_ip_concentration": 0.3265773459814673,
+  "conn_pr_auc_mother_name_collision": 0.4468533774608483,
+  "conn_pr_auc_fee_inflation": 0.052470466200692845,
+  "mean_conn_pr_auc": 0.18239870339855963,
+  "pr_auc_age_violation": 0.3417133448075873,
+  "pr_auc_income_violation": 0.9062623919581585,
+  "pr_auc_ip_concentration": 0.11842899867586934,
+  "pr_auc_mother_name_collision": 0.520637315583218,
+  "pr_auc_fee_inflation": 0.7419851850472592,
+  "score_retention": 2.430786423440548,
+  "n_categories_pass": 5.0
+}

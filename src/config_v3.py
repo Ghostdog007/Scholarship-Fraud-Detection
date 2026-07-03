@@ -1,3 +1,5 @@
+import os  # V4_SEED env override for multi-seed ablation runs
+
 N_FEATURES      = 68
 N_EDGE_TYPES    = 5
 MASK_NUM        = 8
@@ -12,7 +14,7 @@ EPOCHS_STAGE1   = 80
 EPOCHS_STAGE2   = 120
 LR              = 1e-3
 BATCH_SIZE      = 256
-RANDOM_SEED     = 42
+RANDOM_SEED     = int(os.environ.get("V4_SEED", "42"))  # override per run for seed replication
 
 # Incremental fine-tune (CPU server, post-cycle update)
 INCREMENTAL_EPOCHS = 10    # Stage 2 epochs only, RGCN frozen
@@ -118,7 +120,7 @@ def _env(name, default):
 
 # ── V4: encoder switch (lets all 3 ablation configs run from one codebase) ───
 # Override per run with env vars, e.g.  V4_ENCODER_ARCH=rgcn V4_TOPO_EXPOSURE=0
-ENCODER_ARCH         = _env("V4_ENCODER_ARCH", "han")   # "rgcn" | "han"
+ENCODER_ARCH         = _env("V4_ENCODER_ARCH", "rgcn")  # "rgcn" | "han" — default rgcn: 3-seed ablation (2026-07-04) showed HAN drop-in regresses (-0.091 mean, all seeds); see AGENTS.md V4 ablation results
 ARCH_VERSION         = {"rgcn": "rgcn_v1", "han": "han_v1"}[ENCODER_ARCH]  # ckpt tag (hard stop #15)
 
 # ── V4: HAN encoder (ADR-015) ───────────────────────────────────────────────

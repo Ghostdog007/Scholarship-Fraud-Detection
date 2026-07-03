@@ -44,6 +44,50 @@ config-3 partly *fixes* that plumbing — Δ(3−2) means "topology exposure tha
 actually reaches the encoder," not "topology vs scalar" in isolation. Add a
 4th config to separate those if the distinction matters.
 
+### V4 ABLATION RESULTS — 3 seeds (42/43/44), recorded 2026-07-04
+
+Configs actually run (the project lead sequenced topology-first, so the encoder
+is held at RGCN while topology is added, then HAN is added on top):
+**①** RGCN + feature exposure (baseline) · **②** RGCN + topology exposure ·
+**③** HAN + topology exposure. Metric = connected-cluster PR-AUC (the
+graph-sensitive T1 harness; the old isolated-node table is subspace-IF-only and
+does NOT move with the encoder — verified constant within each seed).
+
+```
+Connected PR-AUC (mean ± std over 3 seeds)   ①RGCN+feat   ②RGCN+topo   ③HAN+topo
+ip_concentration                             0.303±0.03   0.464±0.15   0.376±0.02
+mother_name_collision                        0.484±0.04   0.652±0.08   0.392±0.09
+fee_inflation                                0.062±0.01   0.099±0.03   0.036±0.00
+age_violation                                0.062±0.02   0.049±0.00   0.033±0.00
+income_violation                             0.069±0.03   0.063±0.02   0.033±0.00
+MEAN                                         0.196±0.02   0.265±0.02   0.174±0.02
+score_retention                              2.70±0.33    3.90±0.52    1.18±0.15
+Paired Δ topology (②−①): +0.069 ± 0.034  per-seed [+0.072,+0.027,+0.110]  (all +)
+Paired Δ HAN      (③−②): −0.091 ± 0.032  per-seed [−0.099,−0.050,−0.126]  (all −)
+```
+
+**Verdict — topology synthetic exposure (ADR-016): ADOPT.** Positive in all 3
+seeds (~2σ), concentrated in the two relational categories injected as cliques
+(IP +53%, mother-name +35%), and it *raises* robustness (score_retention
+2.70→3.90). Modest not dramatic: the single-seed pilot overstated it (+0.113);
+the 3-seed truth is **+0.069 mean (~+35% relative)**. Mechanism confirmed —
+config-1 Stage-1 printed `h_synth.std=0.0000` (feature exposure collapses to
+`isolated_embedding`, teaching the graph stream nothing); topology exposure
+gives std>0.
+
+**Verdict — HAN encoder (ADR-015): DO NOT ADOPT as a drop-in.** Reliably
+*worse* than RGCN+topology in all 3 seeds (−0.091 mean, ~3σ) — robust, not seed
+noise. Worst on the dense mother-name clique (−0.26); its only occasional win
+(IP) flips sign across seeds. score_retention collapses to 1.18: HAN
+over-relies on graph edges and **over-smooths dense cliques** (attention
+averages homogeneous neighbours → a fraud clique reconstructs *well* → low
+anomaly score → worse detection — "consensus fraud looks locally normal," made
+worse by attention). Likely compounded by the global-β_r simplification
+(one relation-weight vector for the whole graph, not per-node). Before any
+reconsideration: implement per-node β_r + an HAN hyperparameter pass, then
+re-run this ablation. Until then the shipping config is **② RGCN + topology
+exposure**; set `ENCODER_ARCH="rgcn"`, `TOPO_EXPOSURE_ENABLED=True`.
+
 **Scope note (project-lead directed, 2026-07-03):** `src/*.py` changes ARE
 authorized on this branch for the above work (this is an ML-architecture
 program, a directed exception to the F.0 "no src modification" MLOps
