@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.config_v3 import MIN_SIGNALS_FOR_PROMOTION
+from src.config_v3 import MIN_SIGNALS_FOR_PROMOTION, EDGE_TYPES, ENCODER_ARCH
 
 HYBRID_CSV     = Path("outputs/hybrid_scores_v3.csv")
 RISK_CSV       = Path("outputs/risk_scores_v3.csv")
@@ -420,6 +420,19 @@ def _narrative(card: dict) -> str:
     elif not neighbors:
         parts.append("No shared IP, mobile, parent-name, or pincode links found.")
 
+    attention = card.get("attention")
+    if attention:
+        beta_r = attention.get("beta_r", {})
+        if beta_r:
+            top_rel, top_w = max(beta_r.items(), key=lambda kv: kv[1])
+            top_rel_label = EDGE_TYPE_LABELS.get(top_rel, top_rel.replace("_", " "))
+            top_edges = attention.get("top_edges", [])
+            n_edges = len(top_edges)
+            parts.append(
+                f"The model weighted this application's {top_rel_label} links most heavily (β={top_w:.2f}), "
+                f"focusing on {n_edges} co-application(s)."
+            )
+
     # 6. Recommended action — driven by label state and EVT crossings,
     #    not a hand-set score cut
     label_source = ev.get("label_source")
@@ -499,6 +512,14 @@ def run_xai(top_n: int = 500) -> None:
 
     print("[xai] Computing population statistics (values, errors, degrees, groups) ...")
     stats = build_population_stats(hybrid_df, feat_df, risk_df, subspace_df, degree_counts)
+
+    from src.hybrid_graphmcm_v3 import load_model_and_inputs
+    import torch
+    print("[xai] Loading hybrid model for attention extraction ...")
+    model, x_all, edge_index_list, edge_type_tensor, isolated_mask, app_ids_arr, _ = load_model_and_inputs()
+    with torch.no_grad():
+        model(x_all, edge_index_list, edge_type_tensor, isolated_mask)
+    beta_r_tensor = model.last_beta_r.cpu().numpy() if model.last_beta_r is not None else np.ones(len(EDGE_TYPES)) / len(EDGE_TYPES)
 
     risk_sorted = stats["risk_sorted"]
     n_pop       = stats["n"]
@@ -633,11 +654,23 @@ def run_xai(top_n: int = 500) -> None:
             "isolated_population_pct": round(stats.get("isolated_pct", 0.0), 2),
         }
 
+        if ENCODER_ARCH == "han" and node_idx != -1:
+            top_edges = model.top_alpha(node_idx, TOP_K_NEIGHBORS)
+            for edge in top_edges:
+                edge["neighbor_id"] = str(idx_to_id.get(edge["neighbor_idx"], f'idx:{edge["neighbor_idx"]}'))
+            attention_dict = {
+                "beta_r": {EDGE_TYPES[r]: float(beta_r_tensor[r]) for r in range(len(beta_r_tensor))},
+                "top_edges": top_edges
+            }
+        else:
+            attention_dict = None
+
         card = {
             "application_id":       app_id,
             "risk_score_v3":        float(round(score, 6)),
             "hybrid_anomaly_score": float(round(row["hybrid_anomaly_score"], 6)),
             "feature_pred_error":   float(round(row["feature_pred_error"], 6)),
+            "attention":            attention_dict,
             "edge_pred_error":      float(round(row["edge_pred_error"], 6)),
             "review_status":        LABEL_SOURCE_DESCRIPTIONS.get(label_src, label_src),
             "triggers":             triggers,

@@ -274,6 +274,34 @@ Invoke-RestMethod -Method POST "http://localhost:8000/v3/training/pull-checkpoin
 
 ## 5. Supervisor Feedback Endpoints
 
+### 5.0 Interactive Topology View
+
+Open in browser (do not use curl) to see the interactive HTML visualization of the application's network context:
+```text
+http://localhost:8000/v3/monitoring/APP_2024_00123/topology
+```
+
+### 5.0b Pattern Lifecycle
+
+List pending confirmed patterns:
+```powershell
+curl.exe -s http://localhost:8000/v3/supervisor/patterns
+```
+
+Confirm a pattern (saves subgraph):
+```powershell
+Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/patterns/confirm" `
+  -ContentType "application/json" `
+  -Body '{"application_id": "APP_2024_00123", "fraud_type": "IP_CLUSTER", "subgraph": {}, "confirmed_by": "investigator_name"}'
+```
+
+Promote a pattern to exposure and retrain:
+```powershell
+Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/patterns/promote" `
+  -ContentType "application/json" `
+  -Body '{"pattern_ids": ["pat_xxxxxxxx"], "smoke_test": true}'
+```
+
 ### 5.1 Confirm a fraud case
 
 Run this for every application investigators confirm as fraud after reviewing the XAI cards.

@@ -16,7 +16,12 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.config_v3 import N_FEATURES, RANDOM_SEED
+from src.config_v3 import (
+    N_FEATURES, 
+    RANDOM_SEED,
+    N_TOPO_CLUSTERS,
+    TOPO_CLUSTER_SIZE_RANGE,
+)
 
 RNG = np.random.default_rng(RANDOM_SEED)
 
@@ -216,5 +221,88 @@ def build_exposure_set() -> None:
     print(f"[synthetic_exposure] Saved exposure set {exposure.shape} -> {OUT_PT}")
 
 
+def build_topology_exposure() -> None:
+    print("[synthetic_exposure] build_topology_exposure() starting ...")
+
+    schema   = json.loads(SCHEMA_JSON.read_text())
+    features = schema["features"]
+
+    df = pd.read_csv(FINAL_CSV)
+    feat_cols = [c for c in df.columns if c != "application_id"]
+    feat = df[feat_cols].values.astype(np.float32)
+
+    if feat.shape[1] != N_FEATURES:
+        raise ValueError(f"Expected {N_FEATURES} features, got {feat.shape[1]}")
+
+    if feat_cols != features:
+        raise ValueError("Feature CSV column order does not match schema.")
+
+    RELATION_MAP = {
+        "IP_CONCENTRATION": 1,
+        "MOTHER_NAME_COLLISION": 3,
+        "FEE_INFLATION": 4,
+        "AGE_VIOLATION": 4,
+        "INCOME_VIOLATION": 4,
+    }
+
+    chunks = []
+    cluster_ids = []
+    cluster_edges = []
+    edge_types = []
+    
+    node_offset = 0
+    rng = np.random.default_rng(RANDOM_SEED + 999)
+    
+    global N_PER_ARCHETYPE, N_CLEAN, N_PERTURB
+    old_n_per = N_PER_ARCHETYPE
+    old_n_clean = N_CLEAN
+    old_n_perturb = N_PERTURB
+
+    for c in range(N_TOPO_CLUSTERS):
+        cat_name, fn = ARCHETYPES[rng.integers(0, len(ARCHETYPES))]
+        c_size = rng.integers(TOPO_CLUSTER_SIZE_RANGE[0], TOPO_CLUSTER_SIZE_RANGE[1] + 1)
+        
+        N_PER_ARCHETYPE = c_size
+        N_CLEAN = c_size // 3
+        N_PERTURB = c_size - N_CLEAN
+        
+        x_c_np = fn(feat, feat_cols)
+        chunks.append(x_c_np)
+        cluster_ids.extend([c] * c_size)
+        
+        # clique
+        nodes = np.arange(node_offset, node_offset + c_size)
+        idx_i, idx_j = np.meshgrid(nodes, nodes)
+        mask = idx_i != idx_j
+        if mask.any():
+            ei = np.vstack([idx_i[mask], idx_j[mask]])
+            cluster_edges.append(ei)
+            edge_types.extend([RELATION_MAP[cat_name]] * ei.shape[1])
+        
+        node_offset += c_size
+
+    N_PER_ARCHETYPE = old_n_per
+    N_CLEAN = old_n_clean
+    N_PERTURB = old_n_perturb
+
+    exposure_x = np.vstack(chunks).astype(np.float32)
+    edge_index = np.hstack(cluster_edges).astype(np.int64) if cluster_edges else np.zeros((2, 0), dtype=np.int64)
+    edge_type = np.array(edge_types, dtype=np.int64)
+    cluster_id = np.array(cluster_ids, dtype=np.int64)
+
+    out_dict = {
+        "x": torch.tensor(exposure_x),
+        "edge_index": torch.tensor(edge_index),
+        "edge_type": torch.tensor(edge_type),
+        "cluster_id": torch.tensor(cluster_id)
+    }
+
+    topo_pt = Path("data/processed/synthetic_exposure_graph_v3.pt")
+    topo_pt.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(out_dict, topo_pt)
+    print(f"[synthetic_exposure] Saved topology exposure set (M={exposure_x.shape[0]}, E={edge_index.shape[1]}) -> {topo_pt}")
+
+
 if __name__ == "__main__":
     build_exposure_set()
+    build_topology_exposure()

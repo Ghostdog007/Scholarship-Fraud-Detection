@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 
-from src.config_v3 import N_FEATURES, GRAPH_EMB_DIM, N_EDGE_TYPES
+from src.config_v3 import N_FEATURES, GRAPH_EMB_DIM, N_EDGE_TYPES, ARCH_VERSION
 
 LIVE_PATH     = Path("models/hybrid_graphmcm_v3.pth")
 BAK_PATH      = Path("models/hybrid_graphmcm_v3.pth.bak")
@@ -26,7 +26,7 @@ CKPT_DIR      = Path("models/checkpoints")
 MAX_VERSIONED = 5
 
 _REQUIRED_KEYS   = {"model_state_dict", "centroid", "config"}
-_REQUIRED_CONFIG = {"N_FEATURES", "GRAPH_EMB_DIM", "N_EDGE_TYPES"}
+_REQUIRED_CONFIG = {"N_FEATURES", "GRAPH_EMB_DIM", "N_EDGE_TYPES", "ARCH_VERSION"}
 
 
 def _validate(d: dict, path: Path) -> None:
@@ -45,6 +45,8 @@ def _validate(d: dict, path: Path) -> None:
         raise ValueError(f"GRAPH_EMB_DIM mismatch: checkpoint={cfg['GRAPH_EMB_DIM']}, expected={GRAPH_EMB_DIM}")
     if cfg["N_EDGE_TYPES"] != N_EDGE_TYPES:
         raise ValueError(f"N_EDGE_TYPES mismatch: checkpoint={cfg['N_EDGE_TYPES']}, expected={N_EDGE_TYPES}")
+    if cfg["ARCH_VERSION"] != ARCH_VERSION:
+        raise ValueError(f"ARCH_VERSION mismatch: checkpoint={cfg.get('ARCH_VERSION')}, expected={ARCH_VERSION}")
 
 
 def _prune_old_checkpoints() -> None:

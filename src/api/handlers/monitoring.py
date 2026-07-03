@@ -6,6 +6,7 @@ GET  /v3/monitoring/fraud-store-summary
 POST /v3/monitoring/evaluate-dataset   — score a new/unseen dataset read-only, check drift
 GET  /v3/monitoring/dataset-xai        — XAI preview for the top-N staged rows
 GET  /v3/monitoring/top-suspicious     — top-N suspicious apps from the last full run
+GET  /v3/monitoring/{app_id}/topology  — interactive topology view (HTML)
 """
 import json
 from collections import Counter
@@ -192,3 +193,14 @@ def top_suspicious(n: int = 20):
         raise HTTPException(status_code=404, detail="outputs/top_suspicious_v3.tsv not found — run a full pipeline first")
     df = pd.read_csv(tsv_path, sep="\t")
     return df.head(n).to_dict(orient="records")
+
+
+@router.get("/{app_id}/topology")
+def get_topology(app_id: str):
+    from fastapi.responses import HTMLResponse
+    from src.topology_view import extract_ego, render_html
+    ego = extract_ego(app_id, hops=1, node_cap=50)
+    if not ego:
+        raise HTTPException(status_code=404, detail="Ego graph not found or application_id missing")
+    html_content = render_html(ego)
+    return HTMLResponse(content=html_content, status_code=200)

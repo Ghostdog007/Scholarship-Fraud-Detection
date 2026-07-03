@@ -110,3 +110,27 @@ EVT_SHAPE_MAX = 1.0
 # the centroid mean. Excludes likely-contaminated nodes (potential fraud) from the
 # normal centroid definition.
 CENTROID_CLEAN_PERCENTILE = 95  # keep bottom 95% by embedding norm
+
+import os as _os  # env overrides for the ablation switches (set once per run)
+
+def _env(name, default):
+    return _os.environ.get(name, default)
+
+# ── V4: encoder switch (lets all 3 ablation configs run from one codebase) ───
+# Override per run with env vars, e.g.  V4_ENCODER_ARCH=rgcn V4_TOPO_EXPOSURE=0
+ENCODER_ARCH         = _env("V4_ENCODER_ARCH", "han")   # "rgcn" | "han"
+ARCH_VERSION         = {"rgcn": "rgcn_v1", "han": "han_v1"}[ENCODER_ARCH]  # ckpt tag (hard stop #15)
+
+# ── V4: HAN encoder (ADR-015) ───────────────────────────────────────────────
+ATTN_HEADS           = 4          # node-level GAT heads per relation
+ATTN_LEAKY_SLOPE     = 0.2        # LeakyReLU slope in node-level attention
+SEMANTIC_ATTN_HIDDEN = 32         # hidden dim of the semantic-attention MLP
+
+# ── V4: topology synthetic exposure (ADR-016) ───────────────────────────────
+TOPO_EXPOSURE_ENABLED   = _env("V4_TOPO_EXPOSURE", "1") == "1"  # "0" reproduces config-1
+N_TOPO_CLUSTERS         = int(_env("V4_TOPO_CLUSTERS", "50"))   # synthetic connected clusters
+TOPO_CLUSTER_SIZE_RANGE = (6, 40) # nodes per synthetic cluster (min, max)
+
+# ── V4: connected-cluster evaluation (T1) ───────────────────────────────────
+EVAL_CONNECTED_N_CLUSTERS   = int(_env("V4_EVAL_CLUSTERS", "30"))  # injected clusters/category
+EVAL_CONNECTED_SIZE_RANGE   = (6, 40)

@@ -3,11 +3,18 @@ Supervisor feedback endpoints — ADR-005.
 
 POST /v3/supervisor/confirm-fraud
 POST /v3/supervisor/mark-false-positive
-"""
+GET  /v3/supervisor/patterns
+POST /v3/supervisor/patterns/confirm
+POST /v3/supervisor/patterns/promote
 import structlog
 from fastapi import APIRouter, HTTPException
 
-from src.api.schemas import ConfirmFraudRequest, FalsePositiveRequest
+from src.api.schemas import (
+    ConfirmFraudRequest, 
+    FalsePositiveRequest,
+    ConfirmPatternRequest,
+    PromotePatternRequest
+)
 
 log    = structlog.get_logger()
 router = APIRouter()
@@ -63,3 +70,59 @@ def mark_false_positive(req: FalsePositiveRequest):
         }
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+
+
+@router.get("/patterns")
+def list_patterns():
+    from src.confirmed_fraud_graph_store import list_pending, count_pending
+    pending = list_pending()
+    return {
+        "pending_count": len(pending),
+        "patterns": pending
+    }
+
+
+@router.post("/patterns/confirm")
+def confirm_pattern(req: ConfirmPatternRequest):
+    from src.confirmed_fraud_graph_store import add_confirmed_pattern
+    try:
+        pid = add_confirmed_pattern(
+            app_id=req.application_id,
+            fraud_type=req.fraud_type,
+            subgraph=req.subgraph,
+            confirmed_by=req.confirmed_by,
+            notes=req.notes
+        )
+        log.info("supervisor.confirm_pattern", pattern_id=pid, app_id=req.application_id)
+        return {"status": "ok", "pattern_id": pid}
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@router.post("/patterns/promote")
+def promote_patterns(req: PromotePatternRequest):
+    from src.confirmed_fraud_graph_store import select, promote
+    try:
+        select(req.pattern_ids)
+        promoted = promote(req.pattern_ids)
+        log.info("supervisor.promote_patterns", n_promoted=len(promoted), pattern_ids=req.pattern_ids)
+        
+        # trigger retrain
+        import uuid
+        job_id = f"job_retrain_{uuid.uuid4().hex[:8]}"
+        
+        from src.api.tasks import run_incremental_finetune
+        run_incremental_finetune.delay(
+            dataset_path="data/raw/new_cohort_2026.csv", # dummy path since we are retraining on existing data
+            job_id=job_id,
+            smoke_test=req.smoke_test
+        )
+        
+        return {
+            "status": "ok",
+            "message": f"Promoted {len(promoted)} patterns. Retrain dispatched.",
+            "job_id": job_id,
+            "promoted_pattern_ids": [p["pattern_id"] for p in promoted]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -44,6 +44,8 @@ from src.config_v3 import (
     N_EDGE_TYPES,
     RANDOM_SEED,
     SUBSPACE_GROUPS,
+    EVAL_CONNECTED_N_CLUSTERS,
+    EVAL_CONNECTED_SIZE_RANGE,
 )
 
 torch.manual_seed(RANDOM_SEED)
@@ -395,5 +397,151 @@ def evaluate() -> dict[str, float]:
     return metrics
 
 
+def evaluate_connected() -> dict[str, float]:
+    """
+    Connected-cluster evaluation (T1).
+    Injects connected cliques of fraud, testing the graph stream's topological sensitivity.
+    """
+    from src.hybrid_graphmcm_v3 import (
+        HybridGraphMCM,
+        _build_edge_index_and_types,
+        _compute_isolated_mask,
+        compute_score_frame,
+    )
+
+    print(f"\n{'='*60}")
+    print("V4 Hybrid GraphMCM -- Connected Evaluation (T1)")
+    print(f"{'='*60}\n")
+
+    schema    = json.loads(SCHEMA_JSON.read_text())
+    feat_cols = schema["features"]
+
+    df      = pd.read_csv(FINAL_CSV)
+    x_real  = torch.tensor(df[feat_cols].values, dtype=torch.float32).to(DEVICE)
+    feat_np = df[feat_cols].values.astype(np.float32)
+    real_app_ids = df["application_id"].values
+    n_real = x_real.shape[0]
+
+    data = torch.load(GRAPH_PT, weights_only=False)
+    edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, DEVICE)
+
+    ckpt  = torch.load(MODEL_PTH, weights_only=False, map_location=DEVICE)
+    model = HybridGraphMCM().to(DEVICE)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    RELATION_MAP = {
+        "IP_CONCENTRATION": 1,
+        "MOTHER_NAME_COLLISION": 3,
+        "FEE_INFLATION": 4,
+        "AGE_VIOLATION": 4,
+        "INCOME_VIOLATION": 4,
+    }
+
+    results = {}
+    
+    # We must patch N_INJECT temporarily so the perturbation functions generate 
+    # the exact number of nodes per cluster without failing.
+    global N_INJECT
+    old_n_inject = N_INJECT
+    
+    for cat_idx, (category, inject_fn) in enumerate(INJECTION_FNS.items()):
+        rng = np.random.default_rng(EVAL_SEED + cat_idx)
+        
+        all_x_inject = []
+        cluster_edges = []
+        
+        node_offset = n_real
+        
+        for c in range(EVAL_CONNECTED_N_CLUSTERS):
+            c_size = rng.integers(EVAL_CONNECTED_SIZE_RANGE[0], EVAL_CONNECTED_SIZE_RANGE[1] + 1)
+            N_INJECT = c_size
+            
+            x_c_np = inject_fn(feat_np, feat_cols, rng)
+            all_x_inject.append(x_c_np)
+            
+            # create clique
+            nodes = np.arange(node_offset, node_offset + c_size)
+            idx_i, idx_j = np.meshgrid(nodes, nodes)
+            mask = idx_i != idx_j
+            ei = np.vstack([idx_i[mask], idx_j[mask]])
+            cluster_edges.append(ei)
+            
+            node_offset += c_size
+            
+        x_inject_np = np.vstack(all_x_inject)
+        x_inject = torch.tensor(x_inject_np, dtype=torch.float32).to(DEVICE)
+        
+        x_all = torch.cat([x_real, x_inject], dim=0)
+        
+        rel_idx = RELATION_MAP[category]
+        
+        eval_edge_index_list = [ei.clone() for ei in edge_index_list]
+        
+        if cluster_edges:
+            new_edges = np.hstack(cluster_edges)
+            new_edges_t = torch.tensor(new_edges, dtype=torch.long, device=DEVICE)
+            if eval_edge_index_list[rel_idx].shape[1] > 0:
+                eval_edge_index_list[rel_idx] = torch.cat([eval_edge_index_list[rel_idx], new_edges_t], dim=1)
+            else:
+                eval_edge_index_list[rel_idx] = new_edges_t
+
+        eval_edge_type_list = []
+        for r_id, ei in enumerate(eval_edge_index_list):
+            if ei.shape[1] > 0:
+                eval_edge_type_list.append(torch.full((ei.shape[1],), r_id, dtype=torch.long, device=DEVICE))
+                
+        eval_edge_type_tensor = torch.cat(eval_edge_type_list) if eval_edge_type_list else torch.zeros(0, dtype=torch.long, device=DEVICE)
+        eval_isolated_mask = _compute_isolated_mask(eval_edge_index_list, x_all.shape[0], DEVICE)
+        
+        app_ids = np.concatenate([real_app_ids, np.array([f"inject_{i}" for i in range(x_inject.shape[0])])])
+        
+        with torch.no_grad():
+            score_df = compute_score_frame(model, x_all, eval_edge_index_list, eval_edge_type_tensor, eval_isolated_mask, app_ids, feat_cols)
+            
+        hybrid_scores = score_df["hybrid_anomaly_score"].values
+        labels = np.zeros(x_all.shape[0])
+        labels[n_real:] = 1.0
+        
+        pr_auc = average_precision_score(labels, hybrid_scores)
+        results[category] = float(pr_auc)
+        print(f"{category:<25} | Connected PR-AUC: {pr_auc:.4f}")
+
+    N_INJECT = old_n_inject
+    mean_pr = np.mean(list(results.values()))
+    
+    metrics = {f"conn_pr_auc_{cat.lower()}": pr for cat, pr in results.items()}
+    metrics["mean_conn_pr_auc"] = float(mean_pr)
+    
+    return metrics
+
+
 if __name__ == "__main__":
-    evaluate()
+    import sys
+    is_connected = "--connected" in sys.argv
+    ablation_tag = None
+    for arg in sys.argv:
+        if arg.startswith("--ablation-tag="):
+            ablation_tag = arg.split("=")[1]
+        elif arg == "--ablation-tag":
+            idx = sys.argv.index(arg)
+            if idx + 1 < len(sys.argv):
+                ablation_tag = sys.argv[idx + 1]
+                
+    if is_connected:
+        metrics = evaluate_connected()
+    else:
+        metrics = evaluate()
+        
+    if ablation_tag:
+        import json
+        from pathlib import Path
+        
+        if is_connected:
+            iso_metrics = evaluate()
+            metrics.update(iso_metrics)
+            
+        out_path = Path(f"outputs/ablation/{ablation_tag}.json")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(metrics, indent=2))
+        print(f"\nSaved metrics to {out_path}")

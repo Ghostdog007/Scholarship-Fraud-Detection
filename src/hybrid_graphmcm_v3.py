@@ -26,7 +26,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import RGCNConv
+from torch_geometric.nn import RGCNConv, GATConv
 
 from src.config_v3 import (
     BATCH_SIZE,
@@ -47,6 +47,12 @@ from src.config_v3 import (
     N_FEATURES,
     RANDOM_SEED,
     Z_DIM,
+    ENCODER_ARCH,
+    ARCH_VERSION,
+    ATTN_HEADS,
+    ATTN_LEAKY_SLOPE,
+    SEMANTIC_ATTN_HIDDEN,
+    TOPO_EXPOSURE_ENABLED,
 )
 
 torch.manual_seed(RANDOM_SEED)
@@ -80,6 +86,7 @@ class RGCNEncoder(nn.Module):
         super().__init__()
         self.conv1 = RGCNConv(N_FEATURES, GRAPH_HIDDEN, num_relations=N_EDGE_TYPES, aggr="add")
         self.conv2 = RGCNConv(GRAPH_HIDDEN, GRAPH_EMB_DIM, num_relations=N_EDGE_TYPES, aggr="add")
+        self.last_beta_r = torch.ones(N_EDGE_TYPES) / N_EDGE_TYPES
 
     def forward(
         self,
@@ -91,6 +98,102 @@ class RGCNEncoder(nn.Module):
         h = torch.tanh(self.conv1(x, edge_index, edge_type_tensor))
         h = torch.tanh(self.conv2(h, edge_index, edge_type_tensor))
         return h  # (N, GRAPH_EMB_DIM)
+
+    def top_alpha(self, node_idx: int, k: int) -> list:
+        return []
+
+
+class HANEncoder(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv1_dict = nn.ModuleDict({
+            str(r): GATConv(N_FEATURES, GRAPH_HIDDEN // ATTN_HEADS, heads=ATTN_HEADS, 
+                            negative_slope=ATTN_LEAKY_SLOPE, concat=True, add_self_loops=True)
+            for r in range(N_EDGE_TYPES)
+        })
+        self.conv2_dict = nn.ModuleDict({
+            str(r): GATConv(GRAPH_HIDDEN, GRAPH_EMB_DIM // ATTN_HEADS, heads=ATTN_HEADS, 
+                            negative_slope=ATTN_LEAKY_SLOPE, concat=True, add_self_loops=True)
+            for r in range(N_EDGE_TYPES)
+        })
+        self.semantic_attention = nn.Sequential(
+            nn.Linear(GRAPH_EMB_DIM, SEMANTIC_ATTN_HIDDEN),
+            nn.Tanh(),
+            nn.Linear(SEMANTIC_ATTN_HIDDEN, 1, bias=False)
+        )
+        self.last_beta_r = None
+        self.last_alpha = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index_list: list[torch.Tensor],
+        edge_type_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        device = x.device
+        # Reconstruct per-relation edges from edge_type_tensor rather than
+        # indexing edge_index_list positionally: callers may pass a list of only
+        # the non-empty relations (from _build_edge_index_and_types), so position
+        # r is NOT relation r. edge_type_tensor aligns with cat(edge_index_list)
+        # for every caller in this codebase, so masking on it is the safe key.
+        if edge_index_list:
+            edge_index_all = torch.cat(edge_index_list, dim=1)
+        else:
+            edge_index_all = torch.zeros((2, 0), dtype=torch.long, device=device)
+
+        z_r_list = []
+        alpha_dict = {}
+
+        for r in range(N_EDGE_TYPES):
+            if edge_type_tensor.numel() > 0:
+                ei = edge_index_all[:, edge_type_tensor == r]
+            else:
+                ei = torch.zeros((2, 0), dtype=torch.long, device=device)
+            h1 = F.elu(self.conv1_dict[str(r)](x, ei))
+            out = self.conv2_dict[str(r)](h1, ei, return_attention_weights=True)
+            if isinstance(out, tuple):
+                h2, (ei_out, alpha) = out
+                alpha_dict[r] = (ei_out.detach().cpu(), alpha.detach().cpu())
+            else:
+                h2 = out
+                alpha_dict[r] = None
+            z_r_list.append(h2)
+
+        self.last_alpha = alpha_dict
+
+        w_r_list = []
+        for r in range(N_EDGE_TYPES):
+            mean_z_r = z_r_list[r].mean(dim=0, keepdim=True)
+            w_r_list.append(self.semantic_attention(mean_z_r))
+
+        w = torch.cat(w_r_list, dim=1)
+        beta_r = torch.softmax(w, dim=1)
+        self.last_beta_r = beta_r.squeeze(0).detach().cpu()
+
+        h = x.new_zeros(x.shape[0], GRAPH_EMB_DIM)
+        for r in range(N_EDGE_TYPES):
+            h = h + beta_r[0, r] * z_r_list[r]
+
+        return h
+
+    def top_alpha(self, node_idx: int, k: int) -> list:
+        res = []
+        if self.last_alpha is None:
+            return res
+        for r, data in self.last_alpha.items():
+            if data is None:
+                continue
+            ei, alpha = data
+            if alpha.dim() > 1:
+                alpha = alpha.mean(dim=1)
+            mask = ei[1] == node_idx
+            src_nodes = ei[0][mask]
+            weights = alpha[mask]
+            for src, w in zip(src_nodes, weights):
+                if src.item() != node_idx:
+                    res.append({"neighbor_idx": src.item(), "relation": r, "weight": float(w.item())})
+        res.sort(key=lambda x: x["weight"], reverse=True)
+        return res[:k]
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +208,7 @@ class HybridGraphMCM(nn.Module):
         self.mask_logits = nn.Parameter(torch.randn(MASK_NUM, N_FEATURES))
 
         # Graph encoder
-        self.rgcn = RGCNEncoder()
+        self.encoder = RGCNEncoder() if ENCODER_ARCH == "rgcn" else HANEncoder()
 
         # Isolated node embedding (trainable, not zero)
         self.isolated_embedding = nn.Parameter(torch.randn(GRAPH_EMB_DIM))
@@ -145,7 +248,7 @@ class HybridGraphMCM(nn.Module):
         edge_type_tensor: torch.Tensor,
         isolated_mask: torch.Tensor,
     ) -> torch.Tensor:
-        h = self.rgcn(x, edge_index_list, edge_type_tensor)
+        h = self.encoder(x, edge_index_list, edge_type_tensor)
         iso_emb = self.isolated_embedding.unsqueeze(0).expand(h.shape[0], -1)
         mask_exp = isolated_mask.unsqueeze(1).expand_as(h)
         return torch.where(mask_exp, iso_emb, h)
@@ -169,6 +272,13 @@ class HybridGraphMCM(nn.Module):
         edge_prob = self.edge_predictor(concat)        # (N, N_EDGE_TYPES)
 
         return pred_x, edge_prob, h_n, concat
+
+    @property
+    def last_beta_r(self):
+        return self.encoder.last_beta_r
+
+    def top_alpha(self, node_idx: int, k: int) -> list:
+        return self.encoder.top_alpha(node_idx, k)
 
     @torch.no_grad()
     def init_centroid(
@@ -396,6 +506,39 @@ def _get_synth_h(
     return h_synth
 
 
+def _get_synth_h_topology(
+    model: HybridGraphMCM,
+    topo_pack: dict,
+    device: torch.device,
+) -> torch.Tensor:
+    x_topo = topo_pack["x"].to(device)
+    edge_index = topo_pack["edge_index"].to(device)
+    edge_type = topo_pack["edge_type"].to(device)
+    
+    n_synth = x_topo.shape[0]
+    # Group edges by relation AND build an edge_type tensor that aligns with the
+    # concatenation order of edge_index_list. encode_graph -> RGCN does
+    # cat(edge_index_list) and labels each edge with edge_type_grouped[i]; passing
+    # the pack's original (ungrouped) edge_type here would misalign relation
+    # labels and corrupt the RGCN topology-exposure signal (config-2).
+    edge_index_list = []
+    grouped_types = []
+    for r in range(N_EDGE_TYPES):
+        mask = edge_type == r
+        if mask.any():
+            ei_r = edge_index[:, mask]
+            edge_index_list.append(ei_r)
+            grouped_types.append(torch.full((ei_r.shape[1],), r, dtype=torch.long, device=device))
+        else:
+            edge_index_list.append(torch.zeros((2, 0), dtype=torch.long, device=device))
+
+    edge_type_grouped = (torch.cat(grouped_types) if grouped_types
+                         else torch.zeros(0, dtype=torch.long, device=device))
+    isolated_mask = _compute_isolated_mask(edge_index_list, n_synth, device)
+    h_synth = model.encode_graph(x_topo, edge_index_list, edge_type_grouped, isolated_mask)
+    return h_synth
+
+
 def train(smoke_test: bool = False) -> None:
     print(f"[hybrid] Device: {DEVICE}")
 
@@ -413,6 +556,10 @@ def train(smoke_test: bool = False) -> None:
 
     data         = torch.load(GRAPH_PT, weights_only=False)
     x_synth      = torch.load(EXPOSURE_PT, weights_only=True).to(DEVICE)
+    topo_pack    = None
+    if TOPO_EXPOSURE_ENABLED:
+        topo_pt = Path("data/processed/synthetic_exposure_graph_v3.pt")
+        topo_pack = torch.load(topo_pt, weights_only=False)
 
     edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, DEVICE)
     isolated_mask = _compute_isolated_mask(edge_index_list, x_all.shape[0], DEVICE)
@@ -436,7 +583,11 @@ def train(smoke_test: bool = False) -> None:
         _, _, h_n, _ = model(x_all, edge_index_list, edge_type_tensor, isolated_mask)
         svdd_loss = torch.norm(h_n - model.centroid.unsqueeze(0), dim=1).mean()
 
-        h_synth = _get_synth_h(model, x_synth, edge_index_list, edge_type_tensor, DEVICE)
+        if TOPO_EXPOSURE_ENABLED and topo_pack is not None:
+            h_synth = _get_synth_h_topology(model, topo_pack, DEVICE)
+        else:
+            h_synth = _get_synth_h(model, x_synth, edge_index_list, edge_type_tensor, DEVICE)
+            
         loe     = _loe_loss(h_synth, model.centroid, lam_t)
 
         loss = svdd_loss + loe
@@ -444,7 +595,7 @@ def train(smoke_test: bool = False) -> None:
         optimizer.step()
 
         if (epoch + 1) % max(1, epochs_s1 // 5) == 0 or smoke_test:
-            print(f"  S1 epoch {epoch+1}/{epochs_s1} | svdd={svdd_loss.item():.4f} loe={loe.item():.4f} lam={lam_t:.3f}")
+            print(f"  S1 epoch {epoch+1}/{epochs_s1} | svdd={svdd_loss.item():.4f} loe={loe.item():.4f} lam={lam_t:.3f} std={h_synth.std(0).mean().item():.4f}")
 
     # ---- Stage 2: Free joint reconstruction ----
     print(f"[hybrid] Stage 2: {epochs_s2} epochs (free joint reconstruction) ...")
@@ -498,6 +649,7 @@ def train(smoke_test: bool = False) -> None:
                 "Z_DIM": Z_DIM,
                 "MASK_NUM": MASK_NUM,
                 "N_EDGE_TYPES": N_EDGE_TYPES,
+                "ARCH_VERSION": ARCH_VERSION,
             },
             "feature_names": features,
         },
@@ -554,7 +706,8 @@ def train_incremental(
     print(f"[hybrid] Loaded checkpoint from {MODEL_PTH}")
 
     if freeze_rgcn:
-        for param in model.rgcn.parameters():
+        print("[hybrid] Freezing encoder ...")
+        for param in model.encoder.parameters():
             param.requires_grad = False
         print("[hybrid] RGCN encoder frozen — updating predictor + edge_predictor + mask_logits only")
 
@@ -620,6 +773,7 @@ def _score_and_save(
                 "N_FEATURES": N_FEATURES, "GRAPH_EMB_DIM": GRAPH_EMB_DIM,
                 "GRAPH_HIDDEN": GRAPH_HIDDEN, "MLP_HIDDEN": MLP_HIDDEN,
                 "Z_DIM": Z_DIM, "MASK_NUM": MASK_NUM, "N_EDGE_TYPES": N_EDGE_TYPES,
+                "ARCH_VERSION": ARCH_VERSION,
             },
             "feature_names": features,
         },

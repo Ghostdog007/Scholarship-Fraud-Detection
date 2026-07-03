@@ -138,6 +138,21 @@ def _log_top_suspicious(risk_path: Path, xai_path: Path, top_n: int = 20) -> Non
         mlflow.log_artifact(str(tsv_path), artifact_path="suspicious")
         print(f"[main] Logged top-{top_n} suspicious applications -> MLflow artifact 'suspicious/top_suspicious_v3.tsv'")
 
+        try:
+            import src.topology_view as tv
+            for _, row in risk_df.iterrows():
+                app_id = str(row["application_id"])
+                ego = tv.extract_ego(app_id, hops=1, node_cap=50)
+                if ego and ego.get("nodes"):
+                    svg_content = tv.render_svg(ego)
+                    svg_path = Path(f"outputs/topology_{app_id}.svg")
+                    svg_path.write_text(svg_content, encoding="utf-8")
+                    mlflow.log_artifact(str(svg_path), artifact_path="topology")
+                    svg_path.unlink(missing_ok=True)
+            print(f"[main] Logged topology SVGs -> MLflow artifact 'topology/'")
+        except Exception as svg_exc:
+            print(f"[main] Warning: could not render SVGs: {svg_exc}")
+
     except Exception as exc:
         print(f"[main] Warning: could not build top-suspicious TSV: {exc}")
 
@@ -176,6 +191,13 @@ def run_pipeline(steps: list[str] | None = None, smoke_test: bool = False, cycle
             print("\n[main] Step 4: Synthetic exposure -- build_exposure_set()")
             from src.synthetic_exposure_builder_v3 import build_exposure_set
             build_exposure_set()
+            # V4 (ADR-016): also build the connected-cluster topology exposure pack
+            # so train() finds it when TOPO_EXPOSURE_ENABLED is on. Cheap; harmless
+            # when topology exposure is disabled (the pack simply goes unused).
+            from src.config_v3 import TOPO_EXPOSURE_ENABLED
+            if TOPO_EXPOSURE_ENABLED:
+                from src.synthetic_exposure_builder_v3 import build_topology_exposure
+                build_topology_exposure()
 
         if should_run("train_hybrid"):
             print("\n[main] Step 5: Hybrid GraphMCM -- train()")

@@ -21,6 +21,19 @@ class FalsePositiveRequest(BaseModel):
     notes: str = ""
 
 
+class ConfirmPatternRequest(BaseModel):
+    application_id: str
+    fraud_type: str
+    subgraph: dict
+    confirmed_by: str
+    notes: str = ""
+
+
+class PromotePatternRequest(BaseModel):
+    pattern_ids: list[str]
+    smoke_test: bool = False
+
+
 # ── Training jobs ─────────────────────────────────────────────────────────────
 
 class JobResponse(BaseModel):
