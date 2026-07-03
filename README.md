@@ -7,7 +7,7 @@
 
 ---
 
-## V4 — graph-stream capability upgrade (this branch, in progress)
+## V4 — graph-stream capability upgrade (this branch)
 
 V4 upgrades the graph stream inside `src/hybrid_graphmcm_v3.py` in two chained
 steps, plus the human workflow that feeds them. It is a *capability* label, not
@@ -32,12 +32,22 @@ records: `docs/AGENTS.md` Appendix F (ADR-015, ADR-016).
    into a pending queue, and — when ready — selects a batch and triggers one
    retrain. No per-pattern retraining; MLflow records the audit trail.
 
-**Build order:** HAN encoder → store results → topology exposure → store
-results (so a clean ablation shows how much each component helped) → attention
-attribution in XAI → rendering + supervisor cycle. Read-only cluster
-visualization can land earlier as a diagnostic.
+**Status (3-seed ablation, 2026-07-04):**
+- ✅ **Topology synthetic exposure — adopted.** +0.069 ± 0.034 mean connected
+  PR-AUC (positive in all 3 seeds; IP +53%, mother-name +35%). Shipping config.
+- ❌ **HAN encoder — not adopted (drop-in).** −0.091 ± 0.032, worse in all 3
+  seeds: attention over-smooths dense fraud cliques (they reconstruct *well* →
+  lower anomaly score). RGCN + topology is the shipping detector.
+- 🔬 **Getting attention's benefits:** use attention for supervisor *attribution*
+  and as a *discriminative* feature into the LightGBM fusion — not as the
+  reconstruction encoder. Full strategy + next-session handoff in
+  `docs/AGENTS.md` (V4 block).
 
-**V3 baseline (must be beaten, per category, before V4 ships):**
+Shipping config: `ENCODER_ARCH="rgcn"`, `TOPO_EXPOSURE_ENABLED=True` (the
+`config_v3.py` default). The supervisor review-and-promote cycle is built and
+cleared to enable.
+
+**V3 baseline (the connected-cluster ablation above is measured against this):**
 
 | Category | V2 Floor | V3 Score | Result |
 |---|---|---|---|

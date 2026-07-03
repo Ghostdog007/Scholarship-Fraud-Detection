@@ -86,7 +86,55 @@ worse by attention). Likely compounded by the global-β_r simplification
 (one relation-weight vector for the whole graph, not per-node). Before any
 reconsideration: implement per-node β_r + an HAN hyperparameter pass, then
 re-run this ablation. Until then the shipping config is **② RGCN + topology
-exposure**; set `ENCODER_ARCH="rgcn"`, `TOPO_EXPOSURE_ENABLED=True`.
+exposure**; set `ENCODER_ARCH="rgcn"`, `TOPO_EXPOSURE_ENABLED=True`
+(this is now the `config_v3.py` default).
+
+### V4 — CURRENT STATE & NEXT-SESSION HANDOFF (2026-07-04)
+
+**What is implemented and committed on `v4-han-graphmcm`:**
+- **Topology synthetic exposure (ADR-016) — validated, shipping.**
+  `synthetic_exposure_builder_v3.build_topology_exposure()` writes
+  `data/processed/synthetic_exposure_graph_v3.pt` (connected fraud cliques);
+  `hybrid_graphmcm_v3._get_synth_h_topology()` feeds them through the encoder
+  in Stage 1 (fixes the `isolated_embedding` collapse). Built by `main_v3.py`
+  Step 4 when `TOPO_EXPOSURE_ENABLED`.
+- **HAN encoder (ADR-015) — implemented but NOT shipping.** `HANEncoder` in
+  `hybrid_graphmcm_v3.py`, selected by `ENCODER_ARCH` (both encoders kept).
+  3-seed ablation says it regresses as a drop-in (see results above).
+- **Connected-cluster eval (T1):** `evaluate_model_v3.evaluate_connected()`,
+  run via `python -m src.evaluate_model_v3 --connected --ablation-tag <tag>`
+  (NOTE the `-m` form; `python src/evaluate_model_v3.py` breaks on `from src.`).
+- **Attention attribution (T4):** `xai_layer_v3.py` reads `model.last_beta_r`
+  and `model.top_alpha()` into each card's `attention` object. Known
+  deviation: `last_beta_r` is a global `[5]` vector, not per-node.
+- **Supervisor cycle + viz (T6):** `topology_view.py`,
+  `confirmed_fraud_graph_store.py`, new endpoints in `api/handlers/
+  {monitoring,supervisor}.py`, MLflow SVG logging in `main_v3.py`. Built and
+  smoke-tested; the promote/exposure-write action path is cleared to enable
+  now that topology exposure is validated.
+- Ablation record: `outputs/ablation/*.json` (9 runs). Reproduce with env vars
+  `V4_SEED`, `V4_ENCODER_ARCH`, `V4_TOPO_EXPOSURE` (see `config_v3.py`).
+  Smoke harness: `scripts/smoke_v4.py`.
+
+**Files to view first next session:** this block → `docs/IMPLEMENTATION_V4.md`
+(task spec + parallel plan) → `src/hybrid_graphmcm_v3.py` (encoders + Stage 1)
+→ `src/config_v3.py` (switches) → `outputs/ablation/*.json` (numbers).
+
+**Strategy — how to get attention's benefits (the ablation showed HAN-as-
+detector hurts because better reconstruction lowers anomaly on cliques):**
+- **Tier 1 (recommended, no regression):** keep RGCN+topology as the detector;
+  use a lightweight attention head only for (a) supervisor edge attribution
+  (T4, already scaffolded) and (b) attention-summary features (per-relation
+  β_r, α concentration/entropy) fed into the LightGBM fusion classifier, so
+  attention informs the score *discriminatively*, never by easing
+  reconstruction.
+- **Tier 2 (only if attention must be the encoder):** per-node β_r; residual /
+  GATv2 + edge/attention dropout + 1-hop (counter over-smoothing / the 1.18
+  score_retention); and a one-class/contrastive or density-aware term so a
+  clique's reconstructability stops meaning "normal." Then re-run the 3-seed
+  ablation. Speculative, against current evidence.
+- **Tier 3 (research):** score by attention anomaly (α-entropy / β-divergence)
+  instead of reconstruction — fraud rings show peaked attention.
 
 **Scope note (project-lead directed, 2026-07-03):** `src/*.py` changes ARE
 authorized on this branch for the above work (this is an ML-architecture
