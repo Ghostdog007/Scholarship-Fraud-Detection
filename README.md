@@ -170,9 +170,10 @@ data/raw/data_for_ml_model.csv  (15,000 × 136)
   │  ┌─────────────────┐  ┌──────────────────┐ │
   │  │  Feature Stream  │  │   Graph Stream   │ │
   │  │                  │  │                  │ │
-  │  │  8 Learned Masks │  │  RGCN Encoder    │ │
-  │  │  masked_x_i      │  │  aggr='add'+tanh │ │
-  │  │  (68-dim)        │  │  h_N(i) (64-dim) │ │
+  │  │  8 Learned Masks │  │  HAN Encoder     │ │
+  │  │  masked_x_i      │  │  GAT per relation│ │
+  │  │  (68-dim)        │  │  + semantic β_r  │ │
+  │  │                  │  │  h_N(i) (64-dim) │ │
   │  └────────┬─────────┘  └────────┬─────────┘ │
   │           │                     │            │
   │           └──────────┬──────────┘            │
@@ -234,6 +235,46 @@ let the fusion classifier reconcile them. The problem is each scorer's signal
 is computed without knowledge of what the others will find. The hybrid model
 computes both signals (feature-conditional and graph-structural) in a single
 forward pass, where they inform each other during both training and inference.
+
+### Why HAN attention instead of fixed RGCN aggregation (graph stream)
+
+The original V3 graph stream used an RGCN encoder: every neighbor within a
+relation received the same fixed, degree-normalized weight, and the five
+relations were summed with equal importance. A node in a large, organically
+diverse shared-pincode cluster and a node in a tight, feature-camouflaged
+fraud ring sharing an IP got the same fixed-form treatment, differing only by
+degree.
+
+The HAN-style encoder (Wang et al., WWW 2019) replaces this with two levels
+of learned attention:
+
+1. **Node-level attention** (GAT, Veličković et al., ICLR 2018) — within each
+   of the 5 relations, a learned coefficient α_ij per edge decides *which
+   neighbors* matter, computed from the endpoint feature vectors and
+   softmax-normalized over each node's neighborhood.
+2. **Semantic-level attention** — a learned scalar importance w_r per
+   relation, softmax-normalized to β_r across the 5 relations, decides *which
+   relations* matter. The final h_N(i) is the β_r-weighted fusion of the 5
+   relation-specific embeddings.
+
+Everything around the encoder is unchanged: h_N(i) is still 64-dim, the
+concat → MLP → masked-prediction pipeline is identical, isolated nodes still
+use the trainable `isolated_embedding`, and the `hybrid_scores_v3.csv` schema
+is byte-for-byte the same. The MCM anomaly-discovery mechanism is untouched —
+only the neighborhood context it conditions on becomes content-aware.
+
+The swap is deliberately confined to the graph stream. Feature-stream or
+fusion-stream attention was considered and rejected: tree-based models remain
+state-of-the-art on medium-sized tabular data at this project's scale
+(15,000 rows × 68 features — Grinsztajn et al., NeurIPS 2022), so LightGBM
+stays. The graph stream is where no classical baseline can express relational
+reasoning over typed edges at all — attention closes a genuine capability gap
+there.
+
+**Diagnostic check:** the learned β_r weights are logged at the end of
+training. Given relation base rates (82.8% of nodes share a pincode vs 27.6%
+sharing an IP), `shares_ip` ending up weighted above `shares_pincode` is the
+expected signature of a correctly-behaving mechanism.
 
 ### Why keep the Subspace IF
 
@@ -306,6 +347,12 @@ the relevant feature group is the correct tabular anomaly detector here.
 
 Isolated-node stratum PR-AUC: 0.47–1.00 across all categories.
 Edge-dropout score_retention = 3.6452 (feature-based suspicion persists without graph support).
+
+> **Encoder-baseline note (2026-07-03):** the figures above were measured with
+> the original RGCN graph encoder. The HAN encoder swap (see Changelog)
+> requires a full GPU retrain and re-evaluation; until that run completes,
+> these RGCN-era numbers are the comparison baseline for the HAN model, not a
+> description of it.
 
 > **Self-training note (updated 2026-06-30):** Round 0 promotion now requires
 > ≥ 2 EVT signals to fire simultaneously (`MIN_SIGNALS_FOR_PROMOTION=2`).
@@ -505,6 +552,33 @@ cards and the top-suspicious TSV.
 
 ## Changelog
 
+### 2026-07-03 — HAN two-level attention encoder adopted (docs first, code pending)
+
+The graph stream's RGCN encoder is replaced by a HAN-style two-level attention
+encoder (node-level GAT attention per relation + semantic-level β_r attention
+across the 5 relations). **Documentation updated ahead of implementation** —
+the code swap in `src/hybrid_graphmcm_v3.py` + new constants in
+`src/config_v3.py` follows as the next code task. See ADR-015 in
+`docs/AGENTS.md` Appendix F for the full decision record. Key operational
+facts:
+
+- **Full retrain required.** The new architecture has different parameter
+  shapes and names — no old checkpoint loads into the new code, and there is
+  no old RGCN to freeze, so `train_incremental()`'s frozen-encoder pathway is
+  invalid for first deployment. First HAN deployment must go through the GPU
+  full-retrain pathway (`main_v3.py` on the GPU laptop), never
+  `retraining_orchestrator.py`.
+- **Checkpoints carry an `ARCH_VERSION` field** (`"han_v1"`) in their `config`
+  dict. `checkpoint_manager.validate_and_hotswap()` must reject any hot-swap
+  where `ARCH_VERSION` mismatches the running code — a loud error, never a
+  silent partial load.
+- **Rollback pairing:** a pre-HAN versioned checkpoint is only a valid
+  rollback target together with the pre-HAN code. Rolling back the checkpoint
+  alone fails the `ARCH_VERSION` check — that failure is correct and safe,
+  not a bug.
+- **Output contract unchanged:** `outputs/hybrid_scores_v3.csv` schema is
+  byte-for-byte identical; every downstream module is unaware of the swap.
+
 ### 2026-07-02 — MLOps Phase 2: REST API, async jobs, checkpoint manager, Docker
 
 FastAPI server (`src/api/`) with 13 endpoints across 4 groups — supervisor
@@ -649,9 +723,23 @@ smoke run.
 - **MCM / ICLR 2024**: Masked Cell Modeling for tabular data — learned masks
   predict masked feature values from unmasked ones. V3 extends this with graph
   context in the prediction pathway.
+- **HAN** (Wang, Ji, Shi, Wang, Cui, Ye & Yu, "Heterogeneous Graph Attention
+  Network," WWW 2019): Two-level attention over heterogeneous graphs —
+  node-level attention within each relation, semantic-level attention (β_r)
+  across relations. Grounds the V3 graph-stream encoder.
+- **GAT** (Veličković et al., "Graph Attention Networks," ICLR 2018): Learned
+  per-edge attention coefficients via a shared linear projection + attention
+  vector, softmax-normalized over neighborhoods. The node-level mechanism
+  inside the HAN encoder.
+- **Grinsztajn et al.** ("Why do tree-based models still outperform deep
+  learning on tabular data?", NeurIPS 2022): Tree-based models remain
+  state-of-the-art on medium-sized (~10K-row) tabular data. Grounds the
+  decision to confine attention to the graph stream and keep LightGBM in the
+  fusion layer.
 - **DOMINANT** (Ding et al., SDM 2019): Dual-decoder graph autoencoder for
-  anomaly detection. V3 inherits the RGCN encoder architecture (aggr='add',
-  tanh bounding) from V2's validated implementation.
+  anomaly detection. The original V3 encoder inherited its RGCN architecture
+  (aggr='add', tanh bounding) from V2's validated implementation; superseded
+  in the graph stream by the HAN encoder (2026-07-03).
 - **LOE** (Qiu et al., ICML 2022): Latent Outlier Exposure — synthetic anomaly
   pretraining to push outlier embeddings away from the normal hypersphere.
   V3 applies LOE to the graph stream only (Stage 1).
