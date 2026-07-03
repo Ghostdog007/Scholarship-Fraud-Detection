@@ -1,8 +1,11 @@
 # IMPLEMENTATION_V4.md — HAN + Topology Exposure + Supervisor Cycle
 
-> **Audience:** the coding agent implementing V4 on branch `v4-han-graphmcm`.
-> **Reviewer:** Claude (this repo's assistant) reviews every diff; the two
-> ML-core tasks (T3 HAN encoder, T2 topology exposure) get the closest scrutiny.
+> **Audience:** coding agents implementing V4 on branch `v4-han-graphmcm`.
+> **Parallel?** Yes — see **§0.5** for the track/file-ownership split and the
+> wave order. Each agent edits ONLY its track's files and builds against the
+> §0.6 frozen contracts. If you are a single agent, just run the waves in order.
+> **Reviewer:** Claude (this repo's assistant) reviews every diff; Track A (HAN
+> encoder + topology consumption) gets the closest scrutiny.
 > **Authority:** project-lead directed. `src/*.py` edits ARE allowed for this
 > work. Decision records: `docs/AGENTS.md` Appendix F (ADR-015, ADR-016).
 
@@ -43,6 +46,82 @@
 
 ---
 
+## 0.5 Parallel execution model (read if running multiple coding agents)
+
+Work is split into **tracks that own disjoint files** — no two agents ever edit
+the same file, so there are no merge conflicts. Agents coordinate ONLY through
+the **frozen contracts** in §0.6: build against those interfaces, never against
+another track's in-progress code.
+
+### Wave 0 — freeze contracts (serial, one tiny commit, blocks everything)
+One agent adds ALL §2 config constants and lands the §0.6 signatures as
+importable stubs (empty bodies / uniform-weight returns are fine). Nothing else
+starts until this merges. This is the only true synchronization point.
+
+### Wave 1 — fully parallel, disjoint files
+| Track | Owns (edit ONLY these) | Task | Notes |
+|---|---|---|---|
+| **A · ML core** | `src/hybrid_graphmcm_v3.py` | T3 HANEncoder + encoder switch + T2b Stage-1 topology consumption + T5a save-site ARCH_VERSION | highest-scrutiny; single owner of this file so T2/T3/T5 never collide |
+| **B · exposure** | `src/synthetic_exposure_builder_v3.py` | T2a build topology pack | writes the §0.6-3 pack |
+| **C · eval** | `src/evaluate_model_v3.py` | T1 connected-cluster harness | uses frozen `compute_score_frame` |
+| **D · ckpt** | `src/checkpoint_manager.py` | T5b ARCH_VERSION validation | disjoint from A |
+| **F · viz** | NEW `src/topology_view.py`, NEW `src/confirmed_fraud_graph_store.py` | T6a/T6b | new files, zero coupling |
+
+### Wave 2 — parallel, after Wave 1 merges
+| Track | Owns | Task | Blocks on |
+|---|---|---|---|
+| **E · XAI** | `src/xai_layer_v3.py` | T4 attention attribution | A's attention API (§0.6-2) — can mock until A lands |
+| **G · API** | `src/api/handlers/*`, `src/api/schemas.py`, `main_v3.py`, `docs/API_TESTING_GUIDE.md` | T6c/d/e endpoints + MLflow audit | F (ego/store API), C (eval) |
+
+### Wave 3 — ablation runs (serial; compute-bound, not code)
+The three runs share `models/hybrid_graphmcm_v3.pth` and `outputs/*`, so
+serialize them on one machine. Each run = set config → retrain → evaluate:
+1. `ENCODER_ARCH="rgcn", TOPO_EXPOSURE_ENABLED=False` → tag `config1_rgcn_feature`
+2. `ENCODER_ARCH="rgcn", TOPO_EXPOSURE_ENABLED=True`  → tag `config2_rgcn_topo`
+3. `ENCODER_ARCH="han",  TOPO_EXPOSURE_ENABLED=True`  → tag `config3_han_topo`
+
+Concurrent CPU training on one box is *slower*, not faster (compute-bound) —
+only parallelize across separate machines/GPUs, and only then redirect
+`MODEL_PTH` + score-CSV paths per run-id to avoid clobbering.
+
+**Collision rule:** if your task seems to need a file another track owns, STOP —
+that is a contract gap. Surface it to the reviewer; never edit across a boundary.
+
+### 0.6 Frozen interface contracts (agree once in Wave 0, never drift)
+
+1. **Encoder switch (Track A):** `HybridGraphMCM` picks its encoder from
+   `config_v3.ENCODER_ARCH ∈ {"rgcn","han"}`. Keep `RGCNEncoder`; add
+   `HANEncoder`. Both expose the identical signature
+   `forward(x, edge_index_list, edge_type_tensor) -> Tensor[N, GRAPH_EMB_DIM]`,
+   and `encode_graph()` + the isolated fallback are identical for both.
+2. **Attention export API (A → E):** after a forward pass,
+   `model.last_beta_r: Tensor[N, N_EDGE_TYPES]` (per-node semantic weights, rows
+   sum to 1) and `model.top_alpha(node_idx:int, k:int) -> list[{"neighbor_idx":
+   int, "relation":int, "weight":float}]`. Under `ENCODER_ARCH="rgcn"` return
+   uniform weights so E works unchanged in every config.
+3. **Topology exposure pack (B → A):**
+   `data/processed/synthetic_exposure_graph_v3.pt` =
+   `{"x":Float[M,68], "edge_index":Long[2,E], "edge_type":Long[E], "cluster_id":Long[M]}`.
+4. **Ablation metrics JSON (C → reviewer):** `outputs/ablation/<tag>.json`, flat
+   `{str:float}`, keys: `conn_pr_auc_<category>` (5), `mean_conn_pr_auc`,
+   `score_retention`, and the isolated-node `pr_auc_<category>` (5) for
+   regression. Tags per Wave 3.
+5. **Ego-graph (F → G):** `extract_ego(app_id:str, hops:int=1, node_cap:int=50)
+   -> {"nodes":[{"i","application_id","label","is_center","risk","x","y"}],
+   "edges":[{"s","d","rel"}], "primary_rel","n_nodes","shown","total",
+   "rel_counts"}`; plus `render_svg(ego)->str`, `render_html(ego)->str`.
+6. **Pattern store (F → G):** the T6b function signatures are the contract;
+   lifecycle `FLAGGED→CONFIRMED→SELECTED→PROMOTED/REJECTED`.
+7. **ARCH_VERSION (A ↔ D):** checkpoint `config["ARCH_VERSION"]` ∈
+   `{"rgcn_v1","han_v1"}`; D validates it equals the value implied by
+   `config_v3.ENCODER_ARCH`.
+
+Dependency summary: **Wave 0 → {A,B,C,D,F} in parallel → {E,G} in parallel →
+Wave 3 runs.** B blocks A only at *run* time (A imports the pack), not at code
+time — A codes against the §0.6-3 format and B produces a fixture pack early.
+
+---
+
 ## 1. The ablation this whole branch exists to produce
 
 Same seed, same eval harness, per-category PR-AUC. Build order is chosen so
@@ -72,8 +151,11 @@ so the three can be diffed without rerunning.
 ## 2. New config constants (add to `src/config_v3.py`, do not touch existing)
 
 ```python
+# ── V4: encoder switch (lets all 3 ablation configs run from one codebase) ───
+ENCODER_ARCH         = "han"      # "rgcn" | "han" — selects the graph encoder
+ARCH_VERSION         = {"rgcn": "rgcn_v1", "han": "han_v1"}[ENCODER_ARCH]  # ckpt tag (hard stop #15)
+
 # ── V4: HAN encoder (ADR-015) ───────────────────────────────────────────────
-ARCH_VERSION         = "han_v1"   # checkpoint architecture tag (hard stop #15)
 ATTN_HEADS           = 4          # node-level GAT heads per relation
 ATTN_LEAKY_SLOPE     = 0.2        # LeakyReLU slope in node-level attention
 SEMANTIC_ATTN_HIDDEN = 32         # hidden dim of the semantic-attention MLP
@@ -92,7 +174,10 @@ EVAL_CONNECTED_SIZE_RANGE   = (6, 40)
 
 ---
 
-## T1 — Connected-cluster evaluation harness (DO THIS FIRST)
+## T1 — Connected-cluster evaluation harness
+
+**Track C · Wave 1 · owns `src/evaluate_model_v3.py`.** Code is parallel with
+A/B/D/F; the config-1 *run* waits for Wave 3.
 
 **File:** `src/evaluate_model_v3.py` (extend; do not remove the existing
 isolated-node Level-1/2/3 code — the V3 baseline table must stay intact and
@@ -147,6 +232,12 @@ config-1 row measured under identical conditions.
 
 ## T2 — Topology synthetic exposure (graph injection into Stage 1)
 
+**Split across two tracks — T2a is Track B, T2b is Track A (they never share a
+file).** T2a (Track B) owns `src/synthetic_exposure_builder_v3.py` and produces
+the §0.6-3 pack. T2b (Track A) owns the Stage-1 consumption inside
+`src/hybrid_graphmcm_v3.py`. A codes T2b against the frozen pack format; B ships
+a small fixture pack early so A can run before B fully lands.
+
 **Files:** `src/synthetic_exposure_builder_v3.py` (add topology clusters),
 `src/hybrid_graphmcm_v3.py` (consume them with edges intact in Stage 1).
 
@@ -199,11 +290,15 @@ reproducible from the same code.
 
 ---
 
-## T3 — HAN encoder (replaces RGCNEncoder, same seams)
+## T3 — HAN encoder (adds HANEncoder alongside RGCN, switch-selected)
+
+**Track A · Wave 1 · owns `src/hybrid_graphmcm_v3.py` (also does T2b, T5a).**
 
 **File:** `src/hybrid_graphmcm_v3.py` only (+ config constants from §2).
 
-Replace `class RGCNEncoder` with `class HANEncoder(nn.Module)` exposing the
+**Keep** `class RGCNEncoder` (the ablation needs config1/config2 to run on it)
+and **add** `class HANEncoder(nn.Module)`. `HybridGraphMCM.__init__` selects
+which to instantiate from `config_v3.ENCODER_ARCH` (§0.6-1). Both expose the
 **same forward signature** so `encode_graph()` and everything downstream is
 untouched:
 
@@ -230,11 +325,11 @@ def forward(self, x, edge_index_list, edge_type_tensor) -> Tensor  # (N, 64)
   by node-level attention with their relation + weight. These feed T4. They are
   weights, not embeddings — hard-stop-#2 compliant.
 
-**Preserve exactly:** the `HybridGraphMCM.__init__` attribute name can change
-from `self.rgcn` to `self.encoder`, BUT then update the two references in
-`train_incremental()` (`model.rgcn.parameters()`) and any doc/comment. Keeping
-`self.rgcn` as the attribute name (holding a HANEncoder) is also acceptable and
-lower-risk — pick one and be consistent. `encode_graph()` body, the isolated
+**Preserve exactly:** rename the attribute `self.rgcn` → `self.encoder` (it now
+holds either encoder) and update the reference in `train_incremental()`
+(`model.rgcn.parameters()` → `model.encoder.parameters()`) plus any comment.
+Since Track A owns this whole file, that rename is safe — no other track
+references the attribute. `encode_graph()` body, the isolated
 fallback, `forward()`, `compute_score_frame()`, `init_centroid()` stay
 unchanged except that they now call the HAN encoder.
 
@@ -249,6 +344,9 @@ unchanged except that they now call the HAN encoder.
 ---
 
 ## T4 — Attention attribution in XAI ("which edges did it focus on")
+
+**Track E · Wave 2 · owns `src/xai_layer_v3.py`.** Blocks on Track A's
+attention API (§0.6-2); mock `last_beta_r`/`top_alpha` to develop before A lands.
 
 **File:** `src/xai_layer_v3.py` (extend the existing evidence-first narratives;
 do not change training code).
@@ -273,6 +371,11 @@ scored graph. Respect hard stop #2: only weights, never embeddings.
 
 ## T5 — Checkpoint ARCH_VERSION (schema safety)
 
+**Split — T5a is Track A, T5b is Track D (disjoint files).** T5a (Track A) adds
+`ARCH_VERSION` to the checkpoint `config` at both save sites in
+`hybrid_graphmcm_v3.py`. T5b (Track D) adds the validation in
+`checkpoint_manager.py`. They meet only at the §0.6-7 contract.
+
 **Files:** `src/hybrid_graphmcm_v3.py` (both save sites: `train()` and
 `_score_and_save()`), `src/checkpoint_manager.py`.
 
@@ -296,7 +399,13 @@ ARCH_VERSION error.
 
 ## T6 — Visualization + supervisor review cycle (LAST; after T1–T3 prove value)
 
-Only start once the ablation shows topology exposure helps. Read the actual
+**Tracks F (Wave 1, new files) + G (Wave 2, API/MLflow).** T6a/T6b are Track F
+(`src/topology_view.py`, `src/confirmed_fraud_graph_store.py` — new, zero
+coupling, can build immediately). T6c/d/e are Track G, blocking on F's §0.6-5/6
+APIs and C's eval. Gate the *promote/exposure-write* actions behind the
+ablation proving topology exposure helps; the read-only viz (F) may land early.
+
+Only start the action path once the ablation shows topology exposure helps. Read the actual
 handler files before editing: `src/api/handlers/{monitoring,supervisor,
 training}.py`, `src/api/schemas.py`, `src/confirmed_fraud_store.py`, `main_v3.py`.
 
@@ -353,15 +462,27 @@ the new endpoints. Do not change existing curl examples.
 - [ ] No `_v3`→`_v4` renames anywhere; no `/v3`→`/v4` route changes.
 - [ ] All new randomness seeded from `RANDOM_SEED`.
 
-## 8. Suggested commit sequence (one concern per commit)
+## 8. Branch / merge plan for parallel tracks
 
-1. `feat: connected-cluster eval harness (T1) + config-1 baseline JSON`
-2. `feat: topology synthetic exposure into Stage 1 (T2) + config-2 results`
-3. `feat: HAN two-level attention encoder (T3) + config-3 results`
-4. `feat: attention attribution in XAI (T4)`
-5. `feat: ARCH_VERSION checkpoint validation (T5)`
-6. `feat: topology view + supervisor review cycle + MLflow audit (T6)`
+One short-lived branch per track off `v4-han-graphmcm`; each touches only its
+owned files (§0.5), so merges are conflict-free. Integrate in wave order:
 
-Report the three ablation JSONs to the reviewer after commit 3 — that is the
-"which component helped by how much" answer, and nothing after it should start
-until those numbers are reviewed.
+```
+Wave 0  v4/contracts        config_v3 constants + §0.6 stubs        (merge first)
+Wave 1  v4/A-ml-core        HANEncoder + switch + T2b + T5a         ┐
+        v4/B-exposure       topology pack builder                  │ parallel,
+        v4/C-eval           connected-cluster harness              │ merge in
+        v4/D-ckpt           ARCH_VERSION validation                │ any order
+        v4/F-viz            topology_view + graph store (new files) ┘
+Wave 2  v4/E-xai            attention attribution                  ┐ parallel
+        v4/G-api            endpoints + MLflow audit                ┘
+Wave 3  (no code)           run config1 → config2 → config3, serial
+```
+
+**Hard gate:** after Wave 3's three `outputs/ablation/*.json` land, STOP and
+report them to the reviewer. That is the "which component helped by how much"
+answer; the promote/exposure-write action path (T6c/d) must not be enabled
+until those numbers are reviewed. Read-only viz (T6a/b) is exempt.
+
+Commit-message convention per track: `feat(<track>): <task> — <files>`, e.g.
+`feat(A): HAN encoder + switch (T2b/T3/T5a) — hybrid_graphmcm_v3.py`.
