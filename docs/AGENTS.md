@@ -6,25 +6,59 @@
 
 ## V4 — WHAT THIS BRANCH IS (read before anything else below)
 
-This branch (`v4-han-graphmcm`) exists to do exactly **one thing**: replace the
-RGCN graph encoder inside `src/hybrid_graphmcm_v3.py` with a HAN-style
-two-level attention encoder (node-level GAT per relation + semantic β_r
-fusion across relations). See ADR-015 (Appendix F) for the full decision
-record and §4.4 for the encoder design.
+This branch (`v4-han-graphmcm`) is a **graph-stream capability upgrade** made of
+two chained decisions, plus the human workflow that feeds them:
 
-**"V4" is a label for this one architectural change — it is not a new
-pipeline version, and no files, module names, API routes, MLOps tooling, or
-CLI commands are renamed for it.** Everything below this block, and
-everything in `docs/OPERATIONS_RUNBOOK.md` / `docs/API_TESTING_GUIDE.md`,
-describes the V3 system exactly as it runs in production today — file names,
-`src/*_v3.py` paths, `/v3/...` API routes, checkpoint paths
-(`models/hybrid_graphmcm_v3.pth`), and curl commands stay unchanged whether
-the encoder inside `hybrid_graphmcm_v3.py` is RGCN or HAN. Do not rename
-`_v3` to `_v4` anywhere — a prior session attempted a blanket rename and it
-was reverted specifically because it collided with this ADR-015 usage of
-"V4" and touched MLOps/API surfaces that must stay stable. If you are ever
-asked to "rename V3 to V4," stop and confirm — the answer determined here is
-no, the file/module naming stays V3.
+1. **ADR-015 — HAN encoder.** Replace the RGCN graph encoder inside
+   `src/hybrid_graphmcm_v3.py` with a HAN-style two-level attention encoder
+   (node-level GAT per relation + semantic β_r fusion across relations). This
+   also yields per-application **attention attribution** — which neighbors and
+   which relations the model weighted when scoring a node ("focused on these
+   shared-IP edges"), exported as an XAI diagnostic.
+2. **ADR-016 — topology synthetic exposure + supervisor review cycle.** Teach
+   the model confirmed fraud *shapes*, not just scalar degree counts. Confirmed
+   clusters are captured as subgraphs, staged in a review queue, visualized on
+   the FastAPI surface (IDs kept, 1-hop, ~50-node cap), and — on supervisor
+   selection — spliced into the synthetic exposure set for a batched, human-
+   triggered retrain. MLflow is the audit/lineage record; FastAPI is the only
+   interactive + action surface.
+
+See ADR-015 and ADR-016 (Appendix F) for the full decision records.
+
+**Build order (do not reorder — B/C produce the ablation numbers that justify E):**
+A. Docs (this block + ADRs). B. HAN encoder + full run, store results.
+C. Topology exposure + full run, store results. D. Attention attribution export
+into XAI. E. Rendering + supervisor review cycle (FastAPI). Read-only cluster
+visualization may precede E as a diagnostic; the exposure-splice and promote
+actions come after C is proven.
+
+**The ablation that governs this branch** (same seed, same Phase D harness,
+per-category PR-AUC): (1) RGCN + feature exposure = the V3 baseline below;
+(2) HAN + feature exposure = isolates the encoder; (3) HAN + topology exposure
+= isolates the exposure mechanism. Report Δ(2−1) as HAN's contribution and
+Δ(3−2) as topology exposure's contribution. **Known confound to report
+honestly:** the current exposure path collapses every exposure node to the
+single `isolated_embedding` in the graph stream (see `_get_synth_h` /
+`encode_graph`), so config-2 feature exposure is weak by construction and
+config-3 partly *fixes* that plumbing — Δ(3−2) means "topology exposure that
+actually reaches the encoder," not "topology vs scalar" in isolation. Add a
+4th config to separate those if the distinction matters.
+
+**Scope note (project-lead directed, 2026-07-03):** `src/*.py` changes ARE
+authorized on this branch for the above work (this is an ML-architecture
+program, a directed exception to the F.0 "no src modification" MLOps
+invariant). Every change must be explained. **The `_v3` file/module/route
+names still do NOT change** — "V4" is the capability label, not a rename. A
+prior session's blanket `_v3`→`_v4` rename was reverted because it collided
+with the ADR-015/016 usage of "V4" and destabilized MLOps/API surfaces. If
+asked to "rename V3 to V4," stop and confirm — the answer is no.
+
+Everything below this block, and everything in
+`docs/OPERATIONS_RUNBOOK.md` / `docs/API_TESTING_GUIDE.md`, describes the V3
+system as it runs today — file names, `src/*_v3.py` paths, `/v3/...` routes,
+checkpoint paths (`models/hybrid_graphmcm_v3.pth`), and curl commands are
+unchanged. The V4 work adds capability inside those files; it does not rename
+them.
 
 **V3 baseline metrics (recorded before any V4 work, do not overwrite —
 see §5.1 for the full table and floors):**
@@ -39,28 +73,25 @@ Isolated-node stratum PR-AUC: 0.47-1.00. Edge-dropout score_retention: 3.6452.
 The HAN encoder (V4/ADR-015) must be evaluated against this exact table —
 report deltas per category, not just pass/fail, once implemented.
 
-**V4 strategy (ADR-015, not yet implemented):**
+**Step B — HAN encoder swap (ADR-015), scoped to the graph stream only:**
 1. Swap only `RGCNEncoder` inside `hybrid_graphmcm_v3.py` for a `HANEncoder`
    class in the same file. `HybridGraphMCM.encode_graph()` keeps its exact
    isolated-node fallback (`torch.where(isolated_mask, isolated_embedding, h)`)
    and its exact output contract (`h_N(i)`, shape `(None, GRAPH_EMB_DIM)`).
-2. Add HAN-only constants to `config_v3.py` (`ARCH_VERSION`, `ATTN_HEADS`,
+2. Add HAN constants to `config_v3.py` (`ARCH_VERSION`, `ATTN_HEADS`,
    `ATTN_LEAKY_SLOPE`, `SEMANTIC_ATTN_HIDDEN`) — see §6.
 3. Add `ARCH_VERSION` to the checkpoint `config` dict and enforce it in
-   `checkpoint_manager.validate_and_hotswap()` (cross-module change — confirm
-   scope before touching this file, see §0 parallel-agent rule).
-4. Zero changes to: feature engineering, graph construction, subspace IF,
-   EVT scorer, self-training, LightGBM fusion, XAI layer, any API route,
-   Celery task, Dockerfile, docker-compose, or curl command. If a task
-   for this branch touches any of those, stop and confirm scope first.
-5. Full GPU retrain required (`python main_v3.py`) — the HAN swap is NOT
-   compatible with `train_incremental()`'s frozen-encoder path. Old
-   (RGCN) checkpoints must fail `ARCH_VERSION` validation by design; do not
-   silently coerce them.
-6. Validation order: unit tests (shape/isolated-node parity) → CPU smoke
-   test → GPU full retrain → Phase D evaluation with per-category deltas
-   against the V3 baseline table above, plus β_r attention-weight logging
-   (aggregate mean/std per relation, not a per-edge dump).
+   `checkpoint_manager.validate_and_hotswap()`.
+4. The encoder swap *itself* touches nothing but the graph stream — feature
+   engineering, graph construction, subspace IF, EVT, self-training, and
+   LightGBM fusion stay byte-identical. (Steps C–E deliberately extend the
+   XAI layer and the API — that is ADR-016, not the encoder swap.)
+5. Full retrain required (`python main_v3.py`) — the HAN swap is NOT
+   compatible with `train_incremental()`'s frozen-encoder path. Old (RGCN)
+   checkpoints must fail `ARCH_VERSION` validation by design.
+6. Validation order: unit tests (shape/isolated-node parity) → CPU smoke test
+   → full retrain → Phase D evaluation with per-category deltas vs the table
+   above, plus β_r attention-weight logging (aggregate mean/std per relation).
 
 ---
 
@@ -1391,6 +1422,109 @@ response for ~30–90s on the current 15,600-row scale) rather than dispatched
 as a Celery job. Acceptable at current scale; revisit if dataset size or
 call frequency grows enough that this becomes a real request-timeout risk.
 **Phase:** 2
+
+---
+
+## ADR-015 — HAN two-level attention encoder replaces the RGCN graph encoder
+
+**Status:** Accepted (2026-07-03); implementation in progress on
+`v4-han-graphmcm`. Project-lead directed; ML-architecture change (a directed
+exception to the F.0 "no `src/*.py` modification" MLOps invariant).
+**Context:** The RGCN encoder aggregates typed-edge neighborhoods with fixed,
+degree-normalized weights — every neighbor and every relation is weighted the
+same regardless of content. It cannot say *which* neighbor or *which* shared
+attribute mattered for a given node, and it partly washes out the geometry of
+a fraud cluster. It also gives no per-application attribution for XAI.
+**Decision:** Replace `RGCNEncoder` in `hybrid_graphmcm_v3.py` with a HAN-style
+encoder (Wang et al., WWW 2019 / Veličković et al., ICLR 2018):
+- **Level 1 — node-level attention (GAT) per relation.** For each of the 5
+  edge types, attention coefficients α over a node's neighbors in that
+  relation; self-loops handle empty-relation nodes.
+- **Level 2 — semantic attention across relations.** A small MLP + tanh scores
+  each relation's embedding, softmax → β_r weights, β_r-weighted fusion into
+  the final `h_N(i)`. β_r is the per-node "relation mix" (e.g. "80% shared-IP")
+  and is the attention attribution surfaced to XAI (Step D).
+**Invariants preserved (this is what "in place" means):** `h_N(i)` shape stays
+`(None, GRAPH_EMB_DIM=64)`; the isolated-node fallback in `encode_graph()` is
+bit-identical; `compute_score_frame()`'s CSV schema is byte-identical; no
+hand-set relation priority (β_r is learned).
+**Attention export & hard stop #2:** only attention *weights* (per-relation β_r,
+and top-k node-level α for a queried application) leave the model file — never
+the 64-dim embedding. β_r/α are interpretable diagnostics, not embeddings, so
+this respects hard stop #2. Aggregate β_r (mean/std per relation) is logged
+each run; per-application α is computed on demand for XAI/review, not dumped
+wholesale.
+**Backward compatibility:** V4 checkpoints carry `ARCH_VERSION = "han_v1"` in
+`config`; RGCN checkpoints fail `checkpoint_manager.validate_and_hotswap()` by
+design. First deployment needs a FULL retrain (`main_v3.py`); the HAN swap is
+NOT compatible with `train_incremental()`'s frozen-encoder path. A rolled-back
+RGCN checkpoint must be paired with RGCN code.
+**Files to change:** `src/hybrid_graphmcm_v3.py` (encoder + ARCH_VERSION in
+checkpoint), `src/config_v3.py` (HAN constants), `src/checkpoint_manager.py`
+(ARCH_VERSION validation). XAI attention export lands with ADR-016 Step D.
+**Evaluation:** ablation config 2 (HAN + feature exposure) vs config 1 (V3
+baseline). Report per-category PR-AUC deltas.
+**Phase:** — (ML architecture, outside the MLOps phase track)
+
+---
+
+## ADR-016 — Topology synthetic exposure + supervisor review-and-promote cycle
+
+**Status:** Accepted (2026-07-03); implementation sequenced after ADR-015 on
+`v4-han-graphmcm`. Project-lead directed ML-architecture change.
+**Context:** Confirmed fraud today enters exposure as a 68-dim *feature vector*
+(`confirmed_fraud_store.get_exposure_tensor`), and in the graph stream even
+that collapses to the single `isolated_embedding` (`_get_synth_h` force-
+isolates every exposure node). So the model never learns fraud *topology* — a
+39-application shared-IP clique and a lone high-degree node look the same once
+reduced to `degree_shares_ip`. Supervisors also had no way to *see* the
+cluster they were confirming, or to batch decisions.
+**Decision:** Capture confirmed fraud as *subgraphs* and let the HAN encoder
+learn their shape, gated by a human review cycle.
+- **Pattern lifecycle:** `FLAGGED` (auto, from scoring: suspicious app + its
+  ego-graph) → `CONFIRMED` (supervisor agrees it is a fraud pattern; enters a
+  pending queue) → `SELECTED` (supervisor picks which pending patterns train
+  next) → `PROMOTED` (selected subset spliced into exposure + one batched
+  retrain) / `REJECTED` (false positive → hard negative). "How many patterns
+  discovered?" = CONFIRMED-not-yet-PROMOTED count.
+- **Topology exposure:** a `confirmed_fraud_graph_store` persists ego-subgraphs
+  (nodes + typed edges + β_r signature). At *promotion* (not continuously),
+  the selected subgraphs are spliced into the exposure set with edges intact
+  and run through the HAN encoder in Stage 1, so the LOE margin is defined over
+  neighborhood *shapes*, not `isolated_embedding`. The canonical exposure set
+  is rebuilt only at promotion — pending patterns never mutate the live set.
+- **No auto-retrain:** discovery accumulates; retraining is one deliberate,
+  supervisor-triggered, batched action (hard stops #5/#7). A freshly discovered
+  pattern is not specifically hardened against until the next promotion — the
+  existing model + subspace IF still flag similar cases meanwhile.
+- **Surfaces:** FastAPI is the only interactive + action surface (view topology,
+  confirm, select, trigger retrain). MLflow is audit/lineage only — it renders
+  a **static SVG** snapshot per suspicious app as a run artifact (its viewer
+  sandboxes JS, so the interactive view cannot live there) and records the
+  decision (which pattern IDs, reviewer, resulting exposure-set version).
+- **Rendering rules:** 1-hop only (2-hop on name/pincode relations exceeds
+  ~1,200 nodes — unreadable); real application_ids kept for traceability;
+  ~50-node cap with an explicit `showing X of N` and IDs-on-hover overflow;
+  edges colored by relation, nodes by risk score. Because IDs are shown, the
+  SVG artifact and pattern library inherit raw-data PII/access controls.
+**What stays identical:** `hybrid_scores_v3.csv` schema; the two-stream model
+math; the anomaly-score formula; all `_v3` names/routes/paths.
+**Files to change (planned):** new `src/confirmed_fraud_graph_store.py`,
+`src/topology_view.py` (ego-graph extraction + SVG/HTML render, read-only);
+`src/synthetic_exposure_builder_v3.py` + `src/hybrid_graphmcm_v3.py` (splice
+subgraph exposure into Stage 1); `src/xai_layer_v3.py` (attention attribution +
+topology evidence); `src/api/handlers/{monitoring,supervisor,training}.py` +
+`src/api/schemas.py` (review queue, topology endpoint, select+promote);
+`main_v3.py` (log topology SVG artifacts to MLflow).
+**Evaluation:** ablation config 3 (HAN + topology exposure) vs config 2 (HAN +
+feature exposure). Report per-category PR-AUC deltas; report the config-2
+degeneracy confound honestly (see the V4 block's ablation note).
+**Open questions:** ego-graph hop depth vs node cap tradeoff at render time;
+how many confirmed subgraphs are needed before topology exposure beats
+synthetic (the current `min_real=5` heuristic may not transfer to subgraphs);
+whether β_r signatures are stored for retrieval-style matching (a new export
+path needing explicit sign-off under hard stop #2).
+**Phase:** — (ML architecture, outside the MLOps phase track)
 
 ---
 

@@ -7,16 +7,35 @@
 
 ---
 
-## V4 — HAN encoder swap (this branch, ADR-015, not yet implemented)
+## V4 — graph-stream capability upgrade (this branch, in progress)
 
-This branch replaces one component: the RGCN graph encoder inside
-`src/hybrid_graphmcm_v3.py` becomes a HAN-style two-level attention encoder
-(node-level GAT per relation + semantic β_r fusion). Nothing else changes —
-file names, module paths, API routes, MLOps tooling, and curl commands all
-stay exactly as documented below and in `docs/OPERATIONS_RUNBOOK.md` /
-`docs/API_TESTING_GUIDE.md`. "V4" refers only to this encoder swap, not a
-renamed pipeline. Full design and validation plan: `docs/AGENTS.md` §4.4 and
-Appendix F (ADR-015).
+V4 upgrades the graph stream inside `src/hybrid_graphmcm_v3.py` in two chained
+steps, plus the human workflow that feeds them. It is a *capability* label, not
+a rename — all `_v3` file names, module paths, `/v3/...` API routes, MLOps
+tooling, and curl commands stay exactly as documented below. Full decision
+records: `docs/AGENTS.md` Appendix F (ADR-015, ADR-016).
+
+**What V4 aims to accomplish:**
+
+1. **HAN attention encoder (ADR-015)** — replace the RGCN encoder with a
+   HAN-style two-level attention encoder (node-level GAT per relation +
+   semantic β_r fusion). Learns *which* neighbors and *which* shared attributes
+   matter, and exposes that as per-application **attention attribution** — "the
+   model focused on these shared-IP edges when it flagged this application."
+2. **Topology synthetic exposure (ADR-016)** — teach the model confirmed fraud
+   *shapes*, not just scalar degree counts. Confirmed clusters are captured as
+   subgraphs and spliced into the exposure set so the encoder learns the
+   geometry of a fraud ring.
+3. **Supervisor review-and-promote cycle (ADR-016)** — a FastAPI workflow:
+   suspicious clusters are flagged, the supervisor **views the topology**
+   (node-link diagram, IDs kept, 1-hop, ~50-node cap), confirms real patterns
+   into a pending queue, and — when ready — selects a batch and triggers one
+   retrain. No per-pattern retraining; MLflow records the audit trail.
+
+**Build order:** HAN encoder → store results → topology exposure → store
+results (so a clean ablation shows how much each component helped) → attention
+attribution in XAI → rendering + supervisor cycle. Read-only cluster
+visualization can land earlier as a diagnostic.
 
 **V3 baseline (must be beaten, per category, before V4 ships):**
 
