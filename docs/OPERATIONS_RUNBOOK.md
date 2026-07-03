@@ -178,7 +178,7 @@ python -m src.retraining_orchestrator --cycle 2025-26
 1. Loads confirmed fraud from `data/processed/confirmed_fraud.json`
 2. Builds exposure tensor (real confirmed + synthetic fallback)
 3. Fine-tunes MLP prediction head only (10 epochs, LR=1e-4)
-   - If confirmed fraud ≥ 50: also unfreezes the graph encoder
+   - If confirmed fraud ≥ 50: also unfreezes RGCN encoder
 4. Refits Subspace IF on current cycle data
 5. Refits EVT thresholds on updated scores
 6. Runs self-training Round 0 (confirmed fraud bypasses EVT, becomes hard labels)
@@ -449,7 +449,7 @@ NEXT CYCLE repeats from Month 0
 |---|---|
 | **Year 0 (current)** | Full GPU training on historical data. Synthetic LOE only (no confirmed fraud). Round 0 only. |
 | **Year 1** | First real confirmed fraud examples added. Incremental MLP fine-tune. Real LOE replaces synthetic if ≥ 5 cases. LightGBM sees confirmed fraud at 3× weight. |
-| **Year 2** | Confirmed fraud store grows. If ≥ 50 cases: graph encoder also unfrozen on incremental update. KS drift check has a 2-year baseline. |
+| **Year 2** | Confirmed fraud store grows. If ≥ 50 cases: RGCN encoder also unfrozen on incremental update. KS drift check has a 2-year baseline. |
 | **Year 3+** | Stable incremental cycle. Full GPU retrain only if KS drift p < 0.01 or a major data schema change. IP fraud clusters and relational patterns accumulate across cycles. |
 
 ---
@@ -498,7 +498,7 @@ staff should know them to avoid accidentally triggering a bad state:
 | `data/processed/confirmed_fraud.json` | When investigator submits confirmation | All confirmed fraud and false positive records |
 | `data/processed/engineered_features_v3.csv` | Each cycle after build_base | 68 numeric features per application |
 | `data/processed/identity_graph_v3.pt` | Each cycle after build_graph | PyG HeteroData graph (5 typed edges) |
-| `models/hybrid_graphmcm_v3.pth` | After each training run | graph (HAN) encoder + MLP head weights + isolated_embedding |
+| `models/hybrid_graphmcm_v3.pth` | After each training run | RGCN encoder + MLP head weights + isolated_embedding |
 | `outputs/hybrid_scores_v3.csv` | Each cycle | `hybrid_anomaly_score`, `feature_pred_error`, `edge_pred_error` |
 | `outputs/risk_scores_v3.csv` | Each cycle | Final `risk_score_v3` per application — primary deliverable |
 | `outputs/explanation_cards_v3.json` | Each cycle | Per-application XAI (SHAP values, top features, triggered signals) |

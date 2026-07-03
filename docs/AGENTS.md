@@ -1,6 +1,66 @@
-# NIC Fraud Detection — V3 Hybrid GraphMCM / V4 HAN: Agent Context File
-<!-- VERSION: 3.0-final (V3 RGCN complete) / 4.0-draft (V4 HAN planned) | OWNER: Project Lead | LAST REVIEWED: 2026-07-03 -->
+# NIC Fraud Detection — V3 Hybrid GraphMCM (V4 encoder swap in progress): Agent Context File
+<!-- VERSION: 3.0-final (V3 baseline) + V4-ADR-015-draft | OWNER: Project Lead | LAST REVIEWED: 2026-07-03 -->
 <!-- DO NOT MODIFY AUTONOMOUSLY. Flag outdated content; only project lead edits this file. -->
+
+---
+
+## V4 — WHAT THIS BRANCH IS (read before anything else below)
+
+This branch (`v4-han-graphmcm`) exists to do exactly **one thing**: replace the
+RGCN graph encoder inside `src/hybrid_graphmcm_v3.py` with a HAN-style
+two-level attention encoder (node-level GAT per relation + semantic β_r
+fusion across relations). See ADR-015 (Appendix F) for the full decision
+record and §4.4 for the encoder design.
+
+**"V4" is a label for this one architectural change — it is not a new
+pipeline version, and no files, module names, API routes, MLOps tooling, or
+CLI commands are renamed for it.** Everything below this block, and
+everything in `docs/OPERATIONS_RUNBOOK.md` / `docs/API_TESTING_GUIDE.md`,
+describes the V3 system exactly as it runs in production today — file names,
+`src/*_v3.py` paths, `/v3/...` API routes, checkpoint paths
+(`models/hybrid_graphmcm_v3.pth`), and curl commands stay unchanged whether
+the encoder inside `hybrid_graphmcm_v3.py` is RGCN or HAN. Do not rename
+`_v3` to `_v4` anywhere — a prior session attempted a blanket rename and it
+was reverted specifically because it collided with this ADR-015 usage of
+"V4" and touched MLOps/API surfaces that must stay stable. If you are ever
+asked to "rename V3 to V4," stop and confirm — the answer determined here is
+no, the file/module naming stays V3.
+
+**V3 baseline metrics (recorded before any V4 work, do not overwrite —
+see §5.1 for the full table and floors):**
+```
+AGE_VIOLATION             | V2 Floor: 0.1466 | V3 Score: 0.3417 (demographic IF) | PASS
+INCOME_VIOLATION          | V2 Floor: 0.6503 | V3 Score: 0.9063 (financial IF)   | PASS
+IP_CONCENTRATION          | V2 Floor: 0.0370 | V3 Score: 0.1184 (network IF)     | PASS
+MOTHER_NAME_COLLISION     | V2 Floor: 0.2869 | V3 Score: 0.5206 (identity IF)    | PASS
+FEE_INFLATION             | V2 Floor: 0.4962 | V3 Score: 0.7420 (financial IF)   | PASS
+Isolated-node stratum PR-AUC: 0.47-1.00. Edge-dropout score_retention: 3.6452.
+```
+The HAN encoder (V4/ADR-015) must be evaluated against this exact table —
+report deltas per category, not just pass/fail, once implemented.
+
+**V4 strategy (ADR-015, not yet implemented):**
+1. Swap only `RGCNEncoder` inside `hybrid_graphmcm_v3.py` for a `HANEncoder`
+   class in the same file. `HybridGraphMCM.encode_graph()` keeps its exact
+   isolated-node fallback (`torch.where(isolated_mask, isolated_embedding, h)`)
+   and its exact output contract (`h_N(i)`, shape `(None, GRAPH_EMB_DIM)`).
+2. Add HAN-only constants to `config_v3.py` (`ARCH_VERSION`, `ATTN_HEADS`,
+   `ATTN_LEAKY_SLOPE`, `SEMANTIC_ATTN_HIDDEN`) — see §6.
+3. Add `ARCH_VERSION` to the checkpoint `config` dict and enforce it in
+   `checkpoint_manager.validate_and_hotswap()` (cross-module change — confirm
+   scope before touching this file, see §0 parallel-agent rule).
+4. Zero changes to: feature engineering, graph construction, subspace IF,
+   EVT scorer, self-training, LightGBM fusion, XAI layer, any API route,
+   Celery task, Dockerfile, docker-compose, or curl command. If a task
+   for this branch touches any of those, stop and confirm scope first.
+5. Full GPU retrain required (`python main_v3.py`) — the HAN swap is NOT
+   compatible with `train_incremental()`'s frozen-encoder path. Old
+   (RGCN) checkpoints must fail `ARCH_VERSION` validation by design; do not
+   silently coerce them.
+6. Validation order: unit tests (shape/isolated-node parity) → CPU smoke
+   test → GPU full retrain → Phase D evaluation with per-category deltas
+   against the V3 baseline table above, plus β_r attention-weight logging
+   (aggregate mean/std per relation, not a per-edge dump).
 
 ---
 
@@ -9,12 +69,11 @@
 **What this system is:** Unsupervised fraud detection for 15,000 NIC scholarship
 applications. Outputs a 0–1 risk score per application. No hardcoded rules allowed.
 
-**Current state:** V3 (Hybrid GraphMCM with RGCN encoder) fully implemented
-and evaluated — this is the production architecture. V4 (HAN encoder swap)
-is planned but NOT yet implemented (see ADR-015 / §4.4). MLOps Phase 1
-complete (MLflow SQLite backend, DVC, pre-commit). MLOps Phase 2 complete —
-FastAPI REST server with 18 endpoints (`src/api/`), Celery + Redis async job
-queue (`celeryconfig.py`, `src/api/tasks.py`), atomic checkpoint manager with
+**Current state:** V3 fully implemented and evaluated (this is the baseline
+the V4 HAN encoder swap above must beat). MLOps Phase 1 complete
+(MLflow SQLite backend, DVC, pre-commit). MLOps Phase 2 complete — FastAPI
+REST server with 18 endpoints (`src/api/`), Celery + Redis async job queue
+(`celeryconfig.py`, `src/api/tasks.py`), atomic checkpoint manager with
 hot-swap and schema validation (`src/checkpoint_manager.py`), structlog JSON
 logging in all new API files, Dockerfile (`python:3.12-slim`, CPU-only, single
 image), `docker-compose.yml` (Redis + nic-api + nic-worker). Full stack tested
@@ -47,28 +106,12 @@ buckets) removed; the only numeric gates quoted are EVT-derived. Narratives
 distinguish "crossed an EVT threshold" from "promoted" (2-signal rule).
 Cards regenerated (500), incl. `evidence` object per card.
 
-**V4 HAN encoder swap** adopted 2026-07-03 (ADR-015, project-lead directed):
-V4 will replace the V3 graph stream's RGCN encoder with a HAN-style two-level
-attention encoder — node-level GAT attention per relation (Veličković et
-al., ICLR 2018) + semantic-level β_r attention across the 5 relations (Wang
-et al., WWW 2019). **V4 is documentation-only at this stage — the implementation
-in `src/hybrid_graphmcm_v3.py` + `src/config_v3.py` is NOT yet written.** See
-§4.4 (V4 encoder design), §6 (V4 planned constants), hard stop #15
-(ARCH_VERSION), and ADR-015 (full V3→V4 decision record incl.
-backward-compatibility rules). All evaluation numbers in §5.1 are V3 final
-results (RGCN encoder).
-
-**Next task (V4 — not yet started):** implement ADR-015 — the V4 HAN encoder
-swap in `src/hybrid_graphmcm_v3.py` (new constants in `src/config_v3.py`
-only), per the validation order in ADR-015: unit tests (h_N(i) shape;
-isolated-node bit-for-bit fallback) → CPU smoke test with timing delta →
-full GPU retrain via `main_v3.py` (NOT `retraining_orchestrator.py`) →
-§5.1/5.2/5.3 evaluation with explicit deltas vs V3 RGCN baselines + learned
-β_r values. The `checkpoint_manager.py` ARCH_VERSION check is a flagged
-cross-module change — get project-lead scope confirmation before touching
-that file. Still queued after V4: ADR-014 end-to-end Docker validation (API
-testing guide §9), then Phase 3 MLOps (ADR-011/012/013) — project lead
-sign-off required.
+**Next task:** validate ADR-014 end-to-end through the real Docker stack
+(§9 of the API testing guide) — the Docker image should be rebuilt first so
+it picks up the new XAI/hybrid/inference code. After that: Phase 3 MLOps —
+do not begin without explicit project lead sign-off. Candidates: ADR-011
+(Kubernetes / k3s single-node), ADR-012 (PostgreSQL for ego-graph inference),
+ADR-013 (GitHub Actions CI/CD). Discuss scope and order before writing any code.
 
 **On session start — read these, in order:**
 1. This AGENT QUICK-START block (already done)
@@ -285,10 +328,9 @@ Node i: features x_i (68-dim) + neighbors N(i)
     ┌─────────┴──────────┐
     ▼                    ▼
  FEATURE STREAM       GRAPH STREAM
- Learned Masks        HAN Encoder
- (K=8 masks)         (node-level GAT per relation
- masked_x_i           + semantic β_r fusion, §4.4)
-    │                h_N(i) = neighborhood
+ Learned Masks        RGCN Encoder
+ (K=8 masks)         (aggr='add', tanh)
+ masked_x_i          h_N(i) = neighborhood
     │                    │
     └─────────┬──────────┘
               ▼
@@ -337,63 +379,6 @@ This means: isolated nodes still get a prediction, and the model can learn
 conditional distribution from "features that look suspicious given rich
 connectivity."
 
-### 4.4 Graph-stream encoder: V4 HAN two-level attention (ADR-015, code pending)
-
-> Status: adopted 2026-07-03 as V4, documentation ahead of implementation.
-> The code in `src/hybrid_graphmcm_v3.py` still contains the V3 RGCN encoder
-> until the V4 HAN implementation session lands.
-
-The V3 RGCN encoder aggregates all 5 typed edges with the same fixed,
-degree-normalized weighting for every neighbor and every relation — no
-learned content-awareness in the aggregation. The V4 HAN encoder (Wang et al.,
-WWW 2019) will replace it with two levels of learned attention:
-
-**Level 1 — node-level attention (per relation r, GAT formulation):** for
-each of the 5 typed edge sets, replace the fixed
-`S_r = D̃_r^-1/2 · Ã_r · D̃_r^-1/2` aggregation with a learned coefficient
-`α_ij^(r)` per edge — shared linear projection of the two endpoint feature
-vectors + learned attention vector, LeakyReLU, softmax-normalized over each
-node's neighbors within relation r. Multi-head (`ATTN_HEADS`), heads
-concatenated. Produces one embedding per relation per node, `z_r_i`.
-
-**Level 2 — semantic-level attention (across the 5 relations):** learn a
-scalar importance `w_r` per relation via a small MLP + tanh (HAN Eq. 1),
-softmax to `β_r` across the 5 relations (HAN Eq. 2), and fuse:
-`h_N(i) = Σ_r β_r · z_r_i`.
-
-**Invariants the V4 swap must preserve (this is what "in place" means):**
-
-- `h_N(i)` stays shape `(B, GRAPH_EMB_DIM) = (B, 64)`. The concat
-  `[masked_x_i ; h_N(i)] → 132 → MLP` pipeline downstream of the encoder is
-  not touched. The V4 encoder swap ends at h_N(i)'s production.
-- Isolated nodes (degree=0 across all relations, 11.1% of dataset) bypass
-  attention entirely and use the trainable `isolated_embedding` parameter,
-  bit-for-bit identical to current behavior (§4.3, hard stop #11). Attention
-  must never silently produce a degenerate/zero output for isolated nodes.
-- A node connected in relation r but not r′ gets a well-defined per-relation
-  embedding via self-loops within each relation's node-level attention (the
-  standard GAT choice) — β_r fusion always operates on 5 defined vectors.
-- `outputs/hybrid_scores_v3.csv` schema is byte-for-byte unchanged; every
-  downstream module is unaware the encoder changed. If a downstream module
-  needs to change, the output contract was broken — stop, the task exceeded
-  its scope.
-- All attention weights are fully learned — no hand-set relation priority
-  substituting as a hidden rule (hard stop #1).
-
-**β_r logging:** the 5 learned relation weights are logged (structlog) at end
-of training. Diagnostic expectation from relation base rates: `shares_ip`
-should end up weighted higher than `shares_pincode`. Per-edge α_ij values are
-NOT logged wholesale — aggregate stats (mean/std per relation) at most;
-wiring α into `xai_layer_v3.py` is explicitly out of ADR-015's scope.
-
-**Backward compatibility (see ADR-015 for the full rules):** the new
-state_dict has different parameter shapes/names — old checkpoints do not
-load. Checkpoints carry `ARCH_VERSION` (`"han_v1"`) in their `config` dict
-(hard stop #15); `checkpoint_manager.validate_and_hotswap()` must reject
-mismatches loudly. First deployment requires a FULL GPU retrain
-(`main_v3.py`) — `train_incremental()`'s frozen-encoder path is invalid
-across the architecture boundary (there is no old RGCN to freeze).
-
 ---
 
 ## 5. Evaluation Protocol
@@ -401,26 +386,20 @@ across the architecture boundary (there is no old RGCN to freeze).
 ### 5.1 Standard PR-AUC (inherited from V2)
 
 Same 5 categories × 150 injected anomalies × different seeds from training.
-V3 must beat V2's best scores. V4 (HAN) must beat these V3 results.
+V3 must beat V2's best scores.
 
-**V3 final results (RGCN encoder, full-trained model, 111 pseudo-positives, round 0):**
+**Achieved results (full-trained model, 111 pseudo-positives, round 0):**
 
-| Category | V1 PR-AUC | V2 Best | V3 Score (RGCN) | V3 Primary scorer | V3 vs V2 |
-|---|---|---|---|---|---|
-| AGE_VIOLATION | 0.0506 | 0.1466 | **0.3417** | demographic IF | PASS |
-| INCOME_VIOLATION | 0.1162 | 0.6503 | **0.9063** | financial IF | PASS |
-| IP_CONCENTRATION | 0.0239 | 0.0370 | **0.1184** | network IF | PASS |
-| MOTHER_NAME_COLLISION | 0.0258 | 0.2869 | **0.5206** | identity IF | PASS |
-| FEE_INFLATION | 0.0264 | 0.4962 | **0.7420** | financial IF | PASS |
+| Category | V2 Floor | V3 Score | Primary scorer | Status |
+|---|---|---|---|---|
+| AGE_VIOLATION | 0.1466 | **0.3417** | demographic IF | PASS |
+| INCOME_VIOLATION | 0.6503 | **0.9063** | financial IF | PASS |
+| IP_CONCENTRATION | 0.0370 | **0.1184** | network IF | PASS |
+| MOTHER_NAME_COLLISION | 0.2869 | **0.5206** | identity IF | PASS |
+| FEE_INFLATION | 0.4962 | **0.7420** | financial IF | PASS |
 
 Isolated-node degree stratum: 0.47–1.00 across all categories.
 Edge-dropout score_retention = 3.6452 (feature-based suspicion persists without graph edges).
-
-> **V3→V4 comparison baseline (2026-07-03):** these V3 RGCN figures are the
-> explicit comparison baseline for the V4 HAN encoder retrain (ADR-015). The
-> V4 HAN evaluation must report deltas against these numbers on all 5
-> categories, not pass/fail, plus degree-stratified PR-AUC (§5.2), the
-> edge-dropout test (§5.3), and the 5 learned β_r values.
 
 ### 5.2 Degree-Stratified PR-AUC (new in V3)
 
@@ -478,15 +457,8 @@ N_FEATURES      = 68    # 63 original + 5 degree-aware features
 N_EDGE_TYPES    = 5     # shares_mobile, shares_ip, shares_father_name,
                         # shares_mother_name, shares_pincode
 MASK_NUM        = 8     # number of learned masks in GraphMCM
-GRAPH_HIDDEN    = 128   # graph encoder hidden channels
-GRAPH_EMB_DIM   = 64    # graph encoder output embedding dimension (h_N(i))
-
-# ── V4 HAN encoder constants (ADR-015 — planned, land with the V4 code swap) ───
-# Never hardcode these in hybrid_graphmcm_v3.py (hard stop #9).
-ARCH_VERSION         = "han_v1"  # V4 checkpoint architecture tag (hard stop #15)
-ATTN_HEADS           = 4         # node-level GAT attention heads
-ATTN_LEAKY_SLOPE     = 0.2       # LeakyReLU slope in GAT attention scoring
-SEMANTIC_ATTN_HIDDEN = 32        # hidden dim of the w_r MLP (HAN Eq. 1)
+GRAPH_HIDDEN    = 128   # RGCN hidden channels
+GRAPH_EMB_DIM   = 64    # RGCN output embedding dimension (h_N(i))
 MLP_HIDDEN      = 256   # MLP hidden dim after concat
 Z_DIM           = 64    # latent dimension after concat+MLP
 LOE_MARGIN      = 2.0   # exposure loss margin (graph side only)
@@ -603,7 +575,7 @@ another module's source files directly. No embeddings cross module boundaries.
 | `data/processed/identity_graph_v3.pt` | graph_builder | hybrid, evaluate | PyG HeteroData, 5 edge types |
 | `data/processed/degree_features_v3.csv` | graph_builder | feature_engine (written back) | N×5, cols=`degree_shares_*` |
 | `data/processed/synthetic_exposure_set_v3.pt` | synthetic_builder | hybrid | (750, 68) float32 tensor |
-| `models/hybrid_graphmcm_v3.pth` | hybrid | xai, evaluate | `{model_state_dict, centroid, config}` — `config` includes `ARCH_VERSION` from the V4 HAN swap (ADR-015) onward; see hard stop #15 |
+| `models/hybrid_graphmcm_v3.pth` | hybrid | xai, evaluate | `{model_state_dict, centroid, config}` |
 | `outputs/hybrid_scores_v3.csv` | hybrid | evt, self_training, fusion, xai | `application_id, hybrid_anomaly_score, feature_pred_error, edge_pred_error, per_feature_error_json, per_feature_predicted_json` — predicted column added 2026-07-03 (project-lead approved) so XAI states expected-vs-actual with direction; all three scoring paths (train, incremental, API staged) emit it via `hybrid_graphmcm_v3.compute_score_frame()` |
 | `outputs/subspace_if_scores_v3.csv` | subspace_if | fusion, xai | `application_id, subspace_if_score, group_scores_json` |
 | `outputs/evt_thresholds_v3.json` | evt | self_training, xai (read-only, quotes thresholds in narratives) | 6 signals: `{hybrid, subspace_if, subspace_if_financial, subspace_if_identity, subspace_if_network, edge_pred_error}` each with `{u, scale, shape, threshold, n_flagged}` |
@@ -635,19 +607,17 @@ overwrites `identity_graph_v3.pt` in place from whatever is currently in
 `data/raw/data_for_ml_model.csv`. There is no versioned or archived copy of a
 prior cycle's graph anywhere in the pipeline (contrast with model checkpoints,
 which ARE versioned — see `models/checkpoints/` above and ADR-008). This is
-intentional: the graph encoder learns to interpret structural *patterns*
+intentional: the RGCN encoder learns to interpret structural *patterns*
 (unusual IP concentration, name-sharing density, degree distributions) at
 training time, not the identity of specific IPs/mobiles/names present in any
 one batch's edges. Those identities are meaningless outside the batch they
 came from — next cycle's fraud rings use different IPs. What must persist
 across cycles is the learned weights (`hybrid_graphmcm_v3.pth` /
 `models/checkpoints/`), not the graph tensor. `train_incremental()` reflects
-this directly: it loads the checkpoint, optionally freezes the graph encoder
+this directly: it loads the checkpoint, optionally freezes the RGCN encoder
 (`freeze_rgcn=True` when confirmed fraud < 50 — see `retraining_orchestrator.py`),
 and re-scores against the freshly rebuilt graph for the current batch only.
 Do not add graph versioning/archival as a "fix" — there is nothing to fix here.
-(Note: the frozen-encoder incremental path is only valid *within* one
-architecture version — it cannot bridge the V3 RGCN→V4 HAN boundary; see ADR-015.)
 
 ---
 
@@ -753,15 +723,10 @@ row, stop and confirm scope.
 15. **Checkpoint schema must embed a `config` dict.** `hybrid_graphmcm_v3.py`
     must save checkpoints with exactly these top-level keys:
     `{model_state_dict, centroid, config}`. The `config` dict must contain at
-    minimum `N_FEATURES`, `GRAPH_EMB_DIM`, `N_EDGE_TYPES`, and — from the
-    V4 HAN swap (ADR-015) onward — `ARCH_VERSION`, all sourced from
+    minimum `N_FEATURES`, `GRAPH_EMB_DIM`, and `N_EDGE_TYPES` sourced from
     `config_v3.py`. This is the contract `checkpoint_manager.py` validates
     against before any swap. A checkpoint missing these keys is rejected with
-    no change to the live model. `validate_and_hotswap()` must reject an
-    `ARCH_VERSION` mismatch with a clear error — never a silent partial
-    state_dict load. Rolling back a pre-V4 (RGCN) checkpoint under V4 HAN
-    code fails this check by design: a checkpoint is only a valid rollback
-    target together with the code version that produced it.
+    no change to the live model.
 16. **`nic-worker` replica count is fixed at 1.** Training jobs write to fixed
     output paths (`outputs/*.csv`, `models/*.pth`). Scaling `nic-worker` to 2
     causes concurrent runs to overwrite each other's intermediates. Enforce
@@ -785,14 +750,6 @@ row, stop and confirm scope.
   geometry but the 5 archetype types are unchanged. 3–5 additional archetypes
   (cross-cycle IP reuse, institute-cluster, income-rounding) should be evaluated
   before the next full retrain. See Appendix B.
-- HAN encoder depth (V4, ADR-015) — one HAN layer (1-hop) vs two stacked layers
-  (2-hop, matching the V3 RGCN's receptive field). Two layers is the working
-  recommendation so the ablation isolates the aggregation mechanism, not the
-  hop count — no evidence yet.
-- `ATTN_HEADS=4` (V4) — no head-count ablation done.
-- Per-relation empty-neighborhood handling (V4) — self-loops inside each
-  relation's node-level attention (working choice, standard GAT) vs a learned
-  per-relation "no neighbors here" vector.
 
 ---
 
@@ -981,38 +938,6 @@ Subspace IF. EVT tail + self-training pseudo-labels replaced all rule labels.
 both). MCM and Graph AE operated in separate worlds with no information flow
 between them. V3 unifies them into a single joint model.
 
-## C.4 V3 — Hybrid GraphMCM (RGCN Encoder)
-
-V3 unified the 5 independent V2 scorers into 2: one Hybrid GraphMCM model
-(masked conditional feature prediction informed by graph neighborhood via an
-RGCN encoder) + one Subspace IF ensemble (marginal detection on 3 feature
-groups). Training loops reduced from 4 to 1 (plus instant IF fitting). Five
-degree-aware features added to the tabular feature engine.
-
-Key components: `src/hybrid_graphmcm_v3.py` (RGCN encoder, MCM feature stream,
-joint training), `src/subspace_if_v3.py`, `src/config_v3.py` (all constants),
-full MLOps stack (FastAPI, Celery+Redis, Docker, checkpoint manager).
-
-**V3 final PR-AUC results (RGCN encoder, full-trained, 111 pseudo-positives, round 0):**
-
-| Category | V1 PR-AUC | V2 Best | V3 Score (RGCN) | V3 Primary Scorer |
-|---|---|---|---|---|
-| AGE_VIOLATION | 0.0506 | 0.1466 | **0.3417** | demographic IF |
-| INCOME_VIOLATION | 0.1162 | 0.6503 | **0.9063** | financial IF |
-| IP_CONCENTRATION | 0.0239 | 0.0370 | **0.1184** | network IF |
-| MOTHER_NAME_COLLISION | 0.0258 | 0.2869 | **0.5206** | identity IF |
-| FEE_INFLATION | 0.0264 | 0.4962 | **0.7420** | financial IF |
-
-Isolated-node degree stratum: 0.47–1.00 across all categories.
-Edge-dropout score_retention = 3.6452.
-
-**Why V4 supersedes V3:** The RGCN encoder uses fixed, degree-normalized
-aggregation with no learned content-awareness — every neighbor and every
-relation type gets the same treatment. V4 replaces it with a HAN two-level
-attention encoder (node-level GAT per relation + semantic-level β_r fusion)
-to learn which neighbors and which relation types matter most for each node's
-prediction. See ADR-015.
-
 ---
 
 # Appendix D — V2 Architecture Critique (MAR Reference)
@@ -1061,7 +986,7 @@ outside those specific synthetic topologies.
 
 # Appendix E — Research Citations
 
-## E.1 Primary (directly grounds a V3/V4 component)
+## E.1 Primary (directly grounds a V3 component)
 
 | Short Ref | Full Citation | Grounds |
 |---|---|---|
@@ -1069,13 +994,10 @@ outside those specific synthetic topologies.
 | `MaskGAE` | Li et al., NeurIPS 2022 Workshop | Joint masking of edges and features; two-error scoring |
 | `MCM` | Masked Cell Modeling, ICLR 2024 | Learned masks for tabular conditional prediction |
 | `LOE` | Qiu et al., "Latent Outlier Exposure for Anomaly Detection with Contaminated Data," ICML 2022, arXiv:2202.08088 | Graph-side Stage 1 warm-start in hybrid model |
-| `HAN` | Wang, Ji, Shi, Wang, Cui, Ye & Yu, "Heterogeneous Graph Attention Network," WWW 2019 | V4 two-level attention graph-stream encoder (§4.4, ADR-015): node-level attention per relation + semantic β_r fusion across relations |
-| `GAT` | Veličković et al., "Graph Attention Networks," ICLR 2018 | Node-level attention mechanism inside the V4 HAN encoder |
-| `TabularSOTA` | Grinsztajn et al., "Why do tree-based models still outperform deep learning on tabular data?", NeurIPS 2022 | Scope boundary of ADR-015: attention confined to the graph stream; LightGBM fusion and tabular feature stream stay non-attention at this data scale (15,000 × 68) |
-| `DOMINANT` | Ding et al., "Deep Anomaly Detection on Attributed Networks," SDM 2019 | V3 RGCN encoder architecture (aggr='add', tanh bounding) — superseded in V4 by `HAN` (ADR-015) |
+| `DOMINANT` | Ding et al., "Deep Anomaly Detection on Attributed Networks," SDM 2019 | RGCN encoder architecture (aggr='add', tanh bounding) |
 | `DeepSVDD` | Ruff et al., "Deep One-Class Classification," ICML 2018 | Hypersphere centroid; anomaly = distance from normal centroid |
 | `EVT-SPOT` | Siffer et al., "Anomaly Detection in Streams with Extreme Value Theory," KDD 2017 | GPD tail fitting in `evt_scorer_v3.py` |
-| `R-GCN` | Schlichtkrull et al., "Modeling Relational Data with Graph Convolutional Networks," ESWC 2018 | V3 typed-edge RGCN encoder — superseded in V4 by `HAN` (ADR-015) |
+| `R-GCN` | Schlichtkrull et al., "Modeling Relational Data with Graph Convolutional Networks," ESWC 2018 | Typed-edge RGCN encoder |
 | `ASTRA-SelfTrain` | Karamanolakis et al., "Self-Training with Weak Supervision," NAACL 2021, arXiv:2104.05514 | Self-training promotion logic |
 | `OutlierExposure` | Hendrycks et al., "Deep Anomaly Detection with Outlier Exposure," ICLR 2019, arXiv:1812.04606 | Synthetic anomaly exposure curriculum |
 | `GNNExplainer` | Ying et al., NeurIPS 2019, arXiv:1903.03894 | XAI layer per-case explanations |
@@ -1376,13 +1298,13 @@ manifests for each component).
 
 **Status:** Proposed — do not implement until project lead sign-off
 **Context:** At inference time, a new application needs its relational
-neighbors (across 5 edge types) to build a mini-subgraph for the graph
+neighbors (across 5 edge types) to build a mini-subgraph for the RGCN
 encoder. Querying a `.pt` file for this at inference time is not practical.
 **Decision:** Load `data/raw/data_for_ml_model.csv` into a PostgreSQL table
 (`applications`) with indexed columns for all 5 edge-type fields (`mobile_no`,
 `ip_address`, `father_name`, `mother_name`, `pincode`). At inference time,
-query neighbors per edge type, build a mini-subgraph, run the graph encoder,
-return `hybrid_anomaly_score` for the new node only.
+query neighbors per edge type, build a mini-subgraph, run RGCN, return
+`hybrid_anomaly_score` for the new node only.
 **Open question:** cross-cycle schema design — does the `applications` table
 accumulate across years (enabling cross-cycle IP cluster detection) or rebuild
 each year? No decision made. Resolve before Phase 3 implementation.
@@ -1469,80 +1391,6 @@ response for ~30–90s on the current 15,600-row scale) rather than dispatched
 as a Celery job. Acceptable at current scale; revisit if dataset size or
 call frequency grows enough that this becomes a real request-timeout risk.
 **Phase:** 2
-
----
-
-## ADR-015 — V4: HAN two-level attention encoder replaces V3 RGCN in the graph stream
-
-**Status:** Accepted (2026-07-03) — documentation updated; **V4 implementation
-pending**. Directed by the project lead.
-**Context:** The V3 RGCN encoder in `hybrid_graphmcm_v3.py` aggregates all 5
-typed edges with the same fixed, degree-normalized weighting for every
-neighbor and every relation. There is no learned content-awareness in the
-aggregation step — a node in a large, organically-diverse shared-pincode
-cluster and a node in a tight, feature-camouflaged fraud ring sharing an IP
-get the same fixed-form treatment, differing only by degree.
-**Decision:** Replace the V3 RGCN encoder with a HAN-style two-level attention
-encoder (Wang et al., WWW 2019), in place, with zero changes to any other
-module:
-1. Node-level attention per relation (GAT, Veličković et al., ICLR 2018) —
-   learned α_ij per edge, softmax over each node's within-relation neighbors.
-2. Semantic-level attention — learned w_r per relation (small MLP + tanh,
-   HAN Eq. 1), softmax to β_r (HAN Eq. 2), β_r-weighted fusion into h_N(i).
-Full mechanism spec in §4.4. New constants (`ARCH_VERSION`, `ATTN_HEADS`,
-`ATTN_LEAKY_SLOPE`, `SEMANTIC_ATTN_HIDDEN`) live in `config_v3.py` only
-(hard stop #9).
-**Why graph stream only:** no non-neural baseline in this pipeline (LightGBM,
-Isolation Forest) can express relational reasoning over typed edges, so
-attention closes a genuine capability gap there. Feature-stream
-(FT-Transformer-style) and fusion-stream attention are explicitly NOT
-pursued: tree-based models remain state-of-the-art on medium-sized tabular
-data at this project's exact scale (15,000 × 68 — Grinsztajn et al.,
-NeurIPS 2022).
-**Backward compatibility (critical — this is a V3→V4 architecture change,
-not a weight update):**
-1. V4 checkpoints carry `ARCH_VERSION = "han_v1"` in their `config` dict
-   (hard stop #15). V3 RGCN checkpoints do not load into V4 code — the
-   state_dict shapes and names differ.
-2. `checkpoint_manager.validate_and_hotswap()` must reject an `ARCH_VERSION`
-   mismatch with a clear error, never a silent partial load. This is a
-   **flagged cross-module change** — outside `hybrid_graphmcm_v3.py`'s
-   boundary; requires project-lead scope confirmation before
-   `checkpoint_manager.py` is edited (§0 parallel-agent rule).
-3. First V4 deployment requires a FULL retrain from scratch via the GPU
-   pathway (`main_v3.py` on the GPU laptop). It is NOT compatible with
-   `train_incremental()`'s frozen-encoder assumption — there is no old RGCN
-   to freeze. Never route the first V4 HAN training through
-   `retraining_orchestrator.py`.
-4. Rollback safety: a V3 (pre-HAN) versioned checkpoint in
-   `models/checkpoints/` is only a valid rollback target if the code is
-   reverted alongside it. Rolling back the V3 checkpoint alone under V4 HAN
-   code fails the `ARCH_VERSION` check — the correct, safe failure mode, not
-   a bug to work around.
-**What stays identical (V3→V4):** `outputs/hybrid_scores_v3.csv` schema
-(byte-for-byte); every downstream module (subspace_if, evt_scorer,
-self_training, fusion, xai) unaware of the swap; h_N(i) never leaves
-`hybrid_graphmcm_v3.py` (hard stop #10); `isolated_embedding` fallback
-bit-for-bit unchanged (hard stop #11); no hand-set relation priority in the
-attention (hard stop #1); the MCM masked-prediction objective, LOE Stage 1,
-DeepSVDD centroid, and scoring formula are all untouched.
-**V4 validation order (do not skip steps):**
-1. Unit test — h_N(i) shape (B, 64), connected + isolated nodes.
-2. Unit test — isolated nodes bypass attention, `isolated_embedding`
-   bit-for-bit identical to V3 behavior.
-3. CPU smoke test (`main_v3.py --smoke`, 2 epochs) — wall-clock delta vs
-   V3 RGCN baseline (attention cost scales with edge count, not rows).
-4. Full GPU retrain → `evaluate_model_v3.py`, PR-AUC deltas (not pass/fail)
-   vs the V3 RGCN baseline: 0.3417 / 0.9063 / 0.1184 / 0.5206 / 0.7420.
-5. Degree-stratified PR-AUC + edge-dropout test (§5.2–5.3).
-6. Report the 5 learned β_r values alongside the PR-AUC table. Diagnostic:
-   β(shares_ip) > β(shares_pincode) expected from relation base rates.
-**Files to change:** `src/hybrid_graphmcm_v3.py`, `src/config_v3.py`;
-`src/checkpoint_manager.py` flagged only (needs scope confirmation).
-**Note:** ADR-015 is a project-lead-directed exception to the F.0 "no
-`src/*.py` modification" invariant, which governs MLOps wrapper phases —
-this is an ML architecture change, not an MLOps change.
-**Phase:** — (ML architecture, outside the MLOps phase track)
 
 ---
 

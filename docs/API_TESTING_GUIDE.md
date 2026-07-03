@@ -493,7 +493,7 @@ Invoke-RestMethod -Method POST "http://localhost:8000/v3/training/decision" `
 
 **(b) Incremental fine-tune on the new data** — permanently merges the 600
 rows into the raw CSV, rebuilds features/graph, then fine-tunes the existing
-checkpoint (graph encoder frozen unless ≥50 confirmed fraud):
+checkpoint (RGCN frozen unless ≥50 confirmed fraud):
 ```powershell
 Invoke-RestMethod -Method POST "http://localhost:8000/v3/training/decision" `
   -ContentType "application/json" `
