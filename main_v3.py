@@ -42,6 +42,7 @@ PIPELINE_STEPS = [
     "build_exposure_set",
     "train_hybrid",
     "subspace_if",
+    "dense_block",
     "evt",
     "self_training",
     "fusion",
@@ -208,6 +209,11 @@ def run_pipeline(steps: list[str] | None = None, smoke_test: bool = False, cycle
             print("\n[main] Step 6: Subspace IF -- run_subspace_if()")
             from src.subspace_if_v3 import run_subspace_if
             run_subspace_if()
+
+        if should_run("dense_block"):
+            print("\n[main] Step 6b: Dense-block detector (IP) -- run_dense_block()")
+            from src.dense_block_detector_v3 import run_dense_block
+            run_dense_block()
 
         if should_run("evt"):
             print("\n[main] Step 7: EVT scorer -- run_evt()")

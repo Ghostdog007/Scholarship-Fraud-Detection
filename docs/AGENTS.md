@@ -116,9 +116,10 @@ exposure**; set `ENCODER_ARCH="rgcn"`, `TOPO_EXPOSURE_ENABLED=True`
   `V4_SEED`, `V4_ENCODER_ARCH`, `V4_TOPO_EXPOSURE` (see `config_v3.py`).
   Smoke harness: `scripts/smoke_v4.py`.
 
-**Files to view first next session:** this block → `docs/IMPLEMENTATION_V4.md`
-(task spec + parallel plan) → `src/hybrid_graphmcm_v3.py` (encoders + Stage 1)
-→ `src/config_v3.py` (switches) → `outputs/ablation/*.json` (numbers).
+**Files to view first next session:** this block → `docs/IMPLEMENTATION.md`
+(settled layered architecture) → Appendix H (comparison results) →
+`src/hybrid_graphmcm_v3.py` (encoders) → `src/config_v3.py` (switches) →
+`outputs/ablation/tier_comparison.json` (numbers).
 
 **Strategy — how to get attention's benefits (the ablation showed HAN-as-
 detector hurts because better reconstruction lowers anomaly on cliques):**
@@ -1065,7 +1066,9 @@ between them. V3 unifies them into a single joint model.
 
 # Appendix D — V2 Architecture Critique (MAR Reference)
 
-> Source: MAR_v2.md (internal Model and Architecture Review, June 2026).
+> Source: internal Model and Architecture Review (June 2026), now folded inline
+> here — there is no separate `MAR_v2.md`/`MAR_v3.md` file. This appendix is the
+> canonical MAR critique.
 > Some failure modes are partially mitigated in V3; others remain.
 > Read before making changes to the hybrid model, EVT scorer, or self-training loop.
 
@@ -1725,3 +1728,190 @@ torch.set_num_interop_threads(4)  # inter-op parallelism (async ops)
 Do not call these inside `src/` modules — set them in the Celery task wrapper
 (`src/api/tasks.py`) so the values are applied once per worker process and
 do not affect local development or the GPU laptop.
+
+---
+
+# Appendix H — V4 Six-Way Architecture Comparison (canonical results)
+
+**Provenance:** `outputs/ablation/tier_comparison.json`, one CPU-deterministic run
+(RGCN scatter-add non-determinism removed), 3 seeds (42/43/44), connected-cluster
+harness + T9b held-out. Supersedes all earlier GPU runs (±0.03–0.04 noise floor).
+Injected-vs-real PR-AUC per fraud category; higher = better. All fusion classifiers
+fit on the real 15k rows with only **14 pseudo-label positives**; injected fraud is
+never in any fit set.
+
+## H.1 Modes
+
+| Mode | What it is |
+|---|---|
+| baseline | RGCN Hybrid GraphMCM (reconstruction) + subspace IF → LightGBM fusion |
+| tier1 | baseline + 11 attention read-out columns |
+| ring | subgraph ring-classifier projected to nodes |
+| max_fusion | per-node `max(baseline, tier1)` |
+| dense_block_fusion | baseline + FRAUDAR dense-block (per relation) + DevNet deviation |
+| dense_block_only | subspace + dense-block + deviation, GNN columns dropped (tests RGCN retirement) |
+
+## H.2 Aggregate PR-AUC — mean over seeds 42/43/44
+
+| Category | baseline | tier1 | ring | max_fusion | dense_block_fusion | dense_block_only |
+|---|---|---|---|---|---|---|
+| AGE_VIOLATION | **0.402** | 0.141 | 0.182 | 0.286 | 0.163 | 0.091 |
+| INCOME_VIOLATION | **0.638** | 0.180 | 0.212 | 0.586 | 0.262 | 0.052 |
+| IP_CONCENTRATION | 0.155 | 0.413 | 0.186 | 0.404 | **0.673** | 0.453 |
+| MOTHER_NAME_COLLISION | 0.341 | 0.391 | 0.390 | **0.411** | 0.098 | 0.032 |
+| FEE_INFLATION | **0.587** | 0.165 | 0.220 | 0.537 | 0.235 | 0.033 |
+| **MEAN** | 0.425 | 0.258 | 0.238 | **0.445** | 0.286 | 0.132 |
+| (std of mean) | 0.040 | 0.043 | 0.004 | 0.061 | 0.077 | 0.021 |
+
+## H.3 Held-out T9b — novel star/bipartite topologies (seed 42)
+
+| Category | baseline | tier1 | ring | max_fusion | dense_block_fusion | dense_block_only |
+|---|---|---|---|---|---|---|
+| AGE_VIOLATION | **0.444** | 0.105 | 0.149 | 0.304 | 0.226 | 0.058 |
+| INCOME_VIOLATION | **0.675** | 0.101 | 0.210 | 0.545 | 0.293 | 0.064 |
+| IP_CONCENTRATION | 0.271 | 0.424 | 0.157 | 0.387 | 0.285 | 0.230 |
+| MOTHER_NAME_COLLISION | 0.167 | 0.300 | **0.398** | 0.328 | 0.027 | 0.045 |
+| FEE_INFLATION | **0.669** | 0.084 | 0.230 | 0.539 | 0.300 | 0.057 |
+
+## H.4 What each architecture accomplished (verdicts)
+
+- **baseline** — best/near-best on all tabular (AGE/INCOME/FEE); robust; simplest.
+  Weak on IP (0.155): reconstruction is blind to dense cliques (they reconstruct
+  *easily*). The balanced incumbent.
+- **tier1** — recovers relational signal (IP 0.413, MOTHER 0.391) baseline misses,
+  but craters tabular (11 columns overfit 14 positives). Real signal, wrong fusion.
+- **ring** — most stable (std 0.004), best held-out MOTHER (0.398); never wins a
+  category on aggregate (0.238). Under-sold by a clique-only harness.
+- **max_fusion** — highest mean (0.445), marginally over baseline; keeps tabular,
+  gains MOTHER. The +0.02 is within historical noise; a safe lateral.
+- **dense_block_fusion** — **IP 0.673 vs baseline 0.155 (+0.52), the single largest
+  category gain in the project.** Explicit dense-block detection catches dense fraud
+  cliques reconstruction cannot. But regresses everything else, badly on MOTHER
+  (0.098): the real graph already has *legitimate* dense mother-name/pincode blocks
+  (siblings, geography), so the score fires on benign structure there. A specialist.
+- **dense_block_only** — worst overall (0.132); loses tabular entirely.
+  **RGCN retirement is disproven.**
+
+## H.5 Mechanism — why dense-block wins IP but loses MOTHER
+
+Dense-block detection flags density-as-suspicious. It wins on `shares_ip` because
+that relation is *sparse* in the real data, so an injected IP clique stands out.
+It loses on `shares_mother_name`/`shares_pincode` because those relations are
+*legitimately* dense (families, addresses), so the score fires on benign structure
+and misleads the classifier. On held-out star/bipartite topologies the IP edge
+largely evaporates — dense-block detects dense *blocks*, and a star is not dense.
+It is a clique specialist, not a general relational detector.
+
+## H.6 Settled architecture decision (2026-07-05)
+
+**Baseline (RGCN Hybrid GraphMCM + subspace IF + LightGBM fusion) is the backbone**
+— only balanced, tabular-strong, robust option; RGCN retirement disproven. **Add
+dense-block as a per-relation-gated arm on `shares_ip` only** — where its +0.52 win
+lives, gated away from the legitimately-dense relations. Deviation layer stays wired
+but dormant until confirmed patterns accrue. Ring kept as an independent audit
+signal, not a fusion column. Full layered design in `docs/IMPLEMENTATION.md`.
+
+**Do NOT** globally adopt dense-block/tier1/ring, retire the RGCN, or flip any flag
+ON until the IP-gated combination is run and confirmed across >3 seeds — small-seed
+comparisons are where false improvements hide.
+
+## H.7 IP-gated run on a FROZEN detector set (2026-07-05, reproducible)
+
+Dense-block gated to `shares_ip` only (`DENSE_BLOCK_RELATIONS=[1]`); detectors
+**frozen** (reused checkpoints, never retrained per run) — GPU scored. Per-seed
+baseline `[0.275, 0.235, 0.149]` reproduced identically across the CPU and GPU
+runs, confirming the freeze removes the detector-instance variance.
+
+**Aggregate mean (seeds 42/43/44):**
+
+| Category | base | db_fus | db_only | maxfus | tier1 | ring |
+|---|---|---|---|---|---|---|
+| AGE_VIOLATION | 0.147 | 0.124 | **0.469** | 0.150 | 0.082 | 0.188 |
+| INCOME_VIOLATION | 0.315 | 0.147 | **0.556** | 0.408 | 0.399 | 0.179 |
+| IP_CONCENTRATION | 0.169 | 0.224 | 0.278 | **0.364** | 0.356 | 0.195 |
+| MOTHER_NAME_COLLISION | 0.197 | 0.238 | 0.237 | 0.275 | 0.242 | **0.356** |
+| FEE_INFLATION | 0.269 | 0.128 | **0.523** | 0.347 | 0.312 | 0.197 |
+| **MEAN** | 0.220 | 0.172 | **0.413** | 0.309 | 0.278 | 0.223 |
+
+**Strongest per component:** tabular (AGE/INCOME/FEE) → `db_only` (subspace IF,
+GNN dropped); IP → `max_fusion`/`tier1` (attention geometry); MOTHER → `ring`
+(subgraph fingerprint); overall + held-out → `db_only` (held-out AGE 0.505,
+INCOME 0.569, FEE 0.620, MOTHER 0.487).
+
+**CORRECTION (verified 2026-07-05) — "GNN harmful" was a FUSION artifact, not a
+detector fact.** Scoring the *same* frozen detector **raw** via `evaluate_connected`
+(`hybrid_anomaly_score` directly, no LightGBM) gives: AGE 0.112, INCOME 0.083,
+**IP 0.511, MOTHER 0.452**, FEE 0.087 — mean **0.249**, fully consistent with the
+recorded V3 config2_rgcn_topo ablation (mean 0.25–0.30, IP 0.31–0.66, MOTHER
+0.55–0.74). **The detector is healthy and strong on relational fraud.**
+
+The low fusion numbers are the **14-positive LightGBM fusion** degrading that raw
+signal: IP 0.511→0.169, MOTHER 0.452→0.197 through the fusion. The fusion is fit on
+14 real pseudo-label positives whose structure doesn't match injected cliques, so
+it drowns the raw graph score. `db_only` "wins" the fusion comparison only because
+that metric is tabular-dominated (subspace carries AGE/INCOME/FEE) and dropping the
+GNN removes *fusion-fit noise* — NOT because the GNN signal is bad. **The RGCN raw
+score is the strongest relational detector we have.**
+
+**Implications:** (1) the compare-harness fusion baseline is a poor proxy for
+detector quality — the raw detector beats it 3x on IP/MOTHER; (2) the earlier
+"0.42 baseline" (H.2) was a lucky fusion draw above the ~0.25 typical V3 range, not
+the norm; (3) do NOT conclude the GNN should be retired — the real weak link is the
+14-positive fusion. The architecture question is how to preserve the raw IP 0.51 /
+MOTHER 0.45 signal through fusion, not whether to drop the GNN.
+
+## H.8 Score-level fusion of raw components (no LightGBM, no seeds, GPU)
+
+Rank-normalise each raw component score and combine — bypasses the 14-positive fit.
+Frozen detector, one run.
+
+| Category | rgcn_topo | subspace | dense_ip | sl_sum | sl_max |
+|---|---|---|---|---|---|
+| AGE | 0.099 | **0.632** | 0.038 | 0.183 | 0.232 |
+| INCOME | 0.082 | **0.966** | 0.038 | 0.165 | 0.340 |
+| IP | 0.414 | 0.327 | **0.713** | 0.714 | 0.385 |
+| MOTHER | 0.396 | **0.796** | 0.043 | 0.379 | 0.361 |
+| FEE | 0.071 | **0.916** | 0.038 | 0.145 | 0.323 |
+| **MEAN** | 0.212 | **0.727** | 0.174 | 0.317 | 0.328 |
+
+Held-out (star/bipartite): subspace 0.757, rgcn 0.207, dense_ip 0.095, sl_sum 0.272,
+sl_max 0.325. rgcn IP 0.367 > dense_ip 0.282 — RGCN+topology **generalises to novel
+topology better than dense-block** (a clique specialist).
+
+### LightGBM (14-positive fusion) — documented weakness
+
+The learned fusion, fit on only 14 EVT pseudo-label positives, **destroys strong raw
+signals**: subspace INCOME **0.966 → 0.315**; RGCN IP **0.51 → 0.169**. With so few,
+idiosyncratic positives the tree learns "fraud = these 14 points" and discounts any
+feature that didn't happen to separate them — including the two strongest detectors.
+It is a poor combiner in the current label regime.
+
+### Best configuration (per this analysis)
+
+`subspace_if_score` is the backbone (mean 0.727, wins 4/5 categories); IP is its only
+gap, filled by `dense_block_ip` (0.713) and raw RGCN (0.414). **Equal-weight
+score-level fusion under-performs subspace-alone** (0.32 vs 0.73) because it dilutes
+the strong per-category signal — so the target is a **routed/weighted** fusion
+(subspace-dominant + IP-specialist boost), NOT equal-weight, and NOT LightGBM until
+labels grow. Re-evaluate: RGCN+topology (relational + best topology generalisation),
+subspace IF (tabular backbone), dense-block-IP (IP specialist), under weighted score
+fusion.
+
+## H.9 Outlier-exposure (LOE) before/after tests — both exposure layers work
+
+For each component with an exposure layer: test on an anomaly it has NOT been exposed
+to, add that pattern to the exposure, retrain, retest. One run each, GPU.
+
+| Component (exposure) | Novel anomaly | BEFORE | AFTER | Δ |
+|---|---|---|---|---|
+| **RGCN topology exposure** | star/bipartite IP (exposure had only cliques) | 0.309 | **0.457** | **+0.148** |
+| **Deviation synthetic exposure** | IP archetype (leave-one-archetype-out) | 0.034 | **0.126** | **+0.092** |
+
+The RGCN result is corroborated by the variance-controlled config1→config2 ablation
+(topology exposure OFF→ON lifted IP ~0.30→0.46, +0.16) — two independent tests, same
+~+0.15 lift. **Conclusion: outlier/synthetic exposure genuinely teaches each detector
+to catch previously-unseen patterns** — the "show it a fraud shape → it learns to
+detect that shape" mechanism is validated for both the RGCN and the deviation layer.
+(The RGCN Δ includes some retrain-to-retrain variance; the deviation absolute numbers
+are low because it sees only tabular features, not graph structure — but both deltas
+are clearly positive.)

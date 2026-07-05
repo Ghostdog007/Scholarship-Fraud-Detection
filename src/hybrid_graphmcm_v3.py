@@ -281,6 +281,79 @@ class HybridGraphMCM(nn.Module):
         return self.encoder.top_alpha(node_idx, k)
 
     @torch.no_grad()
+    def attention_summary(
+        self,
+        x: torch.Tensor,
+        edge_index_list: list[torch.Tensor],
+        edge_type_tensor: torch.Tensor,
+        isolated_mask: torch.Tensor,
+        app_ids: np.ndarray,
+    ) -> pd.DataFrame:
+        import math
+        n_nodes = x.shape[0]
+        h = self.encoder(x, edge_index_list, edge_type_tensor)
+
+        beta_r = np.full((n_nodes, N_EDGE_TYPES), 0.2, dtype=np.float32)
+        alpha_entropy = np.zeros((n_nodes, N_EDGE_TYPES), dtype=np.float32)
+        alpha_top1 = np.zeros(n_nodes, dtype=np.float32)
+
+        edge_index = torch.cat(edge_index_list, dim=1) if edge_index_list else torch.zeros((2, 0), dtype=torch.long, device=x.device)
+
+        if edge_index.shape[1] > 0:
+            src = edge_index[0].cpu().numpy()
+            dst = edge_index[1].cpu().numpy()
+            rel = edge_type_tensor.cpu().numpy()
+
+            h_src = h[edge_index[0]]
+            h_dst = h[edge_index[1]]
+            e_ij = (h_src * h_dst).sum(dim=1).cpu().numpy()
+
+            df_edges = pd.DataFrame({'src': src, 'dst': dst, 'rel': rel, 'e': e_ij})
+
+            def softmax_group(x):
+                x = x - np.max(x)
+                e_x = np.exp(x)
+                return e_x / e_x.sum()
+
+            df_edges['a'] = df_edges.groupby(['dst', 'rel'])['e'].transform(softmax_group)
+
+            def norm_entropy(a):
+                if len(a) <= 1:
+                    return 0.0
+                ent = -np.sum(a * np.log(a + 1e-9))
+                return ent / math.log(len(a))
+
+            entropy_df = df_edges.groupby(['dst', 'rel'])['a'].apply(norm_entropy).reset_index()
+            for _, row in entropy_df.iterrows():
+                alpha_entropy[int(row['dst']), int(row['rel'])] = row['a']
+
+            top1_df = df_edges.groupby('dst')['a'].max().reset_index()
+            for _, row in top1_df.iterrows():
+                alpha_top1[int(row['dst'])] = row['a']
+
+            energy_df = df_edges.groupby(['dst', 'rel'])['e'].sum().reset_index()
+            node_energies = np.zeros((n_nodes, N_EDGE_TYPES), dtype=np.float32)
+            for _, row in energy_df.iterrows():
+                node_energies[int(row['dst']), int(row['rel'])] = row['e']
+
+            e_max = np.max(node_energies, axis=1, keepdims=True)
+            exp_e = np.exp(node_energies - e_max)
+            beta_r = exp_e / np.sum(exp_e, axis=1, keepdims=True)
+
+            iso = isolated_mask.cpu().numpy()
+            beta_r[iso] = 0.2
+            alpha_entropy[iso] = 0.0
+            alpha_top1[iso] = 0.0
+
+        df = pd.DataFrame({
+            "application_id": app_ids,
+            **{f"beta_{r}": beta_r[:, r] for r in range(N_EDGE_TYPES)},
+            **{f"alpha_entropy_{r}": alpha_entropy[:, r] for r in range(N_EDGE_TYPES)},
+            "alpha_top1": alpha_top1
+        })
+        return df
+
+    @torch.no_grad()
     def init_centroid(
         self,
         x: torch.Tensor,
@@ -782,9 +855,25 @@ def _score_and_save(
     print(f"[hybrid] Checkpoint saved -> {MODEL_PTH}")
 
 
+def run_attention_summary() -> None:
+    print("[attention_summary] Loading model and inputs...")
+    model, x_all, edge_index_list, edge_type_tensor, isolated_mask, app_ids, _ = load_model_and_inputs(DEVICE)
+    model.eval()
+
+    print("[attention_summary] Computing attention summary...")
+    df = model.attention_summary(x_all, edge_index_list, edge_type_tensor, isolated_mask, app_ids)
+
+    out_path = Path("outputs/attention_summary_v3.csv")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_path, index=False)
+    print(f"[attention_summary] Saved to {out_path}")
+
+
 if __name__ == "__main__":
     import sys
     if "--score-only" in sys.argv:
         score_only()
+    elif "--attention-summary" in sys.argv:
+        run_attention_summary()
     else:
         train(smoke_test=False)

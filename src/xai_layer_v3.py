@@ -41,6 +41,10 @@ GRAPH_PT       = Path("data/processed/identity_graph_v3.pt")
 FEATURES_CSV   = Path("data/processed/engineered_features_v3.csv")
 PSEUDO_LABELS  = Path("outputs/pseudo_labels_v3.json")
 OUT_JSON       = Path("outputs/explanation_cards_v3.json")
+FUSION_MODEL   = Path("models/fusion_lgbm_v3.pkl")
+FUSION_FEATS   = Path("models/fusion_lgbm_v3_features.pkl")
+DEV_CSV        = Path("outputs/deviation_scores_v3.csv")
+DENSE_CSV      = Path("outputs/dense_block_scores_v3.csv")
 
 TOP_K_FEATURES  = 5
 TOP_K_NEIGHBORS = 3
@@ -470,6 +474,34 @@ def run_xai(top_n: int = 500) -> None:
     if not has_predicted:
         print("[xai] WARNING: per_feature_predicted_json not in hybrid scores — "
               "expected-vs-actual evidence unavailable; re-run scoring for full narratives.")
+              
+    # Load fusion model for SHAP Explainer
+    import joblib
+    import shap
+    
+    fusion_model, fusion_feats = None, []
+    if FUSION_MODEL.exists() and FUSION_FEATS.exists():
+        fusion_model = joblib.load(FUSION_MODEL)
+        fusion_feats = joblib.load(FUSION_FEATS)
+        explainer = shap.TreeExplainer(fusion_model)
+    else:
+        explainer = None
+        
+    dev_map = {}
+    if DEV_CSV.exists():
+        dev_df = pd.read_csv(DEV_CSV)
+        for _, r in dev_df.iterrows():
+            dev_map[r["application_id"]] = {
+                "deviation_score": float(r["deviation_score"]),
+                "evidence_source": r.get("evidence_source", "neither")
+            }
+            
+    dense_map = {}
+    if DENSE_CSV.exists():
+        dense_df = pd.read_csv(DENSE_CSV)
+        dense_cols = [c for c in dense_df.columns if c.startswith("dense_block_score_")]
+        for _, r in dense_df.iterrows():
+            dense_map[r["application_id"]] = {c: float(r[c]) for c in dense_cols}
 
     # Actual (scaled) feature values per application
     feat_df = pd.read_csv(FEATURES_CSV)
@@ -664,6 +696,47 @@ def run_xai(top_n: int = 500) -> None:
             }
         else:
             attention_dict = None
+            
+        # Fusion TreeSHAP attributions
+        fusion_attributions = {}
+        provenance = []
+        
+        if explainer is not None and len(fusion_feats) > 0:
+            # Build feature vector for this app
+            x_row = []
+            for f in fusion_feats:
+                if f in row:
+                    x_row.append(row[f])
+                elif f in dense_map.get(app_id, {}):
+                    x_row.append(dense_map[app_id][f])
+                elif f == "deviation_score":
+                    x_row.append(dev_map.get(app_id, {}).get("deviation_score", 0.0))
+                else:
+                    x_row.append(0.0)
+                    
+            x_row = np.array(x_row, dtype=np.float32).reshape(1, -1)
+            shap_values = explainer.shap_values(x_row)[0]
+            # SHAP returns a matrix, but since it's single row, [0] gets the vector
+            # But wait, lightgbm binary objective might return list of arrays or a single array
+            if isinstance(shap_values, list):
+                shap_values = shap_values[1] # class 1
+            
+            for i, f in enumerate(fusion_feats):
+                fusion_attributions[f] = float(shap_values[i])
+                if shap_values[i] > 0.0:
+                    if f.startswith("dense_block_score_"):
+                        rel = f.replace("dense_block_score_", "")
+                        provenance.append(f"dense-block-{rel}")
+                    elif f == "deviation_score":
+                        src = dev_map.get(app_id, {}).get("evidence_source", "neither")
+                        provenance.append(f"deviation_score ({src})")
+                    elif f == "subspace_if_score" or f in ["hybrid_anomaly_score", "feature_pred_error"]:
+                        provenance.append("tabular")
+        
+        # Deduplicate provenance
+        provenance = list(set(provenance))
+        evidence["fusion_attributions"] = fusion_attributions
+        evidence["provenance"] = provenance
 
         card = {
             "application_id":       app_id,

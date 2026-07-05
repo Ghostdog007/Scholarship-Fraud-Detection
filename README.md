@@ -7,57 +7,59 @@
 
 ---
 
-## V4 — graph-stream capability upgrade (this branch)
+## V4 — Final Detection Architecture (this branch, LOCKED)
 
-V4 upgrades the graph stream inside `src/hybrid_graphmcm_v3.py` in two chained
-steps, plus the human workflow that feeds them. It is a *capability* label, not
-a rename — all `_v3` file names, module paths, `/v3/...` API routes, MLOps
-tooling, and curl commands stay exactly as documented below. Full decision
-records: `docs/AGENTS.md` Appendix F (ADR-015, ADR-016).
+V4 keeps the V3 detectors but **changes how they are combined**. The detectors
+were never the problem — the old LightGBM fusion, trained on only ~14
+auto-generated pseudo-labels, was *burying* their signal. V4 replaces it with a
+**label-free weighted score-level fusion** of three specialised raw detectors.
+It is a *capability* label, not a rename — all `_v3` file names, `/v3/...` API
+routes, MLOps tooling, and curl commands are unchanged. Full record:
+`docs/IMPLEMENTATION.md` and `docs/AGENTS.md` Appendix H.
 
-**What V4 aims to accomplish:**
+**The three detectors (each strong where the others are blind):**
 
-1. **HAN attention encoder (ADR-015)** — replace the RGCN encoder with a
-   HAN-style two-level attention encoder (node-level GAT per relation +
-   semantic β_r fusion). Learns *which* neighbors and *which* shared attributes
-   matter, and exposes that as per-application **attention attribution** — "the
-   model focused on these shared-IP edges when it flagged this application."
-2. **Topology synthetic exposure (ADR-016)** — teach the model confirmed fraud
-   *shapes*, not just scalar degree counts. Confirmed clusters are captured as
-   subgraphs and spliced into the exposure set so the encoder learns the
-   geometry of a fraud ring.
-3. **Supervisor review-and-promote cycle (ADR-016)** — a FastAPI workflow:
-   suspicious clusters are flagged, the supervisor **views the topology**
-   (node-link diagram, IDs kept, 1-hop, ~50-node cap), confirms real patterns
-   into a pending queue, and — when ready — selects a batch and triggers one
-   retrain. No per-pattern retraining; MLflow records the audit trail.
+1. **Subspace Isolation Forest** — the **tabular backbone**, and the single
+   strongest component (raw mean PR-AUC **0.727**; INCOME 0.966, FEE 0.916). Wins
+   4 of 5 categories on its own. No training.
+2. **Dense-block detector (IP-gated)** — the **IP-concentration specialist**
+   (FRAUDAR-style camouflage-resistant greedy peeling on `shares_ip`; raw IP
+   **0.713**). Fills subspace's one blind spot. Deterministic, no training.
+3. **RGCN + topology exposure** (Hybrid GraphMCM) — the **relational signal**
+   (raw IP **0.51**, MOTHER **0.45**), with the best generalisation to *unseen*
+   fraud shapes. Its outlier-exposure layer is validated to learn new topologies
+   (before/after test: +0.148 on a never-seen star/bipartite ring).
 
-**Status (3-seed ablation, 2026-07-04):**
-- ✅ **Topology synthetic exposure — adopted.** +0.069 ± 0.034 mean connected
-  PR-AUC (positive in all 3 seeds; IP +53%, mother-name +35%). Shipping config.
-- ❌ **HAN encoder — not adopted (drop-in).** −0.091 ± 0.032, worse in all 3
-  seeds: attention over-smooths dense fraud cliques (they reconstruct *well* →
-  lower anomaly score). RGCN + topology is the shipping detector.
-- 🔬 **Getting attention's benefits:** use attention for supervisor *attribution*
-  and as a *discriminative* feature into the LightGBM fusion — not as the
-  reconstruction encoder. Full strategy + next-session handoff in
-  `docs/AGENTS.md` (V4 block).
+**The fusion (locked):**
 
-Shipping config: `ENCODER_ARCH="rgcn"`, `TOPO_EXPOSURE_ENABLED=True` (the
-`config_v3.py` default). The supervisor review-and-promote cycle is built and
-cleared to enable.
+```
+risk = minmax( 1.0·subspace_if_score + 0.5·dense_block_ip + 0.3·hybrid_anomaly_score )
+       (each component min-max normalised first)
+```
 
-**V3 baseline (the connected-cluster ablation above is measured against this):**
+Label-independent — there is no learned gate that can suppress a strong signal.
+Subspace dominates; dense-block-IP boosts the IP blind spot; RGCN adds the
+relational/topology signal.
 
-| Category | V2 Floor | V3 Score | Result |
-|---|---|---|---|
-| AGE_VIOLATION | 0.1466 | 0.3417 (demographic IF) | PASS |
-| INCOME_VIOLATION | 0.6503 | 0.9063 (financial IF) | PASS |
-| IP_CONCENTRATION | 0.0370 | 0.1184 (network IF) | PASS |
-| MOTHER_NAME_COLLISION | 0.2869 | 0.5206 (identity IF) | PASS |
-| FEE_INFLATION | 0.4962 | 0.7420 (financial IF) | PASS |
+**Measured (frozen detector, one run):** connected mean **0.639** (IP **0.538**),
+held-out **0.640** — versus the old LightGBM fusion's **~0.22**.
 
-Isolated-node stratum PR-AUC: 0.47–1.00. Edge-dropout `score_retention`: 3.6452.
+**Why the LightGBM fusion was dropped:** with only ~14 EVT pseudo-labels the tree
+learned "fraud = these 14 particular points" and discounted the very detectors
+that work — it dragged subspace INCOME **0.966 → 0.315** and RGCN IP **0.51 →
+0.169**. It is parked until confirmed labels accumulate (then revisited with
+monotonic constraints).
+
+**Dropped (measured out):** HAN encoder (−0.091 drop-in — attention over-smooths
+dense fraud cliques), Tier-1 attention read-out, equal-weight/max fusion, and
+"retire the RGCN" (disproven). **Standing by:** the deviation layer is wired but
+dormant (cold-start, activates as confirmations grow), and the ring classifier is
+kept as an independent audit signal, not a fusion input.
+
+> **Honest caveat:** the numbers above are on a single frozen detector; a
+> multi-seed confirmation on a representative detector is the remaining validation
+> before production sign-off. See `docs/AGENTS.md` Appendix H for the full
+> component-by-component evidence.
 
 ---
 
@@ -248,33 +250,35 @@ data/raw/data_for_ml_model.csv  (15,000 × 136)
   └──────────────────────┬─────────────────────-─┘
                │
                ▼
-  ┌────────────────────────────┐
-  │     Subspace IF Ensemble   │  ← Safety net, no training
-  │   3 groups × 1 IF each:    │
-  │   financial / identity /   │
-  │   network                  │
-  └────────────┬───────────────┘
-               │
-               ▼
-         EVT Scorer
-         (GPD tail fit, q=0.002)
-               │
-               ▼
-        Self-Training Loop
-        (human-gated, ≥2 EVT signals required)
-               │
-               ▼
-        LightGBM Fusion
-        (hybrid score + subspace IF score)
-               │
-               ▼
-        XAI Layer
-        per-feature conditional errors
-        + graph neighbor explanation
-               │
-               ▼
-        risk_scores_v3.csv
-        explanation_cards_v3.json
+  ┌───────────────────────────────────────────────────────────────┐
+  │  THREE RAW DETECTORS (each strong where the others are blind)   │
+  │                                                                 │
+  │  Subspace IF          Dense-Block (IP)      RGCN + topology     │
+  │  tabular backbone     FRAUDAR peeling on    (from Hybrid above) │
+  │  financial/identity/  shares_ip only        relational signal   │
+  │  network (no train)   raw IP 0.713          raw IP 0.51         │
+  │  raw mean 0.727       (no train)            best generalisation │
+  └───────┬───────────────────┬─────────────────────┬──────────────┘
+          │ subspace_if_score  │ dense_block_ip      │ hybrid_anomaly_score
+          └───────────┬────────┴──────────┬──────────┘
+                      ▼                    │
+              EVT Scorer (GPD tail)        │   (EVT + self-training run in
+                      ▼                    │    parallel; feed thresholds +
+              Self-Training Loop           │    label_source metadata)
+              (human-gated, ≥2 signals)    │
+                      └─────────┬──────────┘
+                                ▼
+              WEIGHTED SCORE-LEVEL FUSION  (LOCKED — replaces LightGBM)
+              risk = minmax(1.0·subspace + 0.5·dense_ip + 0.3·hybrid)
+                                │  each component min-max normalised
+                                ▼
+              EVT/SPOT threshold on the fused score
+                                ▼
+                          XAI Layer
+              per-feature conditional errors + graph neighbor explanation
+                                ▼
+                     risk_scores_v3.csv
+                     explanation_cards_v3.json
 ```
 
 ---
@@ -387,10 +391,11 @@ NIC fraud Detection Project/
 │   ├── graph_builder_v3.py                 # 5 typed edges + degree computation
 │   ├── synthetic_exposure_builder_v3.py    # 750 × 68 LOE tensor (graph-side only)
 │   ├── hybrid_graphmcm_v3.py               # Core model: feature stream + graph stream
-│   ├── subspace_if_v3.py                   # 3-group subspace isolation forest
+│   ├── subspace_if_v3.py                   # 3-group subspace isolation forest (tabular backbone)
+│   ├── dense_block_detector_v3.py          # FRAUDAR greedy peeling on shares_ip (IP specialist)
 │   ├── evt_scorer_v3.py                    # GPD tail fit on 6 signals (hybrid + 5 subspace)
 │   ├── self_training_loop_v3.py            # Pseudo-label promotion (human-gated, ≥2 of 5 EVT signals)
-│   ├── fusion_classifier_v3.py             # LightGBM: hybrid + subspace IF → risk score
+│   ├── fusion_classifier_v3.py             # Weighted SCORE-LEVEL fusion: subspace + dense-block-IP + hybrid → risk
 │   ├── xai_layer_v3.py                     # Evidence-first explanation cards: population percentiles, expected-vs-actual values, EVT-threshold quotes, deterministic narratives
 │   ├── evaluate_model_v3.py                # Category-specific subspace IF + degree-stratified PR-AUC
 │   ├── checkpoint_manager.py               # ADR-008: atomic checkpoint validation + hot-swap

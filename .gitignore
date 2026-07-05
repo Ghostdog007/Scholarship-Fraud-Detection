@@ -28,6 +28,10 @@ training_log.txt
 
 # MLflow experiment tracking (local file-based, not committed to git)
 mlruns/
+mlflow.db
+
+# Ablation checkpoint backup scratch
+.ablation_backup/
 
 # Pre-commit cache
 .pre-commit-cache/

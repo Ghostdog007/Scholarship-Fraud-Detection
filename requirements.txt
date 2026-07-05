@@ -111,3 +111,6 @@ mlflow>=2.14.0
 # ── Structured logging ────────────────────────────────────────────────────────
 structlog>=24.0.0
 python-json-logger>=2.0.0
+
+# ── Interactive graph visualization (flagged-ring 3D configurations) ──────────
+plotly>=6.0.0

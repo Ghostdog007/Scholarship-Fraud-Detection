@@ -136,3 +136,46 @@ TOPO_CLUSTER_SIZE_RANGE = (6, 40) # nodes per synthetic cluster (min, max)
 # ── V4: connected-cluster evaluation (T1) ───────────────────────────────────
 EVAL_CONNECTED_N_CLUSTERS   = int(_env("V4_EVAL_CLUSTERS", "30"))  # injected clusters/category
 EVAL_CONNECTED_SIZE_RANGE   = (6, 40)
+
+# ── V4 Phase 2: Tier-1 attention-summary features (T7) ───────────────────────
+TIER1_ATTN_FEATURES = _env("V4_TIER1_ATTN", "0") == "1"  # default OFF; flip to adopt in fusion
+ATTN_READOUT_K      = 8    # top-k neighbours summarised per node in the read-out head
+
+# ── V4 Phase 2: subgraph ring-classifier (T8) ────────────────────────────────
+RING_MIN_SIZE       = 4    # candidate rings smaller than this are ignored (structural, not policy)
+RING_SPECTRAL_K     = 3    # top-k Laplacian eigenvalues kept in the fingerprint
+RING_N_NEG_SAMPLES  = int(_env("V4_RING_NEG", "400"))  # random real subgraphs as classifier negatives
+RING_OPEN_SET_ENABLED = True   # compute nearest-prototype distance for novel-ring flagging
+RING_CLASSIFIER_ENABLED = _env("V4_RING", "0") == "1"  # default OFF; flip to adopt in pipeline
+
+# ── V4 Phase 2: head-to-head (T9) ────────────────────────────────────────────
+COMPARE_SEEDS       = (42, 43, 44)   # the three seeds the head-to-head averages over
+EVAL_HELDOUT_SIZE_RANGE = (6, 40)    # T9b held-out topology size (structure differs, see T9b)
+
+# ── V4 FINAL: dense-block detector — IP specialist, part of the locked architecture ─
+DENSE_BLOCK_ENABLED   = _env("V4_DENSE_BLOCK", "1") == "1"   # default ON (architected component)
+DENSE_BLOCK_RELATIONS = [1]                                   # gated to shares_ip exclusively (see AGENTS.md H.5)
+DENSE_BLOCK_KCORE_PREFILTER = True                            # k-core narrows, then peel
+DENSE_BLOCK_CAMOUFLAGE_C    = 5.0                             # w = 1/log(deg + c)
+
+# ── V4 FINAL: score-level fusion (LOCKED — replaces the 14-positive LightGBM) ──
+# risk = minmax( W_SUBSPACE*subspace + W_DENSE_IP*dense_block_ip + W_HYBRID*hybrid )
+# each component min-max normalised first. See AGENTS.md H.8 for why LightGBM was
+# dropped (it destroyed subspace 0.966->0.315 and RGCN IP 0.51->0.169).
+FUSION_W_SUBSPACE = 1.0    # tabular backbone (dominant; wins 4/5 categories raw)
+FUSION_W_DENSE_IP = 0.5    # IP specialist boost (subspace's one blind spot)
+FUSION_W_HYBRID   = 0.3    # RGCN relational (best generalisation to novel topology)
+
+# ── V4 revamp: deviation layer (D2/D3) ───────────────────────────────────────
+DEVIATION_LAYER_ENABLED     = _env("V4_DEVIATION", "0") == "1"  # default OFF
+DEV_MIN_CONFIRMED_PER_CATEGORY = int(_env("V4_DEV_MIN_CONF", "5"))  # hard stop #19
+DEV_OOF_FOLDS         = 5                                     # leakage-safe stacking
+DEV_HIDDEN            = 64
+DEV_EPOCHS            = 50
+DEV_LR                = 1e-3
+DEV_CONF_MARGIN       = 5.0                                   # DevNet confidence margin a
+DEV_PAIRWISE          = True                                  # PReNet pairwise augmentation
+
+# ── V4 revamp: fusion input set (keep GNN cols until comparison says otherwise) ─
+FUSION_INCLUDE_GNN_COLS = True   # baseline cols stay; comparison tests removal
+
