@@ -277,10 +277,16 @@ python main_v3.py  # run for real only after smoke test passes
 | Subspace IF scoring | `subspace_if_v3.py` | 5 min |
 | EVT threshold fitting | `evt_scorer_v3.py` | 2 min |
 | Self-training Round 0 | `self_training_loop_v3.py` | 1 min |
-| LightGBM fusion | `fusion_classifier_v3.py` | 2–5 min |
-| XAI cards | `xai_layer_v3.py` | 10–20 min |
+| Score-level fusion (V4) | `fusion_classifier_v3.py` | <1 min |
+| XAI cards (JSON) | `xai_layer_v3.py` | 10–20 min |
+| Reviewer cards (suspicious, HTML) | `xai_card_html_v3.py` | <1 min |
 | Evaluation (synthetic harness) | `evaluate_model_v3.py` | 5 min |
 | **Total** | | **~2–4 hours** |
+
+> The fusion is the locked V4 **weighted score-level combine**
+> (`risk = minmax(1.0·subspace + 0.5·dense_block_ip + 0.3·hybrid)`) — not a
+> LightGBM tree. The reviewer-card step renders interactive HTML only for the
+> flagged (suspicious) applications into `outputs/cards/`.
 
 ### 4.3 Verify outputs
 
@@ -315,6 +321,52 @@ have failed to learn any signal. Stop and investigate before delivering outputs.
 
 ---
 
+### 4.4 MLflow run — metrics + artifacts (incl. the reviewer cards)
+
+Every `main_v3.py` run opens an MLflow run under experiment
+`nic-fraud-detection-v3` (tracking store: `mlflow.db`; artifact files under
+`mlruns/`). Browse it with:
+
+```bash
+mlflow ui            # then open http://localhost:5000
+# or, from the project root, use the helper:
+# ./mlflow_ui.bat    (Windows)
+```
+
+Pick the latest run under `nic-fraud-detection-v3`. The **Metrics** tab shows the
+per-category PR-AUC and `pipeline_duration_seconds`; the **Artifacts** tab holds:
+
+| Artifact path | Contents |
+|---|---|
+| `checkpoints/` | `hybrid_graphmcm_v3.pth` (the scored model) |
+| `scores/` | `risk_scores_v3.csv` |
+| `thresholds/` | `evt_thresholds_v3.json` |
+| `labels/` | `pseudo_labels_v3.json` |
+| `xai/` | `explanation_cards_v3.json` (raw evidence, all top cards) |
+| **`cards/`** | **the interactive reviewer-card gallery** — `index.html` + one `card_NNN_<app_id>.html` per flagged application |
+
+**View the cards from MLflow:** in the Artifacts tab, open `cards/index.html` — the
+MLflow UI renders HTML artifacts inline. `index.html` lists every suspicious
+application ranked by risk; each row opens its evidence card. The cards are the
+**simplistic** representation (inline ego-graph + explanation); their *"Examine
+full ring in 3D"* links resolve against the **live API** (`/v3/monitoring/{app_id}/ring`),
+so the heavy Plotly view is still computed lazily and is only reachable when the
+API is up. Nothing large is stored in MLflow — no Plotly bundle is logged, just the
+few-KB card HTML.
+
+**Verify the cards were logged** (from raw stdout of the run):
+```
+[main] Rendered N suspicious reviewer card(s) -> outputs/cards/
+```
+If `N` is 0, no application crossed an EVT threshold this run — expected on a clean
+cohort, not an error. Regenerate the local set at any time without a full run:
+```bash
+python -m src.xai_card_html_v3                 # suspicious only, lazy 3D links (default)
+python -m src.xai_card_html_v3 --ring-mode file # also pre-render offline Plotly rings
+```
+
+---
+
 ## 5. Post-Inference Phase
 
 ### 5.1 Deliver outputs to investigators
@@ -324,7 +376,8 @@ Primary output files for investigators:
 | File | Contents | Use |
 |---|---|---|
 | `outputs/risk_scores_v3.csv` | One row per application, `risk_score_v3` in [0,1] | Sort descending, prioritise top N for review |
-| `outputs/explanation_cards_v3.json` | Per-application: top contributing features, triggered signals, SHAP values | Investigator decision support |
+| `outputs/explanation_cards_v3.json` | Per-application: top feature errors (declared vs model-expected), triggered signals, EVT crossings, closed-form fusion split (subspace/dense-IP/hybrid shares), graph links | Machine-readable decision support |
+| `outputs/cards/index.html` + `card_*.html` | Interactive reviewer cards for the flagged applications (rendered from the JSON above); also served live at `GET /v3/monitoring/{app_id}/card` | Human review — the primary "why is this suspicious" view |
 
 Sort for investigator delivery:
 ```bash

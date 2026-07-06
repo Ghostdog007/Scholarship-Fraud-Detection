@@ -204,3 +204,45 @@ def get_topology(app_id: str):
         raise HTTPException(status_code=404, detail="Ego graph not found or application_id missing")
     html_content = render_html(ego)
     return HTMLResponse(content=html_content, status_code=200)
+
+
+@router.get("/{app_id}/card")
+def get_card(app_id: str):
+    """
+    Interactive reviewer card (HTML) for one flagged application: the evidence
+    of WHY it is suspicious — risk placement, ranked reason codes, per-field
+    declared-vs-model-expected breakdown, the closed-form fusion split, and a
+    lightweight identity ego-graph. Cheap and on-demand; reads the pre-computed
+    explanation_cards_v3.json. Its "Examine full ring in 3D" link points at
+    /{app_id}/ring, where the expensive Plotly view is rendered lazily on click.
+    """
+    from fastapi.responses import HTMLResponse
+    from src.xai_card_html_v3 import build_card_html
+    html_content = build_card_html(app_id)
+    if html_content is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No card for this application — not flagged, or scores/cards not yet generated",
+        )
+    log.info("monitoring.card", app_id=app_id)
+    return HTMLResponse(content=html_content, status_code=200)
+
+
+@router.get("/{app_id}/ring")
+def get_ring(app_id: str):
+    """
+    Rotatable Plotly 3D identity ring (HTML) for one application — the deep-dive
+    view. LAZY BY DESIGN: the ring is computed only on this request (i.e. when a
+    reviewer clicks the card's link), so Plotly cost is paid per view, never
+    per batch. Returns 404 if the application has no typed edges in the graph.
+    """
+    from fastapi.responses import HTMLResponse
+    from src.xai_card_html_v3 import build_ring_html
+    html_content = build_ring_html(app_id)
+    if html_content is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Application not in identity graph (no shared IP/mobile/name/pincode edges)",
+        )
+    log.info("monitoring.ring", app_id=app_id)
+    return HTMLResponse(content=html_content, status_code=200)

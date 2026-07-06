@@ -112,6 +112,24 @@ exposure**; set `ENCODER_ARCH="rgcn"`, `TOPO_EXPOSURE_ENABLED=True`
   {monitoring,supervisor}.py`, MLflow SVG logging in `main_v3.py`. Built and
   smoke-tested; the promote/exposure-write action path is cleared to enable
   now that topology exposure is validated.
+- **Reviewer-card presentation + review loop (2026-07-06):** new module
+  `src/xai_card_html_v3.py` renders the evidence-first cards
+  (`explanation_cards_v3.json`) as interactive HTML — **suspicious/flagged
+  applications only** — with an identity ego-graph, per-detector signal bars,
+  the **closed-form fusion split** (subspace/dense-IP/hybrid shares), and a
+  per-field declared-vs-model-expected breakdown. The 3D Plotly ring is **lazy**
+  (computed on link-click, never batched). Served by three read-only HTML
+  endpoints — `GET /v3/monitoring/{app_id}/card` and `/ring`, driving one-click
+  review via the card's buttons → `POST /v3/supervisor/{confirm-fraud,
+  mark-false-positive,clear-label}`. `clear-label` (new; `remove_label()` in
+  `confirmed_fraud_store.py`) undoes a label so the detection loop can be
+  re-demoed. `main_v3.py` renders the cards after `run_xai` and logs
+  `outputs/cards` to MLflow (`artifact_path="cards"`). The dead LightGBM/SHAP
+  path in `xai_layer_v3.py` was replaced with the exact closed-form fusion
+  attribution. (Also fixed a pre-existing committed syntax error in
+  `api/handlers/supervisor.py` — an unterminated module docstring — that had
+  kept the whole FastAPI app unimportable.) Docs: `IMPLEMENTATION.md`,
+  `OPERATIONS_RUNBOOK.md` §4.4, `API_TESTING_GUIDE.md` §2.3/§5.3.
 - Ablation record: `outputs/ablation/*.json` (9 runs). Reproduce with env vars
   `V4_SEED`, `V4_ENCODER_ARCH`, `V4_TOPO_EXPOSURE` (see `config_v3.py`).
   Smoke harness: `scripts/smoke_v4.py`.

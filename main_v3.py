@@ -234,6 +234,16 @@ def run_pipeline(steps: list[str] | None = None, smoke_test: bool = False, cycle
             print("\n[main] Step 10: XAI layer -- run_xai()")
             from src.xai_layer_v3 import run_xai
             run_xai()
+            # Render the lightweight interactive reviewer cards for the flagged
+            # (suspicious) applications only. ring_mode="api" keeps them simple —
+            # the 3D Plotly ring is computed lazily by the API on link-click, so
+            # nothing heavy is produced here even when frauds are many.
+            try:
+                from src.xai_card_html_v3 import render_cards
+                n_cards = render_cards(suspicious_only=True, ring_mode="api")
+                print(f"[main] Rendered {n_cards} suspicious reviewer card(s) -> outputs/cards/")
+            except Exception as e:
+                print(f"[main] card rendering skipped ({e})")
 
         metrics = {}
         if should_run("evaluate"):
@@ -254,6 +264,12 @@ def run_pipeline(steps: list[str] | None = None, smoke_test: bool = False, cycle
         xai_path = Path("outputs/explanation_cards_v3.json")
         if xai_path.exists():
             mlflow.log_artifact(str(xai_path), artifact_path="xai")
+
+        # Interactive reviewer-card gallery (simplistic; lazy 3D links resolve
+        # against the live API). Tens of KB/card — no Plotly bundle logged.
+        cards_dir = Path("outputs/cards")
+        if cards_dir.exists():
+            mlflow.log_artifacts(str(cards_dir), artifact_path="cards")
 
         risk_path = Path("outputs/risk_scores_v3.csv")
         if risk_path.exists():

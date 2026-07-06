@@ -60,7 +60,8 @@ NIC fraud Detection Project/
 │   ├── evt_scorer_v3.py                # Phase D: EVT thresholds
 │   ├── self_training_loop_v3.py        # Phase D: pseudo-label promotion (human-gated)
 │   ├── fusion_classifier_v3.py         # Phase E: LightGBM fusion
-│   ├── xai_layer_v3.py                 # Phase E: evidence-first explanation cards
+│   ├── xai_layer_v3.py                 # Phase E: evidence-first explanation cards (JSON)
+│   ├── xai_card_html_v3.py             # Phase E: interactive reviewer cards (HTML) + lazy Plotly rings
 │   ├── evaluate_model_v3.py            # Phase F: synthetic harness (isolated + connected)
 │   │
 │   ├── ring_candidate_v3.py            # V4 Phase 2 (experimental): ring candidate gen
@@ -317,7 +318,8 @@ Before any number enters documentation, a summary, or these files:
 | EVT thresholds | `evt_scorer_v3.py` | score CSVs | `evt_thresholds_v3.json` |
 | Self-training | `self_training_loop_v3.py` | score CSVs, `evt_thresholds_v3.json` | `pseudo_labels_v3.json` |
 | Fusion classifier | `fusion_classifier_v3.py` | scalar scores, `pseudo_labels_v3.json` | `risk_scores_v3.csv` |
-| Explainability | `xai_layer_v3.py` | trained detector, error/predicted vectors | `explanation_cards_v3.json` |
+| Explainability | `xai_layer_v3.py` | trained detector, error/predicted vectors, score CSVs | `explanation_cards_v3.json` (+ closed-form fusion split) |
+| Reviewer cards (HTML) | `xai_card_html_v3.py` | `explanation_cards_v3.json`, `risk_scores_v3.csv`, graph (lazy ring) | `outputs/cards/*.html`; served via API `/card` + `/ring` |
 | Evaluation | `evaluate_model_v3.py` | `data/processed/*`, `models/*.pth` | console / `outputs/ablation/*.json` |
 | **(V4)** ring pipeline | `ring_candidate_v3.py`, `ring_fingerprint_v3.py`, `ring_classifier_v3.py` | public structure + scores only (never `h_N`) | `models/ring_classifier_v3.pkl` |
 | **(V4)** comparison | `compare_architectures_v3.py` | cached detectors + scores | `outputs/ablation/tier_comparison.json` |

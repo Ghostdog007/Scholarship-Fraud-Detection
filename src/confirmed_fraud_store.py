@@ -111,6 +111,30 @@ def add_false_positive(app_id: str, confirmed_by: str, notes: str = "") -> None:
     print(f"[confirmed_fraud] Marked '{app_id}' as false positive. Total FP: {len(store['false_positives'])}")
 
 
+def remove_label(app_id: str) -> dict:
+    """Undo a supervisor label — removes the application from BOTH the confirmed
+    and false-positive lists. Used to reset a label (e.g. to re-demo the
+    detection loop, or to correct a mis-click). Returns which lists it was
+    removed from; both False means the application had no label."""
+    store = _load_store()
+    before_c = len(store["confirmed"])
+    before_f = len(store["false_positives"])
+    store["confirmed"]       = [r for r in store["confirmed"]       if r["application_id"] != app_id]
+    store["false_positives"] = [r for r in store["false_positives"] if r["application_id"] != app_id]
+    removed_c = len(store["confirmed"])       < before_c
+    removed_f = len(store["false_positives"]) < before_f
+    if removed_c or removed_f:
+        _save_store(store)
+        print(f"[confirmed_fraud] Cleared label for '{app_id}' "
+              f"(confirmed={removed_c}, false_positive={removed_f}).")
+    return {
+        "removed_confirmed":       removed_c,
+        "removed_false_positive":  removed_f,
+        "n_confirmed":             len(store["confirmed"]),
+        "n_false_positives":       len(store["false_positives"]),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Downstream consumers
 # ---------------------------------------------------------------------------

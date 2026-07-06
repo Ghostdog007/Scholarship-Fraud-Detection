@@ -55,6 +55,23 @@ PROMOTED). Batched, human-gated (hard stop #5).
 Independent audit signal, not a fusion input. Most stable, best held-out MOTHER.
 `src/ring_*.py`.
 
+### Presentation: interactive reviewer cards (`src/xai_card_html_v3.py`)
+Renders the evidence-first cards (`explanation_cards_v3.json`) as self-contained,
+offline, interactive HTML — **suspicious (flagged) applications only** (crossed an
+EVT threshold, carries a trigger, or a non-negative label). Each card has a
+two-pane layout: an interactive identity ego-graph + per-detector signal bars +
+the **closed-form fusion split** on the left; risk placement, ranked reason codes,
+and per-field declared-vs-model-expected breakdown (progressive disclosure) on the
+right. The heavy Plotly 3D ring is **lazy** — computed only when a reviewer clicks
+the card's link, never pre-rendered in batch. Presentation only; computes no new
+scores and quotes only EVT-derived gates. Replaced the dead LightGBM/TreeSHAP path
+in `xai_layer_v3.py` with the exact closed-form fusion attribution.
+
+Served by the API (`GET /v3/monitoring/{app_id}/card` and `/ring`, both HTML) and
+logged per MLflow run under `artifact_path="cards"` (simplistic cards; lazy 3D
+links resolve against the live API). `main_v3.py` renders the suspicious cards
+after `run_xai`.
+
 ---
 
 ## Measured performance (locked fusion, frozen detector, GPU, one run)
@@ -92,7 +109,12 @@ remain OFF (deprecated as fusion inputs).
 Pipeline order (`main_v3.py`): … subspace_if → **dense_block** → evt → self_training →
 **fusion (score-level)** → xai → evaluate.
 
-## Frozen boundaries (unchanged)
+## Frozen boundaries
 
-FastAPI routes, MLflow schema, `checkpoint_manager.py`, deployment spec, hard stops
-#1–16. This architecture is entirely inside the detection pipeline.
+`checkpoint_manager.py`, deployment spec, hard stops #1–16, and the detection
+pipeline contract remain frozen. **Extended (2026-07-06, lead-approved on this
+branch):** two read-only HTML endpoints added to `monitoring.py`
+(`/{app_id}/card`, `/{app_id}/ring`) and one MLflow artifact path (`cards`) — both
+presentation-only, no change to the scoring/schema contract. Also fixed a
+pre-existing committed syntax error in `src/api/handlers/supervisor.py` (module
+docstring never closed) that had kept the whole API unimportable.

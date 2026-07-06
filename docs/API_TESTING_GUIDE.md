@@ -112,6 +112,75 @@ If `drift_detected: true` — stop and call the project lead before running any 
 
 ---
 
+### 2.3 Reviewer explanation cards — *why* an application is suspicious
+
+Two HTML endpoints render the evidence for a single application. They are meant
+to be **opened in a browser**, but `curl` is the way to fetch/save them from a
+terminal or a headless server.
+
+| Endpoint | Returns | Cost |
+|---|---|---|
+| `GET /v3/monitoring/{app_id}/card` | Interactive reviewer card: risk placement, ranked reason codes, per-field declared-vs-model-expected breakdown, closed-form fusion split, and a lightweight identity ego-graph | Cheap — reads pre-computed `explanation_cards_v3.json` |
+| `GET /v3/monitoring/{app_id}/ring` | Rotatable Plotly 3D identity ring (the deep-dive) | **Lazy** — the ring is computed only on this request (i.e. when the card's "Examine full ring in 3D" link is clicked), never in batch |
+
+Cards exist **only for flagged (suspicious) applications** — those that crossed an
+EVT threshold, carry a self-training trigger, or hold a confirmed/pseudo label.
+Everything else returns `404`.
+
+**First, get a flagged application id** (the top-suspicious list is the easy source):
+```powershell
+curl.exe -s "http://localhost:8000/v3/monitoring/top-suspicious?n=5"
+# copy an application_id from the output, e.g. GJ202526000221788
+```
+
+**Fetch the card and open it:**
+```powershell
+# Save to a file, then open in the default browser
+curl.exe -s "http://localhost:8000/v3/monitoring/GJ202526000221788/card" -o card.html
+Start-Process card.html
+
+# Or open directly in the browser (no curl needed)
+Start-Process "http://localhost:8000/v3/monitoring/GJ202526000221788/card"
+```
+
+**Fetch the 3D ring (this is the only call that triggers Plotly compute):**
+```powershell
+curl.exe -s "http://localhost:8000/v3/monitoring/GJ202526000221788/ring" -o ring.html
+Start-Process ring.html
+```
+
+**Check the status codes without downloading the body:**
+```powershell
+# 200 = flagged application, card available
+curl.exe -s -o NUL -w "card: %{http_code}`n" "http://localhost:8000/v3/monitoring/GJ202526000221788/card"
+
+# 404 = application not flagged, or scores/cards not generated yet
+curl.exe -s -o NUL -w "card: %{http_code}`n" "http://localhost:8000/v3/monitoring/NOT_A_REAL_ID/card"
+```
+
+**Expected:**
+| Case | Status | Body |
+|---|---|---|
+| Flagged app | `200` | `text/html` reviewer card (~25 KB) |
+| Flagged app, `/ring` | `200` | `text/html` Plotly page (self-contained) |
+| Unflagged / unknown app | `404` | `{"detail": "No card for this application — not flagged, or scores/cards not yet generated"}` |
+| App with no graph edges, `/ring` | `404` | `{"detail": "Application not in identity graph (no shared IP/mobile/name/pincode edges)"}` |
+
+> The card's inline ego-graph is the at-a-glance view; the **"Examine full ring in
+> 3D"** link points at `/ring`, so Plotly cost is paid per view, not per batch —
+> safe even when the flagged set is large. Cards are also written to disk on every
+> full pipeline run (`outputs/cards/`, see the runbook) and logged to MLflow.
+
+**One-click review loop.** When a card is served by the live API, its footer
+buttons POST directly to the supervisor endpoints — no separate curl needed:
+**⚑ Confirm fraud** → `POST /v3/supervisor/confirm-fraud` (writes the confirmed
+store), **✓ Mark false positive** → `POST /v3/supervisor/mark-false-positive`, and
+**↺ Undo label** → `POST /v3/supervisor/clear-label` (removes the label so the
+application resets). The fraud-type is pre-selected from the card's own evidence.
+See §5 for the raw calls those buttons make.
+
+---
+
 ## 3. Model / Checkpoint Endpoints
 
 ### 3.1 Checkpoint info
@@ -345,6 +414,37 @@ Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/mark-false-p
 ```json
 {"status": "ok", "application_id": "APP_2024_00456", "n_false_positives": 1}
 ```
+
+---
+
+### 5.3 Clear / undo a label (reset the review)
+
+Removes an application from **both** the confirmed and false-positive stores, so
+its state resets to unlabelled. Use it to correct a mis-click, or to re-run a
+demo of the detection loop (label a topology → retrain → confirm it now scores as
+fraud → **clear** → repeat). This is the button `↺ Undo label` on the card.
+
+```powershell
+Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/clear-label" `
+  -ContentType "application/json" `
+  -Body '{"application_id": "APP_2024_00123"}'
+```
+
+**Expected (label existed):**
+```json
+{"status": "ok", "application_id": "APP_2024_00123",
+ "removed_confirmed": true, "removed_false_positive": false,
+ "n_confirmed": 0, "n_false_positives": 0}
+```
+
+**404 if the application had no label to clear:**
+```json
+{"detail": "No label to clear for 'APP_2024_00123' (not in confirmed or false-positive store)"}
+```
+
+> Clearing a label only edits the store JSON — it does **not** retrain. The change
+> takes effect at the next incremental/full run (or `patterns/promote`), which
+> rebuilds exposure from the current store.
 
 ---
 

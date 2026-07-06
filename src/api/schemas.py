@@ -21,6 +21,10 @@ class FalsePositiveRequest(BaseModel):
     notes: str = ""
 
 
+class ClearLabelRequest(BaseModel):
+    application_id: str
+
+
 class ConfirmPatternRequest(BaseModel):
     application_id: str
     fraud_type: str

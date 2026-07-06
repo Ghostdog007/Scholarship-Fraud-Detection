@@ -30,7 +30,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.config_v3 import MIN_SIGNALS_FOR_PROMOTION, EDGE_TYPES, ENCODER_ARCH
+from src.config_v3 import (
+    MIN_SIGNALS_FOR_PROMOTION, EDGE_TYPES, ENCODER_ARCH,
+    FUSION_W_SUBSPACE, FUSION_W_DENSE_IP, FUSION_W_HYBRID,
+)
 
 HYBRID_CSV     = Path("outputs/hybrid_scores_v3.csv")
 RISK_CSV       = Path("outputs/risk_scores_v3.csv")
@@ -41,9 +44,6 @@ GRAPH_PT       = Path("data/processed/identity_graph_v3.pt")
 FEATURES_CSV   = Path("data/processed/engineered_features_v3.csv")
 PSEUDO_LABELS  = Path("outputs/pseudo_labels_v3.json")
 OUT_JSON       = Path("outputs/explanation_cards_v3.json")
-FUSION_MODEL   = Path("models/fusion_lgbm_v3.pkl")
-FUSION_FEATS   = Path("models/fusion_lgbm_v3_features.pkl")
-DEV_CSV        = Path("outputs/deviation_scores_v3.csv")
 DENSE_CSV      = Path("outputs/dense_block_scores_v3.csv")
 
 TOP_K_FEATURES  = 5
@@ -153,8 +153,67 @@ EDGE_TYPE_LABELS = {
 }
 
 
+DETECTOR_LABELS = {
+    "subspace": "tabular subspace detector",
+    "dense_ip": "shared-IP dense-block",
+    "hybrid":   "relational RGCN model",
+}
+
+
 def _readable(feature: str) -> str:
     return FEATURE_LABELS.get(feature, feature.replace("_", " ").title())
+
+
+def _minmax(x: np.ndarray) -> np.ndarray:
+    """Population min-max to [0,1] — identical to fusion_classifier_v3._minmax
+    so the reported contributions reproduce the actual fused score exactly."""
+    x = np.asarray(x, dtype=np.float64)
+    lo, hi = x.min(), x.max()
+    return (x - lo) / (hi - lo + 1e-9)
+
+
+def build_fusion_contributions(
+    hybrid_df: pd.DataFrame,
+    subspace_df: pd.DataFrame,
+    dense_map: dict,
+) -> dict[str, dict]:
+    """Closed-form per-detector contribution to the score-level fusion.
+
+    Replaces the removed LightGBM TreeSHAP path. Because the fusion is
+      risk = minmax( W_S*minmax(subspace) + W_D*minmax(dense_ip) + W_H*minmax(hybrid) )
+    each detector's contribution to the pre-normalisation sum is exact — no
+    approximation. Returns app_id -> {detector: {weighted, share, normalized}}.
+    """
+    fus = hybrid_df[["application_id", "hybrid_anomaly_score"]].merge(
+        subspace_df[["application_id", "subspace_if_score"]], on="application_id"
+    )
+    fus["dense_block_score_ip"] = fus["application_id"].map(
+        lambda a: dense_map.get(a, {}).get("dense_block_score_ip", 0.0)
+    ).astype(float)
+
+    s = _minmax(fus["subspace_if_score"].values)
+    d = _minmax(fus["dense_block_score_ip"].values)
+    h = _minmax(fus["hybrid_anomaly_score"].values)
+
+    c_s = FUSION_W_SUBSPACE * s
+    c_d = FUSION_W_DENSE_IP * d
+    c_h = FUSION_W_HYBRID   * h
+    total = c_s + c_d + c_h + 1e-12
+
+    out: dict[str, dict] = {}
+    for i, aid in enumerate(fus["application_id"].values):
+        out[aid] = {
+            "subspace": {"weighted": round(float(c_s[i]), 6),
+                         "share": round(float(c_s[i] / total[i]), 4),
+                         "normalized": round(float(s[i]), 6)},
+            "dense_ip": {"weighted": round(float(c_d[i]), 6),
+                         "share": round(float(c_d[i] / total[i]), 4),
+                         "normalized": round(float(d[i]), 6)},
+            "hybrid":   {"weighted": round(float(c_h[i]), 6),
+                         "share": round(float(c_h[i] / total[i]), 4),
+                         "normalized": round(float(h[i]), 6)},
+        }
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +446,29 @@ def _narrative(card: dict) -> str:
         feat_lines = [_feature_sentence(f) for f in top_feats[:NARRATIVE_FEATURES]]
         parts.append("Key evidence: " + " | ".join(feat_lines) + ".")
 
+    # 3b. Fusion breakdown — which detector drove the fused score (closed-form,
+    #     replaces the removed LightGBM TreeSHAP attributions).
+    fc = ev.get("fusion_contributions", {})
+    if fc:
+        order = sorted(fc.items(), key=lambda kv: kv[1].get("share", 0.0), reverse=True)
+        parts_fc = [
+            f"{DETECTOR_LABELS.get(k, k)} {c['share'] * 100:.0f}%"
+            for k, c in order if c.get("share", 0.0) > 0.005
+        ]
+        if parts_fc:
+            parts.append("Score composition: " + ", ".join(parts_fc) + ".")
+
+    # 3c. Dense-block-IP: the IP specialist. Only surfaced when it actually fires.
+    dib = ev.get("dense_block_ip")
+    if dib and dib.get("score", 0.0) > 0.0:
+        pct = dib.get("percentile")
+        pct_str = f", more concentrated than {_fmt_pct(pct)} of applicants" if pct is not None else ""
+        parts.append(
+            f"Shared-IP dense-block: this application sits inside a dense cluster of "
+            f"co-applications on the same IP address{pct_str} — the signal the IP specialist adds "
+            f"on top of the tabular detectors."
+        )
+
     # 4. Subspace detector context. Crossed groups are already reported in
     #    section 2 (triggers or evt_crossings) — here we only add the strongest
     #    detector's percentile when nothing crossed, as ranking context.
@@ -475,33 +557,19 @@ def run_xai(top_n: int = 500) -> None:
         print("[xai] WARNING: per_feature_predicted_json not in hybrid scores — "
               "expected-vs-actual evidence unavailable; re-run scoring for full narratives.")
               
-    # Load fusion model for SHAP Explainer
-    import joblib
-    import shap
-    
-    fusion_model, fusion_feats = None, []
-    if FUSION_MODEL.exists() and FUSION_FEATS.exists():
-        fusion_model = joblib.load(FUSION_MODEL)
-        fusion_feats = joblib.load(FUSION_FEATS)
-        explainer = shap.TreeExplainer(fusion_model)
-    else:
-        explainer = None
-        
-    dev_map = {}
-    if DEV_CSV.exists():
-        dev_df = pd.read_csv(DEV_CSV)
-        for _, r in dev_df.iterrows():
-            dev_map[r["application_id"]] = {
-                "deviation_score": float(r["deviation_score"]),
-                "evidence_source": r.get("evidence_source", "neither")
-            }
-            
-    dense_map = {}
+    # Dense-block-IP scores (V4 IP specialist). Consumed for the closed-form
+    # fusion breakdown and as narrative evidence.
+    dense_map: dict = {}
+    dense_ip_sorted = np.array([])
     if DENSE_CSV.exists():
         dense_df = pd.read_csv(DENSE_CSV)
         dense_cols = [c for c in dense_df.columns if c.startswith("dense_block_score_")]
         for _, r in dense_df.iterrows():
             dense_map[r["application_id"]] = {c: float(r[c]) for c in dense_cols}
+        if "dense_block_score_ip" in dense_df.columns:
+            dense_ip_sorted = np.sort(dense_df["dense_block_score_ip"].values.astype(float))
+    else:
+        print(f"[xai] WARNING: {DENSE_CSV} not found — dense-block-IP evidence omitted.")
 
     # Actual (scaled) feature values per application
     feat_df = pd.read_csv(FEATURES_CSV)
@@ -515,6 +583,12 @@ def run_xai(top_n: int = 500) -> None:
             subspace_map[r["application_id"]] = json.loads(r["group_scores_json"])
     else:
         print(f"[xai] WARNING: {SUBSPACE_CSV} not found — subspace corroboration omitted.")
+
+    # Closed-form fusion breakdown (replaces the removed LightGBM TreeSHAP path)
+    fusion_contrib: dict = {}
+    if subspace_df is not None:
+        fusion_contrib = build_fusion_contributions(hybrid_df, subspace_df, dense_map)
+        print(f"[xai] Computed closed-form fusion contributions for {len(fusion_contrib)} applications.")
 
     # EVT thresholds — the only numeric gates the narrative quotes
     evt = json.loads(EVT_JSON.read_text()) if EVT_JSON.exists() else {}
@@ -697,46 +771,23 @@ def run_xai(top_n: int = 500) -> None:
         else:
             attention_dict = None
             
-        # Fusion TreeSHAP attributions
-        fusion_attributions = {}
-        provenance = []
-        
-        if explainer is not None and len(fusion_feats) > 0:
-            # Build feature vector for this app
-            x_row = []
-            for f in fusion_feats:
-                if f in row:
-                    x_row.append(row[f])
-                elif f in dense_map.get(app_id, {}):
-                    x_row.append(dense_map[app_id][f])
-                elif f == "deviation_score":
-                    x_row.append(dev_map.get(app_id, {}).get("deviation_score", 0.0))
-                else:
-                    x_row.append(0.0)
-                    
-            x_row = np.array(x_row, dtype=np.float32).reshape(1, -1)
-            shap_values = explainer.shap_values(x_row)[0]
-            # SHAP returns a matrix, but since it's single row, [0] gets the vector
-            # But wait, lightgbm binary objective might return list of arrays or a single array
-            if isinstance(shap_values, list):
-                shap_values = shap_values[1] # class 1
-            
-            for i, f in enumerate(fusion_feats):
-                fusion_attributions[f] = float(shap_values[i])
-                if shap_values[i] > 0.0:
-                    if f.startswith("dense_block_score_"):
-                        rel = f.replace("dense_block_score_", "")
-                        provenance.append(f"dense-block-{rel}")
-                    elif f == "deviation_score":
-                        src = dev_map.get(app_id, {}).get("evidence_source", "neither")
-                        provenance.append(f"deviation_score ({src})")
-                    elif f == "subspace_if_score" or f in ["hybrid_anomaly_score", "feature_pred_error"]:
-                        provenance.append("tabular")
-        
-        # Deduplicate provenance
-        provenance = list(set(provenance))
-        evidence["fusion_attributions"] = fusion_attributions
-        evidence["provenance"] = provenance
+        # Closed-form fusion breakdown — exact per-detector contribution to the
+        # score-level fusion (subspace / dense-IP / hybrid). Provenance is the
+        # ordered list of detectors that actually contributed (>0.5% share).
+        contrib = fusion_contrib.get(app_id, {})
+        evidence["fusion_contributions"] = contrib
+        evidence["provenance"] = [
+            DETECTOR_LABELS.get(k, k)
+            for k, c in sorted(contrib.items(), key=lambda kv: kv[1].get("share", 0.0), reverse=True)
+            if c.get("share", 0.0) > 0.005
+        ]
+
+        # Dense-block-IP membership evidence (the IP specialist)
+        dense_ip_score = dense_map.get(app_id, {}).get("dense_block_score_ip", 0.0)
+        dense_ip_ev = {"score": round(float(dense_ip_score), 6)}
+        if dense_ip_sorted.size and dense_ip_score > 0.0:
+            dense_ip_ev["percentile"] = round(_pct_rank(dense_ip_sorted, float(dense_ip_score)), 2)
+        evidence["dense_block_ip"] = dense_ip_ev
 
         card = {
             "application_id":       app_id,

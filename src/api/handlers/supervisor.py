@@ -6,12 +6,14 @@ POST /v3/supervisor/mark-false-positive
 GET  /v3/supervisor/patterns
 POST /v3/supervisor/patterns/confirm
 POST /v3/supervisor/patterns/promote
+"""
 import structlog
 from fastapi import APIRouter, HTTPException
 
 from src.api.schemas import (
-    ConfirmFraudRequest, 
+    ConfirmFraudRequest,
     FalsePositiveRequest,
+    ClearLabelRequest,
     ConfirmPatternRequest,
     PromotePatternRequest
 )
@@ -70,6 +72,23 @@ def mark_false_positive(req: FalsePositiveRequest):
         }
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+
+
+@router.post("/clear-label")
+def clear_label(req: ClearLabelRequest):
+    """Undo a supervisor label — removes the application from the confirmed and
+    false-positive stores so its state resets. Enables re-demoing the detection
+    loop (label a topology → retrain → detected → clear → repeat) and correcting
+    mis-clicks. 404 if the application had no label to clear."""
+    from src.confirmed_fraud_store import remove_label
+    result = remove_label(req.application_id)
+    if not (result["removed_confirmed"] or result["removed_false_positive"]):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No label to clear for '{req.application_id}' (not in confirmed or false-positive store)",
+        )
+    log.info("supervisor.clear_label", app_id=req.application_id, **result)
+    return {"status": "ok", "application_id": req.application_id, **result}
 
 
 @router.get("/patterns")
