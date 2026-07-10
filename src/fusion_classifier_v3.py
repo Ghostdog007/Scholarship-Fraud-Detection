@@ -41,6 +41,29 @@ def _minmax(x: np.ndarray) -> np.ndarray:
     return (x - lo) / (hi - lo + 1e-9)
 
 
+def score_level_fusion(
+    subspace_if_score: np.ndarray,
+    dense_block_score_ip: np.ndarray,
+    hybrid_anomaly_score: np.ndarray,
+) -> np.ndarray:
+    """
+    The LOCKED weighted score-level fusion (single source of truth).
+
+    risk = minmax( W_SUBSPACE*minmax(subspace)
+                 + W_DENSE_IP *minmax(dense_ip)
+                 + W_HYBRID   *minmax(hybrid) )
+
+    All inputs higher = more anomalous (hard stop #3). Label-independent: no
+    learned gate can bury a strong raw signal. Used by both run_fusion (production)
+    and compare_architectures_v3 (validation) so the two never drift.
+    """
+    s = _minmax(subspace_if_score)
+    d = _minmax(dense_block_score_ip)
+    h = _minmax(hybrid_anomaly_score)
+    combined = FUSION_W_SUBSPACE * s + FUSION_W_DENSE_IP * d + FUSION_W_HYBRID * h
+    return _minmax(combined)
+
+
 def run_fusion() -> None:
     print("[fusion] score-level fusion (V4 final) ...")
 
@@ -60,12 +83,11 @@ def run_fusion() -> None:
         merged["dense_block_score_ip"] = 0.0
         print("[fusion] dense-block disabled/absent -> IP specialist contributes 0")
 
-    s = _minmax(merged["subspace_if_score"].values)
-    d = _minmax(merged["dense_block_score_ip"].values)
-    h = _minmax(merged["hybrid_anomaly_score"].values)
-
-    combined = FUSION_W_SUBSPACE * s + FUSION_W_DENSE_IP * d + FUSION_W_HYBRID * h
-    risk = _minmax(combined).astype(np.float32)
+    risk = score_level_fusion(
+        merged["subspace_if_score"].values,
+        merged["dense_block_score_ip"].values,
+        merged["hybrid_anomaly_score"].values,
+    ).astype(np.float32)
 
     print(f"[fusion] weights: subspace={FUSION_W_SUBSPACE} dense_ip={FUSION_W_DENSE_IP} hybrid={FUSION_W_HYBRID}")
 

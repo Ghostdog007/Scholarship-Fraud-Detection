@@ -1,0 +1,248 @@
+{
+  "42": {
+    "locked_fusion": {
+      "conn_pr_auc_AGE_VIOLATION": 0.5809552297148011,
+      "conn_pr_auc_INCOME_VIOLATION": 0.6709245192161444,
+      "conn_pr_auc_IP_CONCENTRATION": 0.5591397201784193,
+      "conn_pr_auc_MOTHER_NAME_COLLISION": 0.7275699876984126,
+      "conn_pr_auc_FEE_INFLATION": 0.6639304999592152,
+      "mean_conn_pr_auc": 0.6405039913533985
+    },
+    "subspace_only": {
+      "conn_pr_auc_AGE_VIOLATION": 0.6808213281112435,
+      "conn_pr_auc_INCOME_VIOLATION": 0.9646097492911548,
+      "conn_pr_auc_IP_CONCENTRATION": 0.35239106911296103,
+      "conn_pr_auc_MOTHER_NAME_COLLISION": 0.779377358874324,
+      "conn_pr_auc_FEE_INFLATION": 0.9231683146807221,
+      "mean_conn_pr_auc": 0.7400735640140811
+    },
+    "hybrid_only": {
+      "conn_pr_auc_AGE_VIOLATION": 0.045829761040509724,
+      "conn_pr_auc_INCOME_VIOLATION": 0.032791059134413436,
+      "conn_pr_auc_IP_CONCENTRATION": 0.25296597076946814,
+      "conn_pr_auc_MOTHER_NAME_COLLISION": 0.5618155092857199,
+      "conn_pr_auc_FEE_INFLATION": 0.04516506636198025,
+      "mean_conn_pr_auc": 0.1877134733184183
+    },
+    "dense_ip_only": {
+      "conn_pr_auc_AGE_VIOLATION": 0.04810255108516309,
+      "conn_pr_auc_INCOME_VIOLATION": 0.034997426659804425,
+      "conn_pr_auc_IP_CONCENTRATION": 0.8381872616137506,
+      "conn_pr_auc_MOTHER_NAME_COLLISION": 0.039015952335191235,
+      "conn_pr_auc_FEE_INFLATION": 0.04147229854942808,
+      "mean_conn_pr_auc": 0.20035509804866752
+    }
+  },
+  "43": {
+    "locked_fusion": {
+      "conn_pr_auc_AGE_VIOLATION": 0.5650251160327296,
+      "conn_pr_auc_INCOME_VIOLATION": 0.7234813919374907,
+      "conn_pr_auc_IP_CONCENTRATION": 0.5963210953947229,
+      "conn_pr_auc_MOTHER_NAME_COLLISION": 0.7767376805269464,
+      "conn_pr_auc_FEE_INFLATION": 0.647889858475351,
+      "mean_conn_pr_auc": 0.6618910284734482
+    },
+    "subspace_only": {
+      "conn_pr_auc_AGE_VIOLATION": 0.6605851967003356,
+      "conn_pr_auc_INCOME_VIOLATION": 0.9744207011981874,
+      "conn_pr_auc_IP_CONCENTRATION": 0.3633197620280018,
+      "conn_pr_auc_MOTHER_NAME_COLLISION": 0.789709566656432,
+      "conn_pr_auc_FEE_INFLATION": 0.9238387278236716,
+      "mean_conn_pr_auc": 0.7423747908813256
+    },
+    "hybrid_only": {
+      "conn_pr_auc_AGE_VIOLATION": 0.05219426447674408,
+      "conn_pr_auc_INCOME_VIOLATION": 0.06625078461371381,
+      "conn_pr_auc_IP_CONCENTRATION": 0.3569322689648792,
+      "conn_pr_auc_MOTHER_NAME_COLLISION": 0.6890636151565189,
+      "conn_pr_auc_FEE_INFLATION": 0.054771910279929954,
+      "mean_conn_pr_auc": 0.2438425686983572
+    },
+    "dense_ip_only": {
+      "conn_pr_auc_AGE_VIOLATION": 0.04348935084810611,
+      "conn_pr_auc_INCOME_VIOLATION": 0.048344118766653975,
+      "conn_pr_auc_IP_CONCENTRATION": 0.7841545365007179,
+      "conn_pr_auc_MOTHER_NAME_COLLISION": 0.04128850824491883,
+      "conn_pr_auc_FEE_INFLATION": 0.04300114839862192,
+      "mean_conn_pr_auc": 0.19205553255180371
+    }
+  },
+  "44": {
+    "locked_fusion": {
+      "conn_pr_auc_AGE_VIOLATION": 0.6462252939590122,
+      "conn_pr_auc_INCOME_VIOLATION": 0.7216050784678922,
+      "conn_pr_auc_IP_CONCENTRATION": 0.5869460527274669,
+      "conn_pr_auc_MOTHER_NAME_COLLISION": 0.7514859595224508,
+      "conn_pr_auc_FEE_INFLATION": 0.672988435389427,
+      "mean_conn_pr_auc": 0.6758501640132499
+    },
+    "subspace_only": {
+      "conn_pr_auc_AGE_VIOLATION": 0.6764149113615567,
+      "conn_pr_auc_INCOME_VIOLATION": 0.9716397099266975,
+      "conn_pr_auc_IP_CONCENTRATION": 0.355544684100808,
+      "conn_pr_auc_MOTHER_NAME_COLLISION": 0.804050894389497,
+      "conn_pr_auc_FEE_INFLATION": 0.9204283493896109,
+      "mean_conn_pr_auc": 0.745615709833634
+    },
+    "hybrid_only": {
+      "conn_pr_auc_AGE_VIOLATION": 0.16042583853602682,
+      "conn_pr_auc_INCOME_VIOLATION": 0.07352124340751702,
+      "conn_pr_auc_IP_CONCENTRATION": 0.4784910316617965,
+      "conn_pr_auc_MOTHER_NAME_COLLISION": 0.44179385792269604,
+      "conn_pr_auc_FEE_INFLATION": 0.08690534228972141,
+      "mean_conn_pr_auc": 0.2482274627635516
+    },
+    "dense_ip_only": {
+      "conn_pr_auc_AGE_VIOLATION": 0.04701397712833545,
+      "conn_pr_auc_INCOME_VIOLATION": 0.04183966783775152,
+      "conn_pr_auc_IP_CONCENTRATION": 0.8249131530745298,
+      "conn_pr_auc_MOTHER_NAME_COLLISION": 0.045983590917763786,
+      "conn_pr_auc_FEE_INFLATION": 0.04036849849657732,
+      "mean_conn_pr_auc": 0.2000237774909916
+    }
+  },
+  "aggregate": {
+    "locked_fusion": {
+      "conn_pr_auc_AGE_VIOLATION": {
+        "mean": 0.597401879902181,
+        "std": 0.03513057975235173
+      },
+      "conn_pr_auc_INCOME_VIOLATION": {
+        "mean": 0.7053369965405091,
+        "std": 0.02434534979222914
+      },
+      "conn_pr_auc_IP_CONCENTRATION": {
+        "mean": 0.5808022894335364,
+        "std": 0.015788667587920465
+      },
+      "conn_pr_auc_MOTHER_NAME_COLLISION": {
+        "mean": 0.7519312092492699,
+        "std": 0.020075095516745554
+      },
+      "conn_pr_auc_FEE_INFLATION": {
+        "mean": 0.6616029312746643,
+        "std": 0.010377791118984925
+      },
+      "mean_conn_pr_auc": {
+        "mean": 0.6594150612800321,
+        "std": 0.014535835959956823
+      }
+    },
+    "subspace_only": {
+      "conn_pr_auc_AGE_VIOLATION": {
+        "mean": 0.6726071453910453,
+        "std": 0.008689056906420583
+      },
+      "conn_pr_auc_INCOME_VIOLATION": {
+        "mean": 0.9702233868053466,
+        "std": 0.004128613384546207
+      },
+      "conn_pr_auc_IP_CONCENTRATION": {
+        "mean": 0.35708517174725696,
+        "std": 0.004592668712158691
+      },
+      "conn_pr_auc_MOTHER_NAME_COLLISION": {
+        "mean": 0.7910459399734177,
+        "std": 0.010117155691740915
+      },
+      "conn_pr_auc_FEE_INFLATION": {
+        "mean": 0.9224784639646683,
+        "std": 0.001475260603804538
+      },
+      "mean_conn_pr_auc": {
+        "mean": 0.7426880215763468,
+        "std": 0.002273386632687692
+      }
+    },
+    "hybrid_only": {
+      "conn_pr_auc_AGE_VIOLATION": {
+        "mean": 0.08614995468442688,
+        "std": 0.05258521286096649
+      },
+      "conn_pr_auc_INCOME_VIOLATION": {
+        "mean": 0.057521029051881424,
+        "std": 0.017736843985655983
+      },
+      "conn_pr_auc_IP_CONCENTRATION": {
+        "mean": 0.36279642379871463,
+        "std": 0.09216354849417964
+      },
+      "conn_pr_auc_MOTHER_NAME_COLLISION": {
+        "mean": 0.5642243274549783,
+        "std": 0.10096182451582987
+      },
+      "conn_pr_auc_FEE_INFLATION": {
+        "mean": 0.06228077297721054,
+        "std": 0.01784843453239809
+      },
+      "mean_conn_pr_auc": {
+        "mean": 0.22659450159344238,
+        "std": 0.027551256399459767
+      }
+    },
+    "dense_ip_only": {
+      "conn_pr_auc_AGE_VIOLATION": {
+        "mean": 0.04620195968720155,
+        "std": 0.001968913973120696
+      },
+      "conn_pr_auc_INCOME_VIOLATION": {
+        "mean": 0.04172707108806997,
+        "std": 0.0054493458977378905
+      },
+      "conn_pr_auc_IP_CONCENTRATION": {
+        "mean": 0.8157516503963328,
+        "std": 0.02299034136729448
+      },
+      "conn_pr_auc_MOTHER_NAME_COLLISION": {
+        "mean": 0.042096017165957955,
+        "std": 0.0029012698194074414
+      },
+      "conn_pr_auc_FEE_INFLATION": {
+        "mean": 0.04161398181487577,
+        "std": 0.0010794341071335514
+      },
+      "mean_conn_pr_auc": {
+        "mean": 0.19747813603048758,
+        "std": 0.0038367446872977
+      }
+    }
+  },
+  "heldout": {
+    "AGE_VIOLATION_locked_fusion": 0.5691562574118992,
+    "AGE_VIOLATION_subspace_only": 0.6678867193141877,
+    "AGE_VIOLATION_hybrid_only": 0.04580270350262511,
+    "AGE_VIOLATION_dense_ip_only": 0.045133363040295374,
+    "INCOME_VIOLATION_locked_fusion": 0.7178757807219215,
+    "INCOME_VIOLATION_subspace_only": 0.9729085380807081,
+    "INCOME_VIOLATION_hybrid_only": 0.044026142014237046,
+    "INCOME_VIOLATION_dense_ip_only": 0.04385517593064763,
+    "IP_CONCENTRATION_locked_fusion": 0.31465998649058446,
+    "IP_CONCENTRATION_subspace_only": 0.3302137369583703,
+    "IP_CONCENTRATION_hybrid_only": 0.1401208717655664,
+    "IP_CONCENTRATION_dense_ip_only": 0.18794006160223103,
+    "MOTHER_NAME_COLLISION_locked_fusion": 0.7411938681746904,
+    "MOTHER_NAME_COLLISION_subspace_only": 0.8000503751539195,
+    "MOTHER_NAME_COLLISION_hybrid_only": 0.5363687307894849,
+    "MOTHER_NAME_COLLISION_dense_ip_only": 0.044829342842587876,
+    "FEE_INFLATION_locked_fusion": 0.691659904463567,
+    "FEE_INFLATION_subspace_only": 0.9380178590820778,
+    "FEE_INFLATION_hybrid_only": 0.05004932181886965,
+    "FEE_INFLATION_dense_ip_only": 0.04561939301393396
+  },
+  "_meta": {
+    "harness": "locked score-level fusion (LightGBM removed)",
+    "weights": {
+      "subspace": 1.0,
+      "dense_ip": 0.5,
+      "hybrid": 0.3
+    },
+    "dense_block_relation": "dense_block_score_ip",
+    "seeds": [
+      42,
+      43,
+      44
+    ],
+    "detectors": "frozen pretrained models/hybrid_v3_seed{seed}.pth",
+    "note": "3 seeds; H.6 formal gate wants >3 \u2014 treat as proposed, pending a 4th seed."
+  }
+}
