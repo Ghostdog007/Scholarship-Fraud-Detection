@@ -1,0 +1,255 @@
+# =============================================================================
+# NIC Fraud Detection V3 — Kubernetes manifests
+# Target: single Ubuntu 22.04 server, 16 vCPU / 64 GB RAM, NO GPU, remote access.
+#
+# This mirrors docker-compose.yml one-to-one:
+#   redis        -> Redis broker (Deployment + Service)
+#   nic-api      -> FastAPI server (Deployment + Service, named `nic-api`)
+#   nic-worker   -> Celery worker (Deployment, SINGLETON — see below)
+#   nginx        -> front door (Deployment + Service, the only exposed entry)
+#
+# The nginx config (deploy/nginx/default.conf) proxies to the Service named
+# `nic-api`, so it is byte-identical between compose and k8s.
+#
+# ---- Before applying ----
+# Build and make both images visible to the cluster (example for k3s/containerd):
+#   docker build -f Dockerfile            -t nic-fraud-api:latest   .
+#   docker build -f deploy/nginx/Dockerfile -t nic-fraud-nginx:latest .
+#   # k3s:      sudo k3s ctr images import <(docker save nic-fraud-api:latest)
+#   # microk8s: docker save nic-fraud-api:latest | microk8s ctr image import -
+#   # or push both to a registry and set the image: fields below accordingly.
+#
+#   kubectl apply -f deploy/k8s/nic-fraud.yaml
+#
+# ---- Storage: THE ONE NON-TRIVIAL PORT ISSUE ----
+# nic-api (reads outputs/models/data) and nic-worker (WRITES them) share the
+# same three directories. In compose that's a host bind mount; in k8s it must
+# be a ReadWriteMany (RWX) PersistentVolume so both pods mount the same data.
+# On a single-node server the simplest RWX options are a hostPath PV or an NFS
+# export. The PVC below requests RWX — provide a matching StorageClass/PV, or
+# swap in the hostPath PV block at the bottom (commented) for a single node.
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nic-fraud
+---
+# ---- Shared state (data / models / outputs) --------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nic-storage
+  namespace: nic-fraud
+spec:
+  accessModes:
+    - ReadWriteMany          # REQUIRED: api + worker mount this simultaneously
+  resources:
+    requests:
+      storage: 20Gi
+  # storageClassName: nfs-client   # set to your RWX class (or use hostPath PV below)
+---
+# ---- Redis broker ----------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: nic-fraud
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: nic-fraud
+spec:
+  selector: { app: redis }
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+# ---- FastAPI server --------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nic-api
+  namespace: nic-fraud
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: nic-api }
+  template:
+    metadata:
+      labels: { app: nic-api }
+    spec:
+      containers:
+        - name: nic-api
+          image: nic-fraud-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - containerPort: 8000
+          env:
+            - name: CELERY_BROKER_URL
+              value: redis://redis:6379/0
+            - name: CELERY_RESULT_BACKEND
+              value: redis://redis:6379/0
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits:   { cpu: "2",    memory: "4Gi" }
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - { name: shared, mountPath: /app/data,    subPath: data }
+            - { name: shared, mountPath: /app/models,  subPath: models }
+            - { name: shared, mountPath: /app/outputs, subPath: outputs }
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: nic-storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nic-api                 # MUST stay `nic-api` — nginx proxies to this name
+  namespace: nic-fraud
+spec:
+  selector: { app: nic-api }
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+# ---- Celery worker (SINGLETON) ---------------------------------------------
+# AGENTS.md hard stop #16: concurrency=1 AND never more than one worker. In k8s
+# that means replicas:1 PLUS strategy Recreate — a RollingUpdate would briefly
+# run the old and new worker pods together, double-writing fixed output paths
+# and corrupting intermediates. Recreate tears the old pod down first.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nic-worker
+  namespace: nic-fraud
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: nic-worker }
+  template:
+    metadata:
+      labels: { app: nic-worker }
+    spec:
+      containers:
+        - name: nic-worker
+          image: nic-fraud-api:latest       # same image as the API
+          imagePullPolicy: IfNotPresent
+          command:
+            - celery
+            - -A
+            - src.api.tasks.celery_app
+            - worker
+            - --loglevel=info
+            - --concurrency=1
+            - -Q
+            - nic_fraud
+          env:
+            - name: CELERY_BROKER_URL
+              value: redis://redis:6379/0
+            - name: CELERY_RESULT_BACKEND
+              value: redis://redis:6379/0
+          resources:
+            # CPU-only training (no GPU on this server). Give it headroom; the
+            # box has 16 vCPU / 64 GB. Training here is slow by design — the
+            # intended path is GPU-train elsewhere, ship the .pth via
+            # upload-checkpoint / dvc pull (Dockerfile note).
+            requests: { cpu: "2",  memory: "4Gi" }
+            limits:   { cpu: "8",  memory: "16Gi" }
+          volumeMounts:
+            - { name: shared, mountPath: /app/data,    subPath: data }
+            - { name: shared, mountPath: /app/models,  subPath: models }
+            - { name: shared, mountPath: /app/outputs, subPath: outputs }
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: nic-storage
+---
+# ---- nginx front door ------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: nic-fraud
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: nginx }
+  template:
+    metadata:
+      labels: { app: nginx }
+    spec:
+      containers:
+        - name: nginx
+          image: nic-fraud-nginx:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet: { path: /, port: 80 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  namespace: nic-fraud
+spec:
+  # NodePort exposes the console at http://<server-ip>:30080 with no ingress
+  # controller needed — good for a single remote-accessed server. Switch to
+  # type: LoadBalancer (cloud) or add an Ingress if you have a controller.
+  type: NodePort
+  selector: { app: nginx }
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30080
+---
+# =============================================================================
+# OPTIONAL: single-node hostPath storage (uncomment INSTEAD of a StorageClass
+# if you have no RWX provisioner). Pins nothing; the directory lives on the
+# server's disk and both pods share it because they land on the same node.
+# Create it first:  sudo mkdir -p /srv/nic-fraud && sudo chmod 777 /srv/nic-fraud
+# =============================================================================
+# apiVersion: v1
+# kind: PersistentVolume
+# metadata:
+#   name: nic-storage-pv
+# spec:
+#   capacity: { storage: 20Gi }
+#   accessModes: [ReadWriteMany]
+#   persistentVolumeReclaimPolicy: Retain
+#   storageClassName: ""
+#   hostPath:
+#     path: /srv/nic-fraud
+# (then set the PVC's storageClassName: "" and volumeName: nic-storage-pv)

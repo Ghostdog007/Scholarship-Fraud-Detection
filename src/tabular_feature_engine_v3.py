@@ -22,6 +22,7 @@ from src.config_v3 import (
     DEGREE_FEATURES,
     DUPLICATE_COLS_TO_DROP,
     EXCLUDED_FROM_FEATURES,
+    IDENTIFIER_FEATURES,
     LOG1P_COLS,
     N_FEATURES,
     NULL_COLS_TO_DROP,
@@ -221,6 +222,13 @@ def add_degree_features() -> None:
         base_df[col] = scaler.fit_transform(base_df[[col]])
 
     feature_cols     = [c for c in base_df.columns if c != "application_id"]
+    # V4 adoption (2026-07-15): drop the nominal identifier/code features from the
+    # MODEL feature set. They carry no ordinal meaning for the reconstruction
+    # detector and polluted the XAI narratives; their sharing signal survives via
+    # the RAW-built graph edges + degree/count features. See noid ablation.
+    dropped_ids      = [c for c in feature_cols if c in IDENTIFIER_FEATURES]
+    feature_cols     = [c for c in feature_cols if c not in IDENTIFIER_FEATURES]
+    base_df          = base_df[["application_id"] + feature_cols]
     base_features    = [c for c in feature_cols if c not in DEGREE_FEATURES]
     aggregation_feats = [
         "mobile_application_count", "ip_application_count",
@@ -241,6 +249,7 @@ def add_degree_features() -> None:
         "degree_features": DEGREE_FEATURES,
         "log1p_cols": LOG1P_COLS,
         "excluded": list(EXCLUDED_FROM_FEATURES),
+        "dropped_from_model": sorted(dropped_ids),
         "n_features": n_total,
         "timestamp": datetime.utcnow().isoformat(),
     }

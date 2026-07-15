@@ -26,9 +26,12 @@ training_log.txt
 /models
 /outputs
 
-# MLflow experiment tracking (local file-based, not committed to git)
+# Retired MLflow leftovers (MLflow removed — run history now in outputs/model_registry.json)
 mlruns/
 mlflow.db
+
+# Editor / shell crash dumps
+*.stackdump
 
 # Ablation checkpoint backup scratch
 .ablation_backup/
@@ -38,4 +41,7 @@ mlflow.db
 
 # DVC cache (content-addressed, managed by DVC — not git)
 /data/processed/
+
+# Local reversibility backup of the 68-feature artifacts (large .pth/.csv)
+backup_68feat/
 

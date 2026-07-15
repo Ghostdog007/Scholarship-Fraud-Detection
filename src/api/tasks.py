@@ -36,6 +36,19 @@ def run_full_pipeline_task(self, smoke_test: bool = False):
         raise RuntimeError(
             f"Pipeline failed (rc={result.returncode}): {result.stderr[-1000:]}"
         )
+    # Record the full run in the local registry (MLflow replacement).
+    from src.model_registry import log_run
+    from pathlib import Path as _Path
+    ckpt = _Path("models/hybrid_graphmcm_v3.pth")
+    log_run(
+        "full",
+        cycle="full_pipeline",
+        smoke_test=smoke_test,
+        checkpoint={
+            "path":    str(ckpt),
+            "size_mb": round(ckpt.stat().st_size / 1e6, 2) if ckpt.exists() else None,
+        },
+    )
     return {
         "status": "complete",
         "smoke_test": smoke_test,
@@ -48,10 +61,10 @@ def run_validate_checkpoint_task(
     self,
     temp_path: str,
     cycle: str = "unknown",
-    mlflow_run_id: str = "none",
+    source_ref: str = "none",
 ):
     from src.checkpoint_manager import validate_and_hotswap
-    result = validate_and_hotswap(Path(temp_path), cycle=cycle, mlflow_run_id=mlflow_run_id)
+    result = validate_and_hotswap(Path(temp_path), cycle=cycle, source_ref=source_ref)
     return {"status": "complete", **result}
 
 

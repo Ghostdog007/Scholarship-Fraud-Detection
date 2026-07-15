@@ -1,6 +1,25 @@
 import os  # V4_SEED env override for multi-seed ablation runs
 
-N_FEATURES      = 68
+# N_FEATURES is the model feature-vector width. Adopted 44 on 2026-07-15: the 24
+# nominal identifier/code features in IDENTIFIER_FEATURES were dropped from the
+# detector input (noid ablation — safe, no regression at detector or fused level;
+# see project memory 'noisy-identifier-feature-drop'). The V4_N_FEATURES env
+# override lets the ablation harness reconstruct the old 68-feature control.
+N_FEATURES      = int(os.environ.get("V4_N_FEATURES", "44"))
+
+# Nominal identifier / code features dropped from the MODEL feature set (single
+# source of truth — consumed by tabular_feature_engine_v3 to shrink the schema and
+# by xai_layer_v3 as the never-narrated set). Their sharing signal is preserved by
+# the graph edges (built from RAW columns) + degree/count features, all kept.
+IDENTIFIER_FEATURES = [
+    "mobile_no", "aadhaar_vault_ref_token", "permanent_pincode",
+    "village_id", "sub_district_id", "permanent_district_id",
+    "c_institution_id", "c_course_id", "p_university_id", "p_course_id",
+    "x_university_id", "pfms_district_code", "lgd_district_code",
+    "domicile_state_id", "category_id", "inst_verify_by", "state_verify_by",
+    "religion", "marital_status", "parent_occupation", "disablity_type",
+    "application_level", "modeofstudy", "pre_post_matric",
+]
 N_EDGE_TYPES    = 5
 MASK_NUM        = 8
 GRAPH_HIDDEN    = 128

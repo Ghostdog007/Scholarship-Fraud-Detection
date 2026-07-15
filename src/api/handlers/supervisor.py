@@ -126,17 +126,29 @@ def promote_patterns(req: PromotePatternRequest):
         promoted = promote(req.pattern_ids)
         log.info("supervisor.promote_patterns", n_promoted=len(promoted), pattern_ids=req.pattern_ids)
         
-        # trigger retrain
+        # Trigger retrain. Two bugs fixed here:
+        #   1. The old code imported `run_incremental_finetune`, which does not
+        #      exist in src/api/tasks.py — the real task is `run_incremental_task`
+        #      (name="tasks.run_incremental"), taking (cycle, smoke_test). The old
+        #      import would have raised ImportError on the first promote call.
+        #   2. The old code manufactured a `job_id` string but dispatched with
+        #      `.delay()`, so Celery assigned a DIFFERENT id. GET
+        #      /v3/training/jobs/{job_id} polls by Celery task id via
+        #      AsyncResult(job_id), so the returned job_id could never be found.
+        #
+        # Fix: pin the Celery task_id to our job_id via apply_async(task_id=...),
+        # so the id returned to the client IS the id Celery tracks. Promotion
+        # retrains on the existing (now pattern-augmented) data, so this uses the
+        # incremental orchestrator — no dataset_path needed.
         import uuid
         job_id = f"job_retrain_{uuid.uuid4().hex[:8]}"
-        
-        from src.api.tasks import run_incremental_finetune
-        run_incremental_finetune.delay(
-            dataset_path="data/raw/new_cohort_2026.csv", # dummy path since we are retraining on existing data
-            job_id=job_id,
-            smoke_test=req.smoke_test
+
+        from src.api.tasks import run_incremental_task
+        run_incremental_task.apply_async(
+            kwargs=dict(cycle="pattern_promotion", smoke_test=req.smoke_test),
+            task_id=job_id,
         )
-        
+
         return {
             "status": "ok",
             "message": f"Promoted {len(promoted)} patterns. Retrain dispatched.",

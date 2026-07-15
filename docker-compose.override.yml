@@ -1,0 +1,14 @@
+# docker-compose.override.yml — LOCAL DEVELOPMENT ONLY.
+#
+# Auto-merged by `docker compose up`. NOT used when a deploy explicitly targets
+# the base file only:
+#   docker compose -f docker-compose.yml up --build   # prod-equivalent, no override
+#
+# Purpose: bind-mount ./frontend over the baked-in copy so editing
+# index.html/app.js/style.css takes effect on browser refresh (no image
+# rebuild). The base image already contains frontend/ via the Dockerfile COPY;
+# this just shadows it with a live host mount for iteration speed.
+services:
+  nginx:
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro

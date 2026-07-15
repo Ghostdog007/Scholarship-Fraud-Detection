@@ -207,14 +207,14 @@ data/raw/data_for_ml_model.csv  (15,000 × 136)
   │   Feature Engine (V3)      │
   │   63 features + log1p      │
   │   + 5 degree-aware features│
-  │   = 68 total               │
+  │   = 44 total               │
   └────────────┬───────────────┘
-               │ engineered_features_v3.csv (N × 68)
+               │ engineered_features_v3.csv (N × 44)
                │
        ┌───────┴───────┐
        ▼               ▼
   Graph Builder    Synthetic Exposure
-  5 typed edges    750 × 68 anomaly set
+  5 typed edges    750 × 44 anomaly set
   (mobile, IP,     (5 archetypes × 150)
    names, pincode) graph-side LOE only
        │               │
@@ -228,7 +228,7 @@ data/raw/data_for_ml_model.csv  (15,000 × 136)
   │  │                  │  │                  │ │
   │  │  8 Learned Masks │  │  RGCN Encoder    │ │
   │  │  masked_x_i      │  │  aggr='add'+tanh │ │
-  │  │  (68-dim)        │  │  h_N(i) (64-dim) │ │
+  │  │  (44-dim)        │  │  h_N(i) (64-dim) │ │
   │  └────────┬─────────┘  └────────┬─────────┘ │
   │           │                     │            │
   │           └──────────┬──────────┘            │
@@ -241,7 +241,7 @@ data/raw/data_for_ml_model.csv  (15,000 × 136)
   │           ▼                     ▼            │
   │   Feature Pred Error     Edge Pred Error     │
   │   |predicted - actual|²  P(edge|x_i, h_N(i))│
-  │   per-feature (68-d)     per-edge-type (5-d) │
+  │   per-feature (44-d)     per-edge-type (5-d) │
   │           │                     │            │
   │           └──────────┬──────────┘            │
   │                      ▼                       │
@@ -295,8 +295,8 @@ forward pass, where they inform each other during both training and inference.
 
 ### Why keep the Subspace IF
 
-The hybrid's feature prediction averages error across 8 masks and 68 features.
-A near-zero income (1 feature out of 68) might not dominate that average even
+The hybrid's feature prediction averages error across 8 masks and 44 features.
+A near-zero income (1 feature out of 44) might not dominate that average even
 with graph context amplifying it. The subspace IF focuses the full statistical
 capacity of isolation forest onto 3 small feature groups where marginal outliers
 matter. It requires no training, runs instantly, and was the decisive scorer on
@@ -381,15 +381,17 @@ NIC fraud Detection Project/
 ├── main_v3.py                              # Pipeline orchestrator (V3)
 ├── README.md                               # This file
 ├── Dockerfile                              # CPU image (python:3.12-slim)
-├── docker-compose.yml                      # Redis + nic-api + nic-worker
+├── docker-compose.yml                      # Redis + nic-api + nic-worker + nginx
+├── docker-compose.override.yml             # Dev-only frontend hot-mount (auto-merged)
 ├── celeryconfig.py                         # Celery broker/worker config (concurrency=1)
 ├── requirements-docker.txt                 # Linux min-version pins for Docker builds
 │
 ├── src/
 │   ├── config_v3.py                        # All dimension constants (single source of truth)
-│   ├── tabular_feature_engine_v3.py        # 63 features + degree merge = 68
+│   ├── model_registry.py                   # Run/metric/checkpoint history (replaces MLflow)
+│   ├── tabular_feature_engine_v3.py        # engineer, then drop 24 identifiers → 44
 │   ├── graph_builder_v3.py                 # 5 typed edges + degree computation
-│   ├── synthetic_exposure_builder_v3.py    # 750 × 68 LOE tensor (graph-side only)
+│   ├── synthetic_exposure_builder_v3.py    # 750 × 44 LOE tensor (graph-side only)
 │   ├── hybrid_graphmcm_v3.py               # Core model: feature stream + graph stream
 │   ├── subspace_if_v3.py                   # 3-group subspace isolation forest (tabular backbone)
 │   ├── dense_block_detector_v3.py          # FRAUDAR greedy peeling on shares_ip (IP specialist)
@@ -404,19 +406,19 @@ NIC fraud Detection Project/
 │       ├── schemas.py                      # Pydantic request/response models
 │       ├── tasks.py                        # Celery task definitions (5 tasks)
 │       └── handlers/
-│           ├── supervisor.py               # POST confirm-fraud, mark-false-positive
-│           ├── training.py                 # POST incremental/full, GET jobs/{id}, upload/pull checkpoint
-│           ├── monitoring.py               # GET drift, fraud-store-summary
-│           └── model.py                    # GET checkpoint-info, POST rollback
+│           ├── supervisor.py               # POST confirm-fraud, mark-false-positive, patterns/*
+│           ├── training.py                 # POST incremental/full/decision, GET jobs/{id}, upload/pull checkpoint
+│           ├── monitoring.py               # GET drift, fraud-store-summary, top-suspicious, {id}/card|ring|topology|export, export/bulk; POST evaluate-dataset, upload-dataset
+│           └── model.py                    # GET checkpoint-info, stats, registry; POST rollback
 │
 ├── data/
 │   ├── raw/data_for_ml_model.csv           # 15,000 × 136 (unchanged)
 │   └── processed/
-│       ├── engineered_features_v3.csv      # N × 68
+│       ├── engineered_features_v3.csv      # N × 44
 │       ├── v3_feature_schema.json
 │       ├── identity_graph_v3.pt
 │       ├── degree_features_v3.csv          # N × 5 per-edge-type degrees
-│       ├── synthetic_exposure_set_v3.pt    # 750 × 68
+│       ├── synthetic_exposure_set_v3.pt    # 750 × 44
 │       └── confirmed_fraud.json            # Supervisor feedback store (confirmed + false positives)
 │
 ├── models/
@@ -429,12 +431,22 @@ NIC fraud Detection Project/
 │   ├── evt_thresholds_v3.json
 │   ├── pseudo_labels_v3.json
 │   ├── risk_scores_v3.csv
-│   └── explanation_cards_v3.json
+│   ├── explanation_cards_v3.json
+│   └── model_registry.json                 # Run/metric/checkpoint history (replaces MLflow)
+│
+├── frontend/                               # Review console (vanilla HTML/CSS/JS, nginx-served)
+│   ├── index.html · app.js · style.css · config.js
+│
+├── deploy/
+│   ├── README.md                           # Local Docker + Kubernetes deploy guide
+│   ├── nginx/                              # front-door image (serves frontend + proxies API)
+│   └── k8s/nic-fraud.yaml                  # Kubernetes manifests
 │
 └── docs/
     ├── AGENTS.md                           # Architecture contract (do not edit autonomously)
-    ├── OPERATIONS_RUNBOOK.md               # Yearly operational cycle guide
-    └── API_TESTING_GUIDE.md                # Manual curl testing guide for all 13 endpoints
+    ├── IMPLEMENTATION.md                   # Settled V4 detection architecture
+    ├── OPERATIONS_RUNBOOK.md               # Start Docker → open the console → what each screen does
+    └── API_TESTING_GUIDE.md                # Manual curl testing guide for the API
 ```
 
 ---
@@ -454,115 +466,78 @@ python main_v3.py
 .\.venv\Scripts\python.exe src/evaluate_model_v3.py
 ```
 
-### Docker (API + async worker)
+### Docker (console + API + async worker)
 
 ```powershell
-# First time — builds the image (~5 min):
+# First time — builds the images (~5 min):
 docker compose up --build
 
 # Every subsequent start:
 docker compose up -d
 
-# API is now at http://localhost:8000
-# Swagger UI (all 13 endpoints): http://localhost:8000/docs
-# Full manual testing guide: docs/API_TESTING_GUIDE.md
-
+# Review console (the UI):        http://localhost:8080/
+# Swagger UI (proxied):           http://localhost:8080/docs
+# API direct (debugging):         http://localhost:8000/health
 # Stop:
 docker compose down
 ```
 
-Docker starts three containers: `redis` (broker), `nic-api` (FastAPI on port 8000),
-`nic-worker` (Celery, concurrency=1). Training jobs dispatched via the API run
-inside `nic-worker` and write to the mounted `data/`, `models/`, `outputs/` volumes.
+Docker starts four containers: `redis` (broker), `nic-api` (FastAPI), `nic-worker`
+(Celery, concurrency=1), and `nginx` (the **front door** — serves the `frontend/`
+console and reverse-proxies the API, so the browser only needs `:8080`). Training
+jobs dispatched from the console run inside `nic-worker` and write to the mounted
+`data/`, `models/`, `outputs/` volumes.
+
+For operating the console screen-by-screen see `docs/OPERATIONS_RUNBOOK.md`; for
+the full local + Kubernetes deployment (storage, worker-singleton, no-GPU notes)
+see `deploy/README.md`; for raw endpoint testing see `docs/API_TESTING_GUIDE.md`.
 
 ---
 
-## MLflow Audit Guide
+## Model Audit (in the console — MLflow retired)
 
-Every pipeline run is logged to `mlflow.db` (SQLite, project root).
-This covers how to open the UI and where to find each auditable artefact.
+MLflow has been removed. Model state, run history, and the deployment loop now
+live in the **console's "Model audit & deploy" tab** (`http://localhost:8080/`),
+backed by a local JSON registry (`outputs/model_registry.json`) that the
+pipeline writes on every training run and checkpoint swap. No MLflow server, no
+`mlflow.db`, no `mlruns/`.
 
-### Starting the UI
+What the tab surfaces:
 
-```bat
-mlflow_ui.bat
-```
+- **Running-model status strip** — live checkpoint (size, feature/edge counts),
+  scored-population size, confirmed/false-positive counts, drift recommendation,
+  last-eval PR-AUC, and the last run. `GET /v3/model/stats`.
+- **Deployment loop** — upload a cohort CSV (schema-validated) → evaluate
+  read-only (drift + preview) → human-gated decide (incremental / full /
+  no-action, or retrain on current data) → watch the job.
+- **Run history** — every training run and checkpoint swap, newest first, with
+  metrics and checkpoint size. `GET /v3/model/registry`.
+- **Rollback** — restore any versioned checkpoint.
 
-Then open **http://localhost:5000** in your browser.
-The batch file always points the UI at the correct `mlflow.db` — do not
-run `mlflow ui` manually without it or runs will not appear.
-
----
-
-### Navigation map
-
-```
-http://localhost:5000
-│
-├── Experiments (left sidebar)
-│   └── nic-fraud-detection-v3          ← click this
-│       └── Runs table (one row per pipeline execution)
-│           └── [click any run]
-│               ├── Overview tab        ← cycle label, duration, smoke-test flag
-│               ├── Model Metrics tab   ← PR-AUC per fraud category (chart view)
-│               ├── Parameters tab      ← all 23 config_v3 constants used for this run
-│               └── Artifacts tab       ← all output files (see below)
-```
-
----
-
-### Artifacts tab — what to look at and why
-
-| Folder | File | What it tells you |
-|---|---|---|
-| `suspicious/` | `top_suspicious_v3.tsv` | **Start here.** Top 20 highest-risk applications with risk score, anomalous features (human-readable labels), linked application IDs, EVT triggers, and full narrative recommendation. Open in Excel for best readability. |
-| `xai/` | `explanation_cards_v3.json` | Full 500 explanation cards. Each card has `review_status`, `top_feature_errors` (with `feature_label`, model-`expected` value, and population percentiles), `top_graph_neighbors` (with actual application IDs), an `evidence` object (risk rank/percentile, EVT crossings vs thresholds, subspace detector scores, graph-degree percentiles), and a `narrative` composed deterministically from that evidence. Download and open in VS Code — search by application ID. |
-| `scores/` | `risk_scores_v3.csv` | Risk score for all 15,000 applications. Columns: `application_id`, `risk_score_v3`, `label_source`. Sort descending to get the full ranked list beyond the top 500. |
-| `thresholds/` | `evt_thresholds_v3.json` | EVT threshold for each of the 6 signals (hybrid, subspace_if, financial, identity, network, edge). Records the GPD fit params (`scale`, `shape`) and how many applications crossed each threshold. Useful for auditing whether thresholds are reasonable. |
-| `labels/` | `pseudo_labels_v3.json` | The 13 applications promoted to pseudo-positive in Round 0 self-training. Each record shows which EVT signals fired. Review before any Round 1 is authorised. |
-| `checkpoints/` | `hybrid_graphmcm_v3.pth` | Model weights used for this run. Download to reproduce scores exactly on the same data. |
-
----
-
-### Metrics tab — what the numbers mean
-
-| Metric | What it means | Pass threshold |
-|---|---|---|
-| `pr_auc_age_violation` | Precision-Recall AUC for detecting fake age fields | > 0.1466 (V2 floor) |
-| `pr_auc_income_violation` | PR-AUC for declared income anomalies | > 0.6503 |
-| `pr_auc_ip_concentration` | PR-AUC for IP address clustering fraud | > 0.0370 |
-| `pr_auc_mother_name_collision` | PR-AUC for shared mother-name rings | > 0.2869 |
-| `pr_auc_fee_inflation` | PR-AUC for inflated tuition fee declarations | > 0.4962 |
-| `score_retention` | How much risk score survives when graph edges are removed (isolated-node robustness). > 1.0 means feature signal alone is sufficient. | > 1.0 |
-| `n_categories_pass` | Number of fraud categories beating the V2 floor. Should be 5/5. | 5 |
-| `pipeline_duration_seconds` | Wall-clock time for the run | — |
-
----
-
-### Comparing two runs
-
-1. In the runs table, tick the checkboxes on two rows.
-2. Click **Compare** (top of table).
-3. MLflow shows a side-by-side diff of all params and metrics — useful for
-   checking whether a config change improved PR-AUC or shifted thresholds.
-
----
-
-### Re-running XAI only (without retraining)
-
-If you want a fresh MLflow run using existing scores (e.g. after editing
-the XAI layer), run:
-
-```bat
-.venv\Scripts\python.exe main_v3.py --steps=xai,evaluate --cycle=<label>
-```
-
-This completes in ~15 seconds and logs a new run with updated explanation
-cards and the top-suspicious TSV.
+The PR-AUC pass floors still apply (age > 0.1466, income > 0.6503, ip > 0.0370,
+mother-name > 0.2869, fee > 0.4962; 5/5 categories) — they're computed by
+`evaluate_model_v3.py` and recorded as run metrics in the registry. For the
+screen-by-screen operator walkthrough see `docs/OPERATIONS_RUNBOOK.md`.
 
 ---
 
 ## Changelog
+
+### 2026-07-10 — Review console + nginx front door, MLflow retired
+
+Added a browser **review console** (`frontend/`, vanilla HTML/CSS/JS) served by
+an **nginx front door** (`deploy/nginx/`) that also reverse-proxies the API — one
+origin at `http://localhost:8080/`, portable unchanged to Kubernetes
+(`deploy/k8s/nic-fraud.yaml`, see `deploy/README.md`). Three tabs: review queue
+(embeds the XAI cards + a topology detail modal), pattern queue, and a **model
+audit & deploy** console (status strip + CSV-upload → evaluate → decide → watch
+loop + run history + rollback). **MLflow fully removed** and replaced by a local
+registry (`src/model_registry.py` → `outputs/model_registry.json`); new endpoints
+`GET /v3/model/stats`, `GET /v3/model/registry`, `POST /v3/monitoring/upload-dataset`.
+Fixes: `promote_patterns` job_id/task bug; global NaN/inf→null JSON encoder so no
+endpoint 500s on non-finite floats. `docs/OPERATIONS_RUNBOOK.md` rewritten as a
+console operator guide; `docs/DEPLOYMENT_PLAN.md` (draft) removed, superseded by
+`deploy/README.md`.
 
 ### 2026-07-02 — MLOps Phase 2: REST API, async jobs, checkpoint manager, Docker
 
@@ -667,7 +642,7 @@ explanation cards usable by fraud reviewers (not just data scientists):
 
 | Issue | Fix |
 |---|---|
-| Raw database column names (`inst_verify_by`) unreadable by reviewers | Added `FEATURE_LABELS` dict mapping all 68 columns to human-readable display names (e.g. "Institution verifier code"). `feature_label` field added to every `top_feature_errors` entry. |
+| Raw database column names (`inst_verify_by`) unreadable by reviewers | Added `FEATURE_LABELS` dict mapping all 44 model columns to human-readable display names (e.g. "Institution verifier code"). `feature_label` field added to every `top_feature_errors` entry. |
 | `label_source: "negative"` misleading when risk = 1.0 | Replaced with `review_status` field using plain-English strings (e.g. "Pending Review — no confirmed fraud label assigned yet"). |
 | `triggers: []` with high risk score unexplained | Narrative now explicitly states when the hybrid model's collective anomaly score drives suspicion without a single EVT threshold crossing. |
 | `neighbor_idx: 8534` (raw array index) unresolvable by reviewers | `top_graph_neighbors` now contains `application_id` (actual portal ID) instead of internal array index. Reviewers can cross-reference directly. |

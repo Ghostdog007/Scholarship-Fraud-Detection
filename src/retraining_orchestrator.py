@@ -27,11 +27,12 @@ Incremental update order:
   5. Run self-training (confirmed fraud already in store — bypasses EVT)
   6. Retrain LightGBM fusion with confirmed fraud at 3× sample weight
 
-MLflow (ADR-002): every incremental update run is logged under the
-  "nic-fraud-detection-v3-incremental" experiment.
-  - Tags: cycle label, n_confirmed_fraud
-  - Metrics: KS p-value, PR-AUC after update (from evaluate_model_v3)
-  - Artifacts: checkpoint after update
+Run history (ADR-011, MLflow retired): every incremental update run is logged to
+  the local registry (src.model_registry -> outputs/model_registry.json).
+  - params: cycle label, freeze_rgcn
+  - metrics: n_confirmed_fraud, n_drifted_features, PR-AUC after update
+  - checkpoint: live path + size after update
+  The console's model-status strip and history table read this file directly.
 
 Feature drift (ADR-009): per-feature KS test logged to
   outputs/feature_drift_v3.json after each incremental cycle.
@@ -48,8 +49,6 @@ from scipy.stats import ks_2samp
 from src.config_v3 import DRIFT_KS_THRESHOLD
 
 _PROJECT_ROOT  = Path(__file__).parent.parent.resolve()
-_MLRUNS_DIR    = _PROJECT_ROOT / "mlruns"
-_MLFLOW_DB_URI = f"sqlite:///{_PROJECT_ROOT / 'mlflow.db'}"
 
 SCORES_CSV        = Path("outputs/hybrid_scores_v3.csv")
 PREV_KS_JSON      = Path("outputs/prev_cycle_scores_ks.json")
@@ -165,12 +164,6 @@ def run_incremental_update(smoke_test: bool = False, cycle: str = "unknown") -> 
     from src.self_training_loop_v3 import run_self_training
     from src.fusion_classifier_v3 import run_fusion
 
-    try:
-        import mlflow
-        mlflow_available = True
-    except ImportError:
-        mlflow_available = False
-
     def _body() -> dict:
         print("\n[orchestrator] ══ Incremental update pipeline starting ══")
         fraud_summary()
@@ -219,27 +212,31 @@ def run_incremental_update(smoke_test: bool = False, cycle: str = "unknown") -> 
                 "n_drifted_features": len([k for k, v in drift_report.items() if v.get("drifted")]),
                 **metrics}
 
-    if mlflow_available:
-        import mlflow
-        mlflow.set_tracking_uri(_MLFLOW_DB_URI)
-        mlflow.set_experiment("nic-fraud-detection-v3-incremental")
-        with mlflow.start_run(tags={"cycle": cycle, "smoke_test": str(smoke_test), "run_type": "incremental"}):
-            result = _body()
-            mlflow.log_param("cycle", cycle)
-            mlflow.log_metric("n_confirmed_fraud", result.get("n_confirmed", 0))
-            mlflow.log_metric("n_drifted_features", result.get("n_drifted_features", 0))
-            eval_metrics = {k: v for k, v in result.items()
-                            if k.startswith("pr_auc_") or k in ("score_retention", "n_categories_pass")}
-            if eval_metrics:
-                mlflow.log_metrics(eval_metrics)
-            ckpt = Path("models/hybrid_graphmcm_v3.pth")
-            if ckpt.exists():
-                mlflow.log_artifact(str(ckpt), artifact_path="checkpoints")
-            if FEATURE_DRIFT_JSON.exists():
-                mlflow.log_artifact(str(FEATURE_DRIFT_JSON), artifact_path="drift")
-            print("[orchestrator] MLflow run logged for incremental update.")
-    else:
-        _body()
+    result = _body()
+
+    # Record the run in the local registry (MLflow replacement). The UI's model
+    # status strip + history table read outputs/model_registry.json.
+    from src.model_registry import log_run
+    eval_metrics = {k: v for k, v in result.items()
+                    if k.startswith("pr_auc_") or k in ("score_retention", "n_categories_pass")}
+    ckpt = Path("models/hybrid_graphmcm_v3.pth")
+    log_run(
+        "incremental",
+        cycle=cycle,
+        smoke_test=smoke_test,
+        params={"cycle": cycle, "freeze_rgcn": result.get("freeze_rgcn")},
+        metrics={
+            "n_confirmed_fraud":  result.get("n_confirmed", 0),
+            "n_drifted_features": result.get("n_drifted_features", 0),
+            **eval_metrics,
+        },
+        checkpoint={
+            "path":    str(ckpt),
+            "size_mb": round(ckpt.stat().st_size / 1e6, 2) if ckpt.exists() else None,
+        },
+    )
+    print("[orchestrator] Registry run logged for incremental update.")
+    return result
 
 
 def main() -> None:

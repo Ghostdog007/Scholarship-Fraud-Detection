@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pandas as pd
 import structlog
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from src.api.schemas import (
     DriftCheckResponse,
@@ -185,14 +185,138 @@ def dataset_xai(dataset_path: str, top_n: int = 20):
     return {"dataset_path": dataset_path, "n_cards": len(cards), "cards": cards}
 
 
+@router.post("/upload-dataset")
+async def upload_dataset(file: UploadFile = File(...)):
+    """Browser CSV intake for the deployment loop. Saves the uploaded cohort
+    under data/uploads/, then validates its columns against the canonical raw
+    schema (data/raw/data_for_ml_model.csv) WITHOUT mutating anything. Returns
+    the server-side path (to feed /evaluate-dataset or /training/decision) plus
+    a schema report. `schema_ok` is False when required columns are missing —
+    the UI should block evaluate/retrain in that case.
+    """
+    import shutil
+    import re
+    from src.api import dataset_ops
+
+    if not (file.filename or "").lower().endswith(".csv"):
+        raise HTTPException(status_code=422, detail="Upload must be a .csv file")
+
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", Path(file.filename).name)
+    dest_dir  = Path("data/uploads")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest      = dest_dir / safe_name
+    with dest.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    if not dataset_ops.RAW_CSV.exists():
+        raise HTTPException(status_code=500, detail=f"Canonical raw schema not found: {dataset_ops.RAW_CSV}")
+
+    try:
+        base_cols = list(pd.read_csv(dataset_ops.RAW_CSV, nrows=0).columns)
+        new_df    = pd.read_csv(dest, low_memory=False)
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail=f"Could not read CSV: {e}")
+
+    base_set, new_set = set(base_cols), set(new_df.columns)
+    missing = sorted(base_set - new_set)   # required by raw schema, absent → hard fail
+    extra   = sorted(new_set - base_set)   # unexpected extras → warn only
+
+    duplicate_ids: list[str] = []
+    if "application_id" in new_df.columns and "application_id" in base_cols:
+        base_ids = set(pd.read_csv(dataset_ops.RAW_CSV, usecols=["application_id"])["application_id"].astype(str))
+        duplicate_ids = sorted(set(new_df["application_id"].astype(str)) & base_ids)[:10]
+
+    report = {
+        "dataset_path":     str(dest),
+        "filename":         safe_name,
+        "n_rows":           int(len(new_df)),
+        "n_cols":           int(new_df.shape[1]),
+        "expected_cols":    len(base_cols),
+        "schema_ok":        not missing,
+        "missing_columns":  missing,
+        "extra_columns":    extra,
+        "duplicate_ids":    duplicate_ids,
+    }
+    log.info("monitoring.upload_dataset", filename=safe_name, n_rows=report["n_rows"],
+             schema_ok=report["schema_ok"], n_missing=len(missing))
+    return report
+
+
 @router.get("/top-suspicious")
 def top_suspicious(n: int = 20):
-    """Top-N suspicious applications from the last full pipeline run (main_v3.py)."""
+    """Top-N applications by fused risk, for the reviewer queue.
+
+    Sourced from outputs/risk_scores_v3.csv — the SAME file xai_layer_v3 ranks
+    to generate the explanation cards — so every queued row is guaranteed to
+    have a card (for n <= the number of cards). The older top_suspicious_v3.tsv
+    is written by main_v3.py in a separate step and can drift out of sync across
+    partial runs, which left queued rows with no card (404); it is used only as
+    a fallback when risk_scores_v3.csv is absent.
+
+    Non-finite floats are sanitized to null globally by SafeJSONResponse.
+    """
+    risk_path = Path("outputs/risk_scores_v3.csv")
+    if risk_path.exists():
+        df = (pd.read_csv(risk_path)
+                .sort_values("risk_score_v3", ascending=False)
+                .head(n))
+        return df.to_dict(orient="records")
+
     tsv_path = Path("outputs/top_suspicious_v3.tsv")
-    if not tsv_path.exists():
-        raise HTTPException(status_code=404, detail="outputs/top_suspicious_v3.tsv not found — run a full pipeline first")
-    df = pd.read_csv(tsv_path, sep="\t")
-    return df.head(n).to_dict(orient="records")
+    if tsv_path.exists():
+        return pd.read_csv(tsv_path, sep="\t").head(n).to_dict(orient="records")
+
+    raise HTTPException(
+        status_code=404,
+        detail="No outputs/risk_scores_v3.csv or top_suspicious_v3.tsv — run a full pipeline first",
+    )
+
+
+@router.get("/export/bulk")
+def export_bulk():
+    """
+    Bulk export of every flagged application as one downloadable zip:
+    manifest.csv (one scorecard row per app) + cards/<id>.html + evidence/<id>.json.
+    Built entirely from outputs/explanation_cards_v3.json — no recomputation.
+    """
+    from fastapi.responses import Response
+    from src.export_v3 import build_bulk_export
+    result = build_bulk_export()
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No explanation cards to export — run the pipeline (XAI layer) first",
+        )
+    filename, data = result
+    log.info("monitoring.export_bulk", filename=filename, bytes=len(data))
+    return Response(
+        content=data, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{app_id}/export")
+def export_application(app_id: str):
+    """
+    Single-application export zip: <id>_scorecard.csv (flat audit row incl. the
+    model-traceability summary) + <id>_card.html (reviewer card) + <id>_evidence.json.
+    404 if the application has no card (not flagged, or cards not generated).
+    """
+    from fastapi.responses import Response
+    from src.export_v3 import build_single_export
+    result = build_single_export(app_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No card for this application — not flagged, or scores/cards not yet generated",
+        )
+    filename, data = result
+    log.info("monitoring.export_app", app_id=app_id, filename=filename, bytes=len(data))
+    return Response(
+        content=data, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/{app_id}/topology")

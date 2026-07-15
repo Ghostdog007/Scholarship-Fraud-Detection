@@ -1,13 +1,18 @@
 # NIC Fraud Detection V3 — local dev stack (ADR-006 + ADR-010)
-# Starts: Redis broker + FastAPI server + Celery worker
+# Starts: Redis broker + FastAPI server + Celery worker + nginx front door
 #
 # Usage:
-#   docker compose up --build          # full stack
-#   docker compose up redis nic-api    # API only (no async training)
+#   docker compose up --build          # full stack (UI on :8080, API on :8000)
+#   docker compose up redis nic-api    # API only (no async training, no UI)
 #
-# Test endpoints:
-#   curl http://localhost:8000/health
-#   curl http://localhost:8000/docs     (Swagger UI)
+# Entry points:
+#   http://localhost:8080/              Review console (nginx-served UI)
+#   http://localhost:8080/docs          Swagger UI (proxied through nginx)
+#   http://localhost:8000/health        API direct (bypasses nginx — debugging)
+#
+# The nginx service is the ONLY origin the browser needs. It mirrors the
+# k8s deployment (deploy/k8s/nic-fraud.yaml), where an nginx pod plays the
+# same role in front of the nic-api Service.
 
 services:
 
@@ -62,3 +67,16 @@ services:
         condition: service_healthy
     deploy:
       replicas: 1   # NEVER increase — concurrent training corrupts fixed-path outputs
+
+  nginx:
+    # Front door: serves the frontend/ UI and reverse-proxies /v3, /health,
+    # /ready, /docs to nic-api. Build context is the repo root so the image
+    # can bake in frontend/. Same image/config used in k8s.
+    build:
+      context: .
+      dockerfile: deploy/nginx/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      nic-api:
+        condition: service_healthy

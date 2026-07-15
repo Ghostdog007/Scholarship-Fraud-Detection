@@ -1,0 +1,23 @@
+# Keep build contexts small and reproducible. Neither the API image nor the
+# nginx image needs these. frontend/ is intentionally NOT ignored — the nginx
+# image copies it in.
+.git
+.venv
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+bash.exe.stackdump
+*.stackdump
+
+# Large local artifacts — mounted at runtime as volumes / PVCs, never baked in.
+data/
+models/
+outputs/
+mlruns/
+
+# Dev tooling
+.claude/
+scratchpad/

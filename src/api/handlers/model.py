@@ -26,6 +26,44 @@ def checkpoint_info():
     return CheckpointInfoResponse(**info)
 
 
+@router.get("/stats")
+def model_stats():
+    """Compact running-model snapshot for the console status strip (MLflow
+    replacement). Cheap: reads the live checkpoint metadata, the local run
+    registry, the confirmed-fraud store, and the scored-population size. Drift
+    is intentionally excluded here (it's a heavier call the UI fetches
+    separately via /v3/monitoring/drift)."""
+    import pandas as pd
+    from src.checkpoint_manager import get_checkpoint_info
+    from src.model_registry import latest_run, list_runs
+    from src.confirmed_fraud_store import load_confirmed, load_false_positive_ids
+
+    scores = Path("outputs/risk_scores_v3.csv")
+    n_scored = int(pd.read_csv(scores, usecols=["application_id"]).shape[0]) if scores.exists() else 0
+    latest_incr = latest_run("incremental")
+
+    stats = {
+        "checkpoint":                  get_checkpoint_info(),
+        "latest_run":                  latest_run(),
+        "latest_incremental_metrics":  (latest_incr or {}).get("metrics", {}),
+        "n_scored":                    n_scored,
+        "n_confirmed":                 len(load_confirmed()),
+        "n_false_positives":           len(load_false_positive_ids()),
+        "n_runs":                      len(list_runs()),
+    }
+    log.info("model.stats", n_scored=n_scored, n_runs=stats["n_runs"])
+    return stats
+
+
+@router.get("/registry")
+def model_registry_history(limit: int = 25, run_type: str | None = None):
+    """Newest-first training/checkpoint run history from the local registry
+    (outputs/model_registry.json) — the console's model-history table. Replaces
+    the MLflow run list."""
+    from src.model_registry import list_runs
+    return {"runs": list_runs(limit=limit, run_type=run_type)}
+
+
 @router.post("/rollback", response_model=JobResponse)
 def rollback(req: RollbackRequest):
     versioned = Path(req.versioned_path)

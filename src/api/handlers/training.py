@@ -82,7 +82,7 @@ def get_job_status(job_id: str):
 async def upload_checkpoint(
     file: UploadFile = File(...),
     cycle: str = Form("unknown"),
-    mlflow_run_id: str = Form("none"),
+    source_ref: str = Form("none"),
 ):
     if not (file.filename or "").endswith(".pth"):
         raise HTTPException(status_code=422, detail="Uploaded file must be a .pth checkpoint")
@@ -94,7 +94,7 @@ async def upload_checkpoint(
         shutil.copyfileobj(file.file, f)
 
     from src.api.tasks import run_validate_checkpoint_task
-    task = run_validate_checkpoint_task.delay(str(temp_path), cycle, mlflow_run_id)
+    task = run_validate_checkpoint_task.delay(str(temp_path), cycle, source_ref)
     log.info("training.upload_checkpoint.queued", job_id=task.id, cycle=cycle, temp=str(temp_path))
     return JobResponse(
         job_id=task.id,

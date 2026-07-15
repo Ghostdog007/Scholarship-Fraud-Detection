@@ -61,7 +61,7 @@ def _prune_old_checkpoints() -> None:
 def validate_and_hotswap(
     temp_path: Path,
     cycle: str = "unknown",
-    mlflow_run_id: str = "none",
+    source_ref: str = "none",
 ) -> dict:
     """
     Validate a checkpoint at temp_path then atomically swap it to LIVE_PATH.
@@ -90,7 +90,7 @@ def validate_and_hotswap(
     )
 
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
-    run_tag   = mlflow_run_id[:8] if mlflow_run_id != "none" else uuid.uuid4().hex[:8]
+    run_tag   = source_ref[:8] if source_ref != "none" else uuid.uuid4().hex[:8]
     cycle_tag = cycle.replace("/", "-").replace(" ", "_")
     versioned_path = CKPT_DIR / f"hybrid_v3_{cycle_tag}_{run_tag}.pth"
     shutil.copy2(temp_path, versioned_path)
@@ -111,12 +111,31 @@ def validate_and_hotswap(
         temp_path.unlink(missing_ok=True)
         print(f"[checkpoint_manager] Cleaned temp: {temp_path.name}")
 
-    return {
+    meta = {
         "versioned_path": str(versioned_path),
         "size_mb": round(LIVE_PATH.stat().st_size / 1e6, 2),
         "cycle": cycle,
-        "mlflow_run_id": mlflow_run_id,
+        "source_ref": source_ref,
     }
+
+    # Record the swap in the local registry (MLflow replacement) so uploads,
+    # dvc pulls and rollbacks all show up in the console's model history.
+    try:
+        from src.model_registry import log_run
+        log_run(
+            "checkpoint_swap",
+            cycle=cycle,
+            params={"source_ref": source_ref},
+            checkpoint={
+                "versioned_path": str(versioned_path),
+                "live_path":      str(LIVE_PATH),
+                "size_mb":        meta["size_mb"],
+            },
+        )
+    except Exception as e:   # registry is best-effort; never fail a hot-swap on it
+        print(f"[checkpoint_manager] registry log skipped: {e}")
+
+    return meta
 
 
 def get_checkpoint_info() -> dict:

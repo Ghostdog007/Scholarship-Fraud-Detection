@@ -62,6 +62,7 @@ FINAL_CSV   = Path("data/processed/engineered_features_v3.csv")
 SCHEMA_JSON = Path("data/processed/v3_feature_schema.json")
 GRAPH_PT    = Path("data/processed/identity_graph_v3.pt")
 EXPOSURE_PT = Path("data/processed/synthetic_exposure_set_v3.pt")
+TOPO_PT     = Path("data/processed/synthetic_exposure_graph_v3.pt")  # module global so the ablation can redirect it
 OUT_CSV     = Path("outputs/hybrid_scores_v3.csv")
 MODEL_PTH   = Path("models/hybrid_graphmcm_v3.pth")
 
@@ -631,8 +632,7 @@ def train(smoke_test: bool = False) -> None:
     x_synth      = torch.load(EXPOSURE_PT, weights_only=True).to(DEVICE)
     topo_pack    = None
     if TOPO_EXPOSURE_ENABLED:
-        topo_pt = Path("data/processed/synthetic_exposure_graph_v3.pt")
-        topo_pack = torch.load(topo_pt, weights_only=False)
+        topo_pack = torch.load(TOPO_PT, weights_only=False)
 
     edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, DEVICE)
     isolated_mask = _compute_isolated_mask(edge_index_list, x_all.shape[0], DEVICE)

@@ -33,6 +33,7 @@ import pandas as pd
 from src.config_v3 import (
     MIN_SIGNALS_FOR_PROMOTION, EDGE_TYPES, ENCODER_ARCH,
     FUSION_W_SUBSPACE, FUSION_W_DENSE_IP, FUSION_W_HYBRID,
+    IDENTIFIER_FEATURES as _IDENTIFIER_FEATURES,
 )
 
 HYBRID_CSV     = Path("outputs/hybrid_scores_v3.csv")
@@ -101,6 +102,15 @@ FEATURE_LABELS: dict[str, str] = {
     "shared_mother_name_count":    "No. of applications sharing mother's name",
     "father_name_entropy":         "Father name entropy (uniqueness)",
     "mother_name_entropy":         "Mother name entropy (uniqueness)",
+    # Binary flags (narrated via network-consistency)
+    "is_female":                   "Gender (female flag)",
+    "is_rural":                    "Rural residence flag",
+    "is_singlegirlchild":          "Single-girl-child claim",
+    "has_state_verify":            "State-verification flag",
+    "hosteller":                   "Hosteller status",
+    "orphan_flag":                 "Orphan status",
+    "disability_flag":             "Disability-declared flag",
+    "parents_not_alive":           "Parents-not-alive claim",
     # Geography
     "is_urban":                    "Urban applicant flag",
     "pincode_application_count":   "No. of applications from same pincode",
@@ -158,6 +168,140 @@ DETECTOR_LABELS = {
     "dense_ip": "shared-IP dense-block",
     "hybrid":   "relational RGCN model",
 }
+
+# Static model-traceability registry. Describes *what each fused model is and
+# reads* — the only new content the traceability layer adds; every number a card
+# quotes still comes from the computed fusion contributions / EVT signals. Keyed
+# to the same detector keys as DETECTOR_LABELS and fusion_contributions.
+DETECTOR_REGISTRY = {
+    "subspace": {
+        "name":   "Tabular subspace Isolation Forest",
+        "what":   "Per-group Isolation Forest over 20 of the 44 features "
+                  "(financial / identity / network). Flags statistically extreme "
+                  "values within a feature group — point anomalies that stand out "
+                  "from the population, with no graph link required.",
+        "reads":  "20 of 44 tabular features (financial 7 · identity 6 · network 7)",
+        "weight": FUSION_W_SUBSPACE,
+        "catches":"Individually implausible records — extreme income/fee ratios, "
+                  "name collisions, IP/mobile counts — even for isolated applicants.",
+    },
+    "dense_ip": {
+        "name":   "Shared-IP dense-block detector",
+        "what":   "FraudAR dense-subgraph peeling gated to shared-IP edges. Reads "
+                  "no features — pure graph structure. Flags coordinated rings that "
+                  "co-apply from one IP address.",
+        "reads":  "0 features — shared-IP graph structure only",
+        "weight": FUSION_W_DENSE_IP,
+        "catches":"Dense IP rings that reconstruct too easily for the relational "
+                  "model to flag — the subspace detector's structural blind spot.",
+    },
+    "hybrid": {
+        "name":   "Hybrid GraphMCM (relational RGCN)",
+        "what":   "Masked feature prediction + an RGCN over 5 edge types. Flags "
+                  "applications whose declared fields are inconsistent with the rest "
+                  "of their own record and their network context.",
+        "reads":  "all 44 features + the identity graph (5 edge types)",
+        "weight": FUSION_W_HYBRID,
+        "catches":"Records that don't fit their own declared profile / neighbourhood; "
+                  "best generalisation to novel topologies.",
+    },
+}
+
+# Maps each self-training trigger to the fused model that raised it — so the
+# per-card model_trace can list which model fired which flag. Note: the
+# shared-IP dense-block has NO trigger (it contributes to the fused score but
+# never raises a self-training signal); model_trace states that gap explicitly.
+TRIGGER_MODEL = {
+    "EVT_HYBRID":    "hybrid",
+    "EVT_EDGE_RING": "hybrid",
+    "EVT_FINANCIAL": "subspace",
+    "EVT_IDENTITY":  "subspace",
+    "EVT_NETWORK":   "subspace",
+}
+
+# ── Narration policy (PRESENTATION ONLY — never gates or alters a score) ──────
+# Controls which reconstruction errors the explanation is allowed to SPEAK. The
+# detector still scores all 44 features; this only decides which become prose.
+#   identifier : nominal ID / code — "the model expected 0.75" is meaningless
+#                because the scaled magnitude has no ordinal meaning (a phone
+#                number / course-ID is not "larger" than another). Never narrated.
+#   binary     : 0/1 flag — narrated ONLY with graph grounding (the flag's value
+#                among the applicant's co-applicants), because the raw expectation
+#                is otherwise just a base rate. See _binary_context.
+#   continuous : everything else — declared-vs-expected prose as before.
+# This is a feature-TYPE classification (like FEATURE_LABELS), not a domain
+# threshold. It does not touch hybrid_anomaly_score, the fusion, or the EVT gates.
+# Single source of truth in config_v3 (also drives the feature-engine drop).
+IDENTIFIER_FEATURES = set(_IDENTIFIER_FEATURES)
+BINARY_FEATURES = {
+    "is_urban", "is_rural", "is_female", "is_singlegirlchild",
+    "has_state_verify", "hosteller", "orphan_flag", "disability_flag",
+    "parents_not_alive", "is_applicant_name_eq_father",
+    "is_applicant_name_eq_mother", "is_father_name_eq_mother",
+}
+# (0-label, 1-label) so binary prose reads in domain terms rather than "0.0/1.0".
+BINARY_VALUE_LABELS = {
+    "is_female":                   ("male", "female"),
+    "is_urban":                    ("non-urban", "urban"),
+    "is_rural":                    ("non-rural", "rural"),
+    "is_singlegirlchild":          ("not single-girl-child", "single girl child"),
+    "has_state_verify":            ("without state verification", "state-verified"),
+    "hosteller":                   ("day scholar", "hosteller"),
+    "orphan_flag":                 ("not orphan", "orphan"),
+    "disability_flag":             ("no disability declared", "disability declared"),
+    "parents_not_alive":           ("parents alive", "parents not alive"),
+    "is_applicant_name_eq_father": ("applicant name ≠ father's", "applicant name = father's"),
+    "is_applicant_name_eq_mother": ("applicant name ≠ mother's", "applicant name = mother's"),
+    "is_father_name_eq_mother":    ("father name ≠ mother's", "father name = mother's"),
+}
+
+
+def _feature_kind(f: str) -> str:
+    if f in IDENTIFIER_FEATURES:
+        return "identifier"
+    if f in BINARY_FEATURES:
+        return "binary"
+    return "continuous"
+
+
+def _binary_label(f: str, value) -> str:
+    lo, hi = BINARY_VALUE_LABELS.get(f, ("no", "yes"))
+    return hi if round(float(value)) == 1 else lo
+
+
+def _binary_context(f, declared_value, neighbor_idxs, binary_vals, context_edge_label):
+    """Distribution of a binary flag among the applicant's graph neighbours — the
+    network grounding that makes a flag mismatch meaningful (e.g. a male applicant
+    whose shared-IP co-applicants are overwhelmingly female → the model expects
+    female from the network). Returns None when there is no neighbour to ground
+    it against, in which case the flag is not narrated at all."""
+    if not neighbor_idxs or binary_vals is None or f not in binary_vals:
+        return None
+    if declared_value is None:
+        return None
+    arr = binary_vals[f]
+    vals = [arr[j] for j in neighbor_idxs if 0 <= j < len(arr) and not np.isnan(arr[j])]
+    m = len(vals)
+    if m == 0:
+        return None
+    n_one    = int(sum(1 for v in vals if round(float(v)) == 1))
+    majority = 1 if (2 * n_one >= m) else 0
+    maj_cnt  = n_one if majority == 1 else (m - n_one)
+    # Only an INCONSISTENCY is evidence: the applicant must differ from the
+    # co-applicant majority (e.g. a male applicant in an all-female IP ring).
+    # When the applicant agrees with its neighbours, the flag is not narrated —
+    # the reconstruction error there is base-rate noise, not a network signal.
+    if round(float(declared_value)) == majority:
+        return None
+    return {
+        "n_linked":       m,
+        "n_flag_one":     n_one,
+        "majority_value": majority,
+        "majority_label": _binary_label(f, majority),
+        "majority_count": maj_cnt,
+        "majority_pct":   round(100.0 * maj_cnt / m, 1),
+        "context_edge":   context_edge_label,
+    }
 
 
 def _readable(feature: str) -> str:
@@ -281,19 +425,55 @@ def _top_features(
     k: int,
     predicted: dict | None = None,
     stats: dict | None = None,
+    neighbor_idxs: list | None = None,
+    binary_vals: dict | None = None,
+    context_edge_label: str | None = None,
 ) -> list[dict]:
-    """Top-k features by prediction error, enriched with all available
-    evidence: declared value, model-expected value, and population
-    percentiles (when stats are supplied)."""
+    """Top interpretable features by prediction error (narration policy applied).
+
+    Identifier/code features are never surfaced — a reconstruction error on a
+    scaled ID is entropy, not evidence. Binary flags are surfaced only when the
+    applicant has graph neighbours to ground the expectation, and carry that
+    network context. Continuous features carry declared-vs-expected as before.
+
+    Ranking is by prediction error, but we scan past the top-k because some
+    features are skipped. When no graph context is supplied (e.g. the pre-fusion
+    dataset preview) binaries are simply dropped and continuous evidence is used."""
     sorted_feats = sorted(per_feat.items(), key=lambda kv: kv[1], reverse=True)
-    result = []
-    for f, err in sorted_feats[:k]:
+    result: list[dict] = []
+    for f, err in sorted_feats:
+        if len(result) >= k:
+            break
+        kind = _feature_kind(f)
+        if kind == "identifier":
+            continue
+
+        val = actual_vals.get(f)
         entry: dict = {
             "feature":       f,
             "feature_label": _readable(f),
             "error":         round(err, 6),
+            # The hybrid masked feature/graph stream computed the expected value.
+            "source_model":  "hybrid",
+            "kind":          kind,
         }
-        val = actual_vals.get(f)
+
+        if kind == "binary":
+            ctx = _binary_context(f, val, neighbor_idxs, binary_vals, context_edge_label)
+            if ctx is None:
+                continue  # base-rate-only expectation is not meaningful evidence
+            entry["network_context"] = ctx
+            if val is not None:
+                entry["value"] = round(float(val), 6)
+                entry["declared_label"] = _binary_label(f, val)
+            if predicted is not None and f in predicted:
+                entry["expected"] = round(float(predicted[f]), 6)
+            if stats is not None and f in stats.get("err_sorted", {}):
+                entry["error_percentile"] = round(_pct_rank(stats["err_sorted"][f], float(err)), 2)
+            result.append(entry)
+            continue
+
+        # continuous
         if val is not None:
             entry["value"] = round(float(val), 6)
         if predicted is not None and f in predicted:
@@ -342,7 +522,30 @@ def _degree_counts_from_index(
 # Narrative rendering — deterministic prose composed from the evidence
 # ---------------------------------------------------------------------------
 
+def _binary_sentence(entry: dict) -> str:
+    """Network-consistency prose for a binary flag: what the applicant declared
+    vs. what its co-applicants declare, grounding the model's expectation in the
+    graph rather than a base rate."""
+    label    = entry.get("feature_label", _readable(entry["feature"]))
+    declared = entry.get("declared_label", "—")
+    ctx      = entry.get("network_context", {})
+    m        = ctx.get("n_linked")
+    maj      = ctx.get("majority_label")
+    mc       = ctx.get("majority_count")
+    pct      = ctx.get("majority_pct")
+    edge     = ctx.get("context_edge")
+    via = f", linked mainly by {edge}," if edge else ""
+    s = (f"{label}: declared {declared}, but {mc} of {m} co-applicant(s) linked to this "
+         f"application{via} ({pct:.0f}%) declared {maj} — inconsistent with its network")
+    ep = entry.get("error_percentile")
+    if ep is not None and ep >= 50.0:
+        s += f", a mismatch the model weighted above {_fmt_pct(ep)} of applications on this field"
+    return s
+
+
 def _feature_sentence(entry: dict) -> str:
+    if entry.get("kind") == "binary":
+        return _binary_sentence(entry)
     label = entry.get("feature_label", _readable(entry["feature"]))
     val   = entry.get("value")
     parts = [label]
@@ -616,6 +819,14 @@ def run_xai(top_n: int = 500) -> None:
     edge_types    = sorted({e["edge_type"] for entries in neighbor_index.values() for e in entries})
     degree_counts = _degree_counts_from_index(neighbor_index, len(all_ids), edge_types)
 
+    # Binary-flag values indexed by graph node id — used to ground each narrated
+    # binary flag in its co-applicants' declarations (network-consistency prose).
+    binary_present = [f for f in BINARY_FEATURES if f in feat_df.columns]
+    binary_vals = {
+        f: np.array([feat_value_map.get(a, {}).get(f, np.nan) for a in all_ids], dtype=float)
+        for f in binary_present
+    }
+
     print("[xai] Computing population statistics (values, errors, degrees, groups) ...")
     stats = build_population_stats(hybrid_df, feat_df, risk_df, subspace_df, degree_counts)
 
@@ -653,8 +864,6 @@ def run_xai(top_n: int = 500) -> None:
                 f"key set does not match v3_feature_schema.json features."
             )
 
-        top_feats = _top_features(per_feat, actual_vals, TOP_K_FEATURES, predicted, stats)
-
         # Graph connections: per-edge-type counts + population percentile
         neighbors = neighbor_index.get(node_idx, [])
         by_type: dict[str, list[int]] = {}
@@ -667,11 +876,30 @@ def run_xai(top_n: int = 500) -> None:
                 "edge_type":  et,
                 "count":      count,
                 "sample_ids": [str(idx_to_id.get(i, f"idx:{i}")) for i in idxs[:TOP_K_NEIGHBORS]],
+                # Graph structure is a raw fact, not a model output — so it is
+                # tagged with the model(s) that CONSUME it. The RGCN graph stream
+                # reads every edge type; the shared-IP dense-block additionally
+                # reads shares_ip.
+                "consumed_by": (["hybrid", "dense_ip"] if et == "shares_ip" else ["hybrid"]),
             }
             if et in stats.get("degree_sorted", {}):
                 conn["percentile"] = round(_pct_rank(stats["degree_sorted"][et], count), 2)
             connections.append(conn)
         connections.sort(key=lambda c: c["count"], reverse=True)
+
+        # Narrated evidence (narration policy applied): identifiers dropped,
+        # binaries grounded in the co-applicant distribution above.
+        neighbor_idxs = sorted({n["neighbor_idx"] for n in neighbors})
+        context_edge_label = (
+            EDGE_TYPE_LABELS.get(connections[0]["edge_type"],
+                                 connections[0]["edge_type"].replace("_", " "))
+            if connections else None
+        )
+        top_feats = _top_features(
+            per_feat, actual_vals, TOP_K_FEATURES, predicted, stats,
+            neighbor_idxs=neighbor_idxs, binary_vals=binary_vals,
+            context_edge_label=context_edge_label,
+        )
 
         neighbor_records = [
             {"edge_type": n["edge_type"],
@@ -683,7 +911,7 @@ def run_xai(top_n: int = 500) -> None:
         groups_ev: dict[str, dict] = {}
         app_groups = subspace_map.get(app_id, {})
         for g, g_score in app_groups.items():
-            g_ev: dict = {"score": round(float(g_score), 6)}
+            g_ev: dict = {"score": round(float(g_score), 6), "source_model": "subspace"}
             if g in stats.get("group_sorted", {}):
                 g_ev["percentile"] = round(_pct_rank(stats["group_sorted"][g], float(g_score)), 2)
             thr = evt.get(f"subspace_if_{g}", {}).get("threshold")
@@ -713,6 +941,7 @@ def run_xai(top_n: int = 500) -> None:
                 "observed":  round(float(observed), 6) if observed is not None else None,
                 "threshold": round(float(sig["threshold"]), 6) if "threshold" in sig else None,
                 "q":         sig.get("q"),
+                "source_model": TRIGGER_MODEL.get(t),
             }
 
         # EVT crossings independent of promotion — a single crossed signal is
@@ -726,6 +955,7 @@ def run_xai(top_n: int = 500) -> None:
                 "label":     "hybrid-model overall anomaly score",
                 "observed":  round(float(row["hybrid_anomaly_score"]), 6),
                 "threshold": round(float(hyb_thr), 6),
+                "source_model": "hybrid",
             })
         edge_thr = evt.get("edge_pred_error", {}).get("threshold")
         if edge_thr is not None and float(row["edge_pred_error"]) >= float(edge_thr):
@@ -734,6 +964,7 @@ def run_xai(top_n: int = 500) -> None:
                 "label":     "graph-connectivity signal",
                 "observed":  round(float(row["edge_pred_error"]), 6),
                 "threshold": round(float(edge_thr), 6),
+                "source_model": "hybrid",
             })
         for g, g_ev in groups_ev.items():
             if g_ev.get("crossed"):
@@ -742,6 +973,7 @@ def run_xai(top_n: int = 500) -> None:
                     "label":     GROUP_LABELS.get(g, g),
                     "observed":  g_ev["score"],
                     "threshold": g_ev["threshold"],
+                    "source_model": "subspace",
                 })
 
         score     = float(row["risk_score_v3"])
@@ -784,10 +1016,48 @@ def run_xai(top_n: int = 500) -> None:
 
         # Dense-block-IP membership evidence (the IP specialist)
         dense_ip_score = dense_map.get(app_id, {}).get("dense_block_score_ip", 0.0)
-        dense_ip_ev = {"score": round(float(dense_ip_score), 6)}
+        dense_ip_ev = {"score": round(float(dense_ip_score), 6), "source_model": "dense_ip"}
         if dense_ip_sorted.size and dense_ip_score > 0.0:
             dense_ip_ev["percentile"] = round(_pct_rank(dense_ip_sorted, float(dense_ip_score)), 2)
         evidence["dense_block_ip"] = dense_ip_ev
+
+        # Model-traceability trail: for each fused model, what it is / reads, the
+        # exact share it contributed to THIS application's score (from the
+        # closed-form fusion), and which EVT trigger(s) it raised. Ordered by
+        # contribution share. Every number here already exists above — this block
+        # only joins it to the static DETECTOR_REGISTRY descriptions.
+        triggers_by_model: dict[str, list[str]] = {}
+        for t in triggers:
+            triggers_by_model.setdefault(TRIGGER_MODEL.get(t, "hybrid"), []).append(t)
+        trace_models = []
+        for k in sorted(DETECTOR_REGISTRY, key=lambda k: contrib.get(k, {}).get("share", 0.0), reverse=True):
+            reg = DETECTOR_REGISTRY[k]
+            c   = contrib.get(k, {})
+            share = c.get("share", 0.0)
+            fired = triggers_by_model.get(k, [])
+            entry = {
+                "key":            k,
+                "name":           reg["name"],
+                "what":           reg["what"],
+                "reads":          reg["reads"],
+                "catches":        reg["catches"],
+                "fusion_weight":  reg["weight"],
+                "share":          share,
+                "normalized":     c.get("normalized", 0.0),
+                "drove_score":    share > 0.005,
+                "fired_triggers": fired,
+            }
+            # The honest gap: dense-block contributes to the score but never
+            # raises a self-training trigger — state it where a reader looks.
+            if k == "dense_ip" and share > 0.005 and not fired:
+                entry["note"] = ("contributes to the fused score but raises no "
+                                 "self-training trigger (no EVT tail of its own)")
+            trace_models.append(entry)
+        evidence["model_trace"] = {
+            "fusion_formula": (f"risk = minmax({FUSION_W_SUBSPACE:g}·subspace + "
+                               f"{FUSION_W_DENSE_IP:g}·dense_ip + {FUSION_W_HYBRID:g}·hybrid)"),
+            "models": trace_models,
+        }
 
         card = {
             "application_id":       app_id,

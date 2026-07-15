@@ -68,9 +68,10 @@ scores and quotes only EVT-derived gates. Replaced the dead LightGBM/TreeSHAP pa
 in `xai_layer_v3.py` with the exact closed-form fusion attribution.
 
 Served by the API (`GET /v3/monitoring/{app_id}/card` and `/ring`, both HTML) and
-logged per MLflow run under `artifact_path="cards"` (simplistic cards; lazy 3D
-links resolve against the live API). `main_v3.py` renders the suspicious cards
-after `run_xai`.
+embedded in the review console (lazy 3D links resolve against the live API).
+`main_v3.py` renders the suspicious cards after `run_xai`. (MLflow artifact
+logging was retired — run history now lives in `outputs/model_registry.json`;
+see README "Model Audit".)
 
 ---
 
@@ -114,7 +115,8 @@ Pipeline order (`main_v3.py`): … subspace_if → **dense_block** → evt → s
 `checkpoint_manager.py`, deployment spec, hard stops #1–16, and the detection
 pipeline contract remain frozen. **Extended (2026-07-06, lead-approved on this
 branch):** two read-only HTML endpoints added to `monitoring.py`
-(`/{app_id}/card`, `/{app_id}/ring`) and one MLflow artifact path (`cards`) — both
-presentation-only, no change to the scoring/schema contract. Also fixed a
+(`/{app_id}/card`, `/{app_id}/ring`) — presentation-only, no change to the
+scoring/schema contract. (The card was formerly also logged as an MLflow
+artifact; MLflow has since been retired — see README "Model Audit".) Also fixed a
 pre-existing committed syntax error in `src/api/handlers/supervisor.py` (module
 docstring never closed) that had kept the whole API unimportable.

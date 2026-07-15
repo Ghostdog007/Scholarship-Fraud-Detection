@@ -12,6 +12,9 @@ lightgbm>=4.0
 shap>=0.44
 networkx>=3.0
 
+# ── Visualization (reviewer-card ego-network + 3D identity ring, /ring /topology) ─
+plotly>=6.0.0
+
 # ── Deep learning (CPU wheel installed separately in Dockerfile) ───────────────
 # torch installed via CPU index before this file; torch_geometric installed here
 torch_geometric>=2.4.0
@@ -22,9 +25,6 @@ uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
 celery>=5.4.0
 redis>=5.0.0
-
-# ── MLOps ─────────────────────────────────────────────────────────────────────
-mlflow>=2.14.0
 
 # ── Structured logging ────────────────────────────────────────────────────────
 structlog>=24.0.0

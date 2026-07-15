@@ -15,14 +15,41 @@ Deploy behind VPN until the project lead decides on internal-only vs
 public-facing (see AGENTS.md Appendix F, OQ-2).
 """
 import logging
+import math
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from src.api.handlers import model, monitoring, supervisor, training
+
+
+# ── JSON safety (non-finite floats) ───────────────────────────────────────────
+# Starlette's JSONResponse renders with json.dumps(allow_nan=False), so ANY
+# endpoint returning a dict/list that contains NaN/inf/-inf 500s with
+# "Out of range float values are not JSON compliant: nan". Source CSVs/TSVs
+# (e.g. outputs/top_suspicious_v3.tsv) legitimately have blank cells that pandas
+# loads as NaN, and computed p-values can be NaN. Rather than sanitize in each
+# handler, this global response class rewrites non-finite floats to null once,
+# for every JSON endpoint. HTML endpoints return HTMLResponse directly and are
+# unaffected.
+def _json_safe(obj: Any) -> Any:
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+class SafeJSONResponse(JSONResponse):
+    def render(self, content: Any) -> bytes:
+        return super().render(_json_safe(content))
 
 # ── Structured logging (ADR-007) ──────────────────────────────────────────────
 structlog.configure(
@@ -56,6 +83,7 @@ app = FastAPI(
     ),
     version="3.0.0",
     lifespan=lifespan,
+    default_response_class=SafeJSONResponse,
 )
 
 # Restrict origins once OQ-2 (auth / VPN decision) is resolved

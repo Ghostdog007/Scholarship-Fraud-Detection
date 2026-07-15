@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NIC Fraud Review Console</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <h1><span class="accent">NIC</span> Fraud Review Console</h1>
+  <span class="subtitle">V3 supervisor &amp; monitoring</span>
+</header>
+
+<nav class="tabs">
+  <button data-view="review" class="active">Review queue</button>
+  <button data-view="patterns">Pattern queue (LOE)</button>
+  <button data-view="admin" class="admin-tab">Model audit &amp; deploy (admin)</button>
+</nav>
+
+<main>
+
+  <!-- ============ REVIEW QUEUE ============ -->
+  <section id="view-review" class="view active">
+
+    <div class="tiles" id="stat-tiles">
+      <div class="tile"><div class="label">Confirmed fraud</div><div class="value" id="tile-confirmed">–</div></div>
+      <div class="tile"><div class="label">False positives</div><div class="value" id="tile-fp">–</div></div>
+      <div class="tile"><div class="label">Checkpoint</div><div class="value" id="tile-checkpoint">–</div></div>
+      <div class="tile" id="tile-drift-wrap"><div class="label">Drift recommendation</div><div class="value" id="tile-drift">–</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span>Top suspicious applications</span>
+        <div style="display:flex;gap:8px;">
+          <button id="btn-export-bulk" class="ghost">⤓ Export all flagged</button>
+          <button id="btn-refresh-queue" class="ghost">↻ Refresh</button>
+        </div>
+      </div>
+      <div class="panel-body" id="queue-body">
+        <div class="empty-state">Loading…</div>
+      </div>
+    </div>
+
+    <div class="panel" id="detail-section" style="display:none;">
+      <div class="panel-head">
+        <span>Reviewer card · <span class="num" id="detail-app-id" style="color:var(--cyan)">—</span></span>
+        <div style="display:flex;gap:8px;">
+          <button id="btn-open-ring" class="ghost">◎ 3D identity ring</button>
+          <button id="btn-open-topology" class="ghost">⌗ Ego-graph</button>
+          <button id="btn-export-app" class="ghost">⤓ Export</button>
+          <button id="btn-flag-loe" class="ghost">⚑ Flag for LOE</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="card-frame-wrap">
+          <iframe id="card-frame" class="card-embed" title="Reviewer card"></iframe>
+        </div>
+        <p style="font-size:11.5px;color:var(--faint);margin:12px 2px 0;">
+          The card is fully interactive — switch between the identity network and signal-driver
+          tabs inside it, expand each field for the declared-vs-model-expected breakdown, and
+          submit a reviewer decision directly. Use the buttons above for the full-detail topology.
+        </p>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ============ PATTERN QUEUE (LOE) ============ -->
+  <section id="view-patterns" class="view">
+    <div class="panel">
+      <div class="panel-head">
+        <span>Candidate patterns awaiting confirmation</span>
+        <button id="btn-refresh-patterns" class="ghost">↻ Refresh</button>
+      </div>
+      <div class="panel-body" id="patterns-body">
+        <div class="empty-state">Loading…</div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <span>Promote selected → dispatch incremental retrain</span>
+      </div>
+      <div class="panel-body">
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--fg2);">
+            <input type="checkbox" id="chk-smoke-test"> smoke test (fast, no real training)
+          </label>
+          <button id="btn-promote" class="primary">Promote selected patterns</button>
+        </div>
+        <div id="promote-job-status" class="job-status" style="display:none;"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ MODEL AUDIT & DEPLOY ============ -->
+  <section id="view-admin" class="view">
+    <div class="admin-warning">
+      ⚠ These actions trigger real retraining and file mutation on the server. No auth is
+      wired up in this build (OQ-2 unresolved) — this panel is separated visually only.
+      Do not expose this build outside a trusted network / VPN.
+    </div>
+
+    <!-- ---- MODEL STATUS STRIP (replaces MLflow) ---- -->
+    <div class="panel">
+      <div class="panel-head">
+        <span>Running model — status</span>
+        <button id="btn-refresh-stats" class="ghost">↻ Refresh</button>
+      </div>
+      <div class="panel-body">
+        <div id="model-stats" class="stat-grid"><div class="empty-state">Loading…</div></div>
+      </div>
+    </div>
+
+    <!-- ---- DEPLOYMENT LOOP ---- -->
+    <div class="panel">
+      <div class="panel-head"><span>Deployment loop</span></div>
+      <div class="panel-body">
+
+        <!-- Step 1 — intake -->
+        <div class="step">
+          <div class="step-h"><span class="step-n">1</span> Intake — upload a new cohort (CSV, raw schema)</div>
+          <div class="dropzone" id="dropzone">
+            <input type="file" id="file-input" accept=".csv" hidden>
+            <div class="dz-inner">
+              <div class="dz-icon">⬆</div>
+              <div>Drop a cohort CSV here, or <button class="linkbtn" id="btn-browse">browse</button></div>
+              <div class="dz-note">Validated against the canonical raw schema before anything is touched.</div>
+            </div>
+          </div>
+          <div id="intake-report" class="job-status" style="display:none;"></div>
+        </div>
+
+        <!-- Step 2 — evaluate -->
+        <div class="step">
+          <div class="step-h"><span class="step-n">2</span> Evaluate — score read-only + drift check</div>
+          <div class="field">
+            <label>Active dataset path (auto-filled from intake, or type a server-side path)</label>
+            <input id="eval-dataset-path" type="text" placeholder="data/uploads/new_cohort.csv">
+          </div>
+          <button id="btn-evaluate" class="primary">Evaluate cohort</button>
+          <div id="eval-result" class="job-status" style="display:none;"></div>
+        </div>
+
+        <!-- Step 3 — decide -->
+        <div class="step">
+          <div class="step-h"><span class="step-n">3</span> Decide — human-gated, acts on the active cohort</div>
+          <div style="display:flex;gap:12px;flex-wrap:wrap;">
+            <div class="field" style="flex:1;min-width:140px;"><label>Cycle</label><input id="decision-cycle" type="text" placeholder="2026H1"></div>
+            <div class="field" style="flex:1;min-width:140px;"><label>Decided by</label><input id="decision-by" type="text" placeholder="lead_1"></div>
+          </div>
+          <div class="action-row">
+            <button class="decide-btn" data-action="none">Log “no action”</button>
+            <button class="decide-btn primary" data-action="incremental">Merge + incremental update</button>
+            <button class="decide-btn danger" data-action="full_retrain">Merge + full retrain</button>
+          </div>
+          <div class="substep">
+            <span class="substep-t">Or retrain on current data only (no new cohort):</span>
+            <button id="btn-train-incremental" class="ghost">incremental</button>
+            <button id="btn-train-full" class="ghost">full pipeline</button>
+          </div>
+          <div id="decision-result" class="job-status" style="display:none;"></div>
+        </div>
+
+        <!-- Step 4 — watch -->
+        <div class="step">
+          <div class="step-h"><span class="step-n">4</span> Watch — job status</div>
+          <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+            <div class="field" style="flex:1;min-width:200px;margin:0;"><label>Job id (auto-filled when you dispatch above)</label><input id="poll-job-id" type="text" placeholder="job id"></div>
+            <button id="btn-poll-job" class="ghost">Poll status</button>
+          </div>
+          <div id="training-job-status" class="job-status" style="display:none;"></div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ---- RUN HISTORY (replaces MLflow run list) ---- -->
+    <div class="panel">
+      <div class="panel-head">
+        <span>Run history</span>
+        <button id="btn-refresh-history" class="ghost">↻ Refresh</button>
+      </div>
+      <div class="panel-body" id="history-body"><div class="empty-state">Loading…</div></div>
+    </div>
+
+    <!-- ---- ROLLBACK ---- -->
+    <div class="panel">
+      <div class="panel-head"><span>Rollback checkpoint</span></div>
+      <div class="panel-body">
+        <div class="field">
+          <label>Versioned checkpoint path</label>
+          <input id="rollback-path" type="text" placeholder="models/checkpoints/hybrid_v3_2025-26_abc12345.pth">
+        </div>
+        <button id="btn-rollback" class="danger">Rollback</button>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- ============ TOPOLOGY DETAIL MODAL ============ -->
+<div class="modal-backdrop" id="topo-modal">
+  <div class="modal">
+    <div class="modal-head">
+      <span class="m-title" id="topo-title">Topology · <span class="num" id="topo-app-id">—</span></span>
+      <div class="spacer"></div>
+      <div class="seg">
+        <button id="seg-ring" class="on" data-kind="ring">3D identity ring</button>
+        <button id="seg-ego" data-kind="topology">Ego-graph</button>
+      </div>
+      <button id="btn-topo-popout" class="ghost">↗ Open in new tab</button>
+      <button id="btn-topo-close" class="ghost">✕ Close</button>
+    </div>
+    <div class="modal-body">
+      <iframe id="topo-frame" title="Topology detail"></iframe>
+    </div>
+  </div>
+</div>
+
+<!-- ============ FLAG FOR LOE MODAL ============ -->
+<div class="modal-backdrop" id="loe-modal">
+  <div class="modal" style="height:auto;max-height:90vh;width:min(620px,96vw);">
+    <div class="modal-head">
+      <span class="m-title">Flag for LOE · <span class="num" id="loe-app-id">—</span></span>
+      <div class="spacer"></div>
+      <button id="btn-loe-close" class="ghost">✕ Close</button>
+    </div>
+    <div class="modal-body" style="background:var(--panel);overflow:auto;padding:18px;">
+      <div class="field">
+        <label>Fraud type — click one</label>
+        <div class="chips" id="loe-type-chips"></div>
+      </div>
+      <div class="field">
+        <label>What is it? — describe the pattern (required if type is OTHER)</label>
+        <textarea id="loe-notes" rows="3" placeholder="e.g. same landlord address reused across 6 applications under different names"></textarea>
+      </div>
+      <div class="field">
+        <label>Applications in the ring — comma-separated IDs (include this one)</label>
+        <input id="loe-nodes" type="text">
+      </div>
+      <div class="field">
+        <label>Shared link (edge type)</label>
+        <select id="loe-edge">
+          <option value="shares_ip">shares_ip</option>
+          <option value="shares_mobile">shares_mobile</option>
+          <option value="shares_father_name">shares_father_name</option>
+          <option value="shares_mother_name">shares_mother_name</option>
+          <option value="shares_pincode">shares_pincode</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Reviewer name</label>
+        <input id="loe-by" type="text" placeholder="your name">
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;">
+        <button id="btn-loe-cancel" class="ghost">Cancel</button>
+        <button id="btn-loe-submit" class="primary">Record pattern</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-stack" id="toast-stack"></div>
+
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

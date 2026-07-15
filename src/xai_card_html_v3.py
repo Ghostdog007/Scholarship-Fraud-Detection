@@ -55,6 +55,57 @@ def _risk_color(v: float) -> str:
     return RISK_HIGH if v >= 0.66 else RISK_MED if v >= 0.33 else RISK_LOW
 
 
+# key -> (short label, colour) for the model-traceability pills. Same keys and
+# colours as DETECTOR_ORDER so pills match the fusion-composition footer.
+DETECTOR_PILL = {k: (lbl, col) for k, lbl, col in DETECTOR_ORDER}
+
+
+def _model_pill(key: str | None) -> str:
+    """Small colour-coded pill naming the source model of an evidence line."""
+    if key not in DETECTOR_PILL:
+        return ""
+    lbl, col = DETECTOR_PILL[key]
+    return (f"<span class='mpill' style='color:{col};border-color:{col}55;"
+            f"background:{col}1a' title='source model: {lbl}'>{lbl}</span>")
+
+
+def _model_trace(card: dict) -> str:
+    """Render the 'How this score was produced' traceability section from the
+    pre-computed evidence.model_trace block. Adds no numbers of its own."""
+    mt = card.get("evidence", {}).get("model_trace")
+    if not mt or not mt.get("models"):
+        return ""
+    rows = []
+    for m in mt["models"]:
+        lbl, col = DETECTOR_PILL.get(m["key"], (m.get("name", m["key"]), "#8b949e"))
+        share = float(m.get("share", 0.0)) * 100
+        fired = m.get("fired_triggers", [])
+        if fired:
+            meta_tail = " · fired " + ", ".join(f"<span class='num'>{_esc(t)}</span>" for t in fired)
+        elif m.get("note"):
+            meta_tail = f" · <span style='color:var(--faint)'>{_esc(m['note'])}</span>"
+        else:
+            meta_tail = " · <span style='color:var(--faint)'>no trigger fired for this application</span>"
+        rows.append(f"""
+          <div class="mtrace">
+            <div class="mtrace-h">
+              <span class="mpill" style="color:{col};border-color:{col}55;background:{col}1a">{_esc(lbl)}</span>
+              <span class="mtrace-name">{_esc(m['name'])}</span>
+              <span class="mtrace-share num" style="color:{col}">{share:.0f}%</span>
+            </div>
+            <div class="mtrace-track"><div style="width:{max(0.0, min(100.0, share)):.0f}%;background:{col}"></div></div>
+            <div class="mtrace-what">{_esc(m['what'])}</div>
+            <div class="mtrace-meta"><b>Reads:</b> {_esc(m['reads'])}{meta_tail}</div>
+          </div>""")
+    return (
+        "<div class='section-t'>How this score was produced — model traceability</div>"
+        "<div class='mtrace-intro'>Score-level fusion of three independent models. Each "
+        "percentage is this application's exact contribution from the closed-form fusion "
+        f"(<code>{_esc(mt.get('fusion_formula', ''))}</code>).</div>"
+        + "".join(rows)
+    )
+
+
 def _is_suspicious(card: dict) -> bool:
     """A card is rendered only for flagged applications — one that crossed an
     EVT threshold, carries a self-training trigger, or holds a non-negative
@@ -171,6 +222,20 @@ canvas.net{width:100%;height:320px;display:block;background:radial-gradient(120%
 .idx-reason{font-size:12px;color:var(--muted);margin-top:2px}
 .idx-risk{font-family:var(--mono);font-weight:700;font-size:15px}
 .idx-pill{font-size:11px;font-weight:600;padding:3px 9px;border-radius:999px}
+/* model-traceability pills + trace section */
+.mpill{display:inline-block;font-size:9.5px;font-weight:700;letter-spacing:.03em;padding:1px 6px;border-radius:5px;border:1px solid;vertical-align:middle;font-family:var(--mono);white-space:nowrap}
+.mtrace-intro{font-size:12px;color:var(--muted);margin:0 2px 12px}
+.mtrace-intro code{font-family:var(--mono);color:var(--fg2);font-size:11px}
+.mtrace{border:1px solid var(--border);border-radius:10px;background:var(--panel2);padding:11px 13px;margin-bottom:8px}
+.mtrace-h{display:flex;align-items:center;gap:9px;margin-bottom:7px}
+.mtrace-name{flex:1;font-size:12.5px;font-weight:600}
+.mtrace-share{font-size:14px;font-weight:700}
+.mtrace-track{height:6px;border-radius:4px;background:rgba(255,255,255,.06);overflow:hidden;margin-bottom:8px}
+.mtrace-track>div{height:100%;border-radius:4px}
+.mtrace-what{font-size:12px;color:var(--fg2);line-height:1.5}
+.mtrace-meta{font-size:11px;color:var(--muted);margin-top:6px}
+.mtrace-meta b{color:var(--fg2);font-weight:600}
+.export-link{font-size:12px;color:var(--muted);display:inline-flex;align-items:center;gap:5px}
 """
 
 # JS: tab switching + interactive ego-network. Nodes injected as a JSON blob.
@@ -368,14 +433,14 @@ def _signal_bars(card: dict) -> str:
         note = (f"observed <span class='num'>{d['score']:.3f}</span> vs EVT threshold "
                 f"<span class='num'>{d['threshold']:.3f}</span>{chip}") if "threshold" in d else \
                "below its EVT threshold"
-        rows.append(_bar(f"{GROUP_LABELS.get(g, g)} subspace detector",
+        rows.append(_bar(f"{GROUP_LABELS.get(g, g)} subspace detector {_model_pill('subspace')}",
                          f"{pct:.1f}<span style='color:var(--faint)'>pct</span>",
                          pct, fill, note))
 
     # 2) dense-block-IP
     dib = ev.get("dense_block_ip", {})
     if dib.get("score", 0.0) > 0.0 and dib.get("percentile") is not None:
-        rows.append(_bar("Shared-IP dense-block",
+        rows.append(_bar(f"Shared-IP dense-block {_model_pill('dense_ip')}",
                          f"{dib['percentile']:.1f}<span style='color:var(--faint)'>pct</span>",
                          dib["percentile"], "linear-gradient(90deg,#b5187f,#f72585)",
                          "member of a dense shared-IP cluster — the IP specialist"))
@@ -417,7 +482,7 @@ def _reason_codes(card: dict) -> str:
     for c in ev.get("evt_crossings", []):
         rows.append(
             f"<div class='reason'><div class='rk'>{rank:02d}</div><div class='rc'>"
-            f"<div class='rt'>{_esc(c['label']).capitalize()}</div>"
+            f"<div class='rt'>{_esc(c['label']).capitalize()} {_model_pill(c.get('source_model'))}</div>"
             f"<div class='rd'>Crossed its extreme-value threshold — observed "
             f"<span class='num'>{c['observed']:.3f}</span> vs threshold "
             f"<span class='num'>{c['threshold']:.3f}</span>.</div></div></div>")
@@ -430,7 +495,7 @@ def _reason_codes(card: dict) -> str:
                 if pct is not None else "")
         rows.append(
             f"<div class='reason'><div class='rk'>{rank:02d}</div><div class='rc'>"
-            f"<div class='rt'>Shared-IP concentration</div>"
+            f"<div class='rt'>Shared-IP concentration {_model_pill('dense_ip')}</div>"
             f"<div class='rd'>Shares one IP with <span class='num'>{ip_conn['count']}</span> "
             f"other application(s){pstr}.</div></div></div>")
         rank += 1
@@ -446,16 +511,46 @@ def _clamp_half(v: float, lim: float = 1.5) -> float:
     return min(abs(float(v)), lim) / lim * 48.0
 
 
+def _binary_field_body(f: dict) -> str:
+    """Network-consistency body for a binary flag: declared value vs. the
+    co-applicant distribution that grounds the model's expectation."""
+    ctx = f.get("network_context", {})
+    declared = f.get("declared_label", "—")
+    m   = ctx.get("n_linked")
+    maj = ctx.get("majority_label")
+    mc  = ctx.get("majority_count")
+    pct = ctx.get("majority_pct")
+    edge = ctx.get("context_edge")
+    pctw = max(0.0, min(100.0, float(pct or 0)))
+    dec_line = (f"<div class='cmp-row'><span class='cmp-lab'>declared</span>"
+                f"<span class='cmp-v' style='color:#ffbf85'>{_esc(declared)}</span></div>")
+    net_line = (f"<div class='cmp-row'><span class='cmp-lab'>co-applicants</span>"
+                f"<div class='cmp-bar'><i style='left:0;width:{pctw:.0f}%;background:{RISK_HIGH}'></i></div>"
+                f"<span class='cmp-v'>{mc}/{m}</span></div>") if m else ""
+    via = f", linked mainly by {_esc(edge)}," if edge else ""
+    why = (f"<div class='why'><b>What this means:</b> this applicant declared "
+           f"<b>{_esc(declared)}</b>, but of <span class='num'>{m}</span> co-applicant(s) linked "
+           f"to this application{via} <span class='num'>{mc}</span> "
+           f"(<span class='num'>{pct:.0f}%</span>) declared <b>{_esc(maj)}</b> — an inconsistency "
+           f"with its network that the model weighted as a top signal.</div>") if m else ""
+    return dec_line + net_line + why
+
+
 def _field_accordions(card: dict) -> str:
     out = []
     for i, f in enumerate(card.get("top_feature_errors", [])[:5]):
         ep = f.get("error_percentile")
         stripe = RISK_HIGH if (ep or 0) >= 99.5 else RISK_MED if (ep or 0) >= 90 else RISK_LOW
-        tag = f"miss {'99.9%+' if ep and ep >= 99.95 else f'{ep:.1f}%'}" if ep is not None else ""
+        kind = f.get("kind", "continuous")
         val = f.get("value")
         exp = f.get("expected")
         cmp_html, why = "", ""
-        if val is not None and exp is not None:
+        if kind == "binary":
+            tag = f"mismatch {'99.9%+' if ep and ep >= 99.95 else f'{ep:.1f}%'}" if ep is not None else "network"
+            cmp_html = _binary_field_body(f)
+        else:
+            tag = f"miss {'99.9%+' if ep and ep >= 99.95 else f'{ep:.1f}%'}" if ep is not None else ""
+        if kind != "binary" and val is not None and exp is not None:
             vw, ew = _clamp_half(val), _clamp_half(exp)
             vside = "left:50%" if val >= 0 else f"right:50%;left:auto"
             eside = "left:50%" if exp >= 0 else f"right:50%;left:auto"
@@ -489,6 +584,7 @@ def _field_accordions(card: dict) -> str:
           <div class="field-h" onclick="this.parentNode.classList.toggle('open')">
             <span class="stripe" style="background:{stripe}"></span>
             <span class="field-name">{_esc(f.get('feature_label', f.get('feature')))}</span>
+            {_model_pill(f.get('source_model', 'hybrid'))}
             <span class="field-tag">{tag}</span><span class="chev">▶</span>
           </div>
           <div class="field-b">{cmp_html}{why}</div>
@@ -590,6 +686,7 @@ def _right_pane(card: dict) -> str:
       {_reason_codes(card)}
       <div class="section-t">What's happening in each field — declared vs. model-expected</div>
       {_field_accordions(card)}
+      {_model_trace(card)}
       {_action(card)}
       <div class="footnote">Every number on this card traces to
         <code>explanation_cards_v3.json</code> — no hand-set thresholds; the only numeric gates
@@ -614,6 +711,8 @@ def _card_page(card: dict, rank: int, risk_map: dict, ring_href: str | None = No
           <div class="appid">{_esc(app_id)}</div></div>
         <div class="spacer"></div>
         <a href="index.html" style="font-size:12px;color:var(--muted)">← all cards</a>
+        <a class="export-link" href="/v3/monitoring/{_esc(app_id)}/export" download
+           title="Download scorecard CSV + this card + evidence JSON">⤓ Export bundle</a>
         <div class="status" style="color:{scol};background:{scol}22;border:1px solid {scol}55">
           <span class="dot"></span>{_esc(status)}</div>
       </div>

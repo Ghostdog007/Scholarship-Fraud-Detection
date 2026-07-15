@@ -43,6 +43,27 @@ writing any code.
 
 ---
 
+## Documentation Freshness — Standing Instruction
+
+**After completing any instruction that changes behaviour, interfaces, files,
+or how the system is run/deployed, update the relevant docs in the same turn.**
+Do not leave docs describing a superseded state. Concretely:
+
+- Code/endpoint/CLI/config change → update `README.md` and, if it's an API
+  change, `docs/API_TESTING_GUIDE.md`.
+- Serving/deploy/container change → update `deploy/README.md` and, if the
+  operator flow changed, `docs/OPERATIONS_RUNBOOK.md`.
+- Detection-architecture change → update `docs/IMPLEMENTATION.md`.
+- If a doc becomes redundant, delete it or rewrite it to point at the current
+  one — do not accumulate stale parallel docs.
+- `docs/AGENTS.md` is **lead-owned (hard stop #8)** — never edit it to "keep it
+  fresh." If it goes stale, flag it and propose a redline instead.
+
+Treat a task as unfinished until its docs match reality. State in your summary
+which docs you touched (or that none needed changes).
+
+---
+
 ## Project Directory Layout
 
 ```
@@ -74,8 +95,8 @@ NIC fraud Detection Project/
 ├── data/
 │   ├── raw/data_for_ml_model.csv       # 15,000 primary dataset
 │   └── processed/
-│       ├── engineered_features_v3.csv  # 15,000 × 68 numeric features (+ application_id)
-│       ├── v3_feature_schema.json      # 68 feature names + exclusions
+│       ├── engineered_features_v3.csv  # 15,000 × 44 numeric features (+ application_id)
+│       ├── v3_feature_schema.json      # 44 feature names + exclusions + dropped_from_model
 │       ├── degree_features_v3.csv
 │       ├── identity_graph_v3.pt        # PyG HeteroData graph (5 edge types)
 │       ├── synthetic_exposure_set_v3.pt# tabular LOE tensor
@@ -121,7 +142,7 @@ src/graph_builder_v3.py ──► identity_graph_v3.pt  src/synthetic_exposure_b
         │                                         │       synthetic_exposure_graph_v3.pt
         └──────────────┬──────────────────────────┘
                        ▼
-     src/hybrid_graphmcm_v3.py  (feature stream: K=8 masks over 68-dim
+     src/hybrid_graphmcm_v3.py  (feature stream: K=8 masks over 44-dim
                        │         graph stream: RGCN, 5 edge types → h_N(64)
                        │         concat → MLP → predicted x + edge probs)
                        │  ──► hybrid_scores_v3.csv, models/hybrid_graphmcm_v3.pth
@@ -157,7 +178,7 @@ Source of truth: `src/config_v3.py`.
 
 | Parameter | Value |
 |---|---|
-| Input feature dimensions | 68 numeric columns (`N_FEATURES`) |
+| Input feature dimensions | 44 numeric columns (`N_FEATURES`) — 68 minus the 24 nominal `IDENTIFIER_FEATURES`, dropped 2026-07-15 (noid ablation) |
 | Graph edge types | 5 (`shares_mobile`, `shares_ip`, `shares_father_name`, `shares_mother_name`, `shares_pincode`) |
 | Feature-stream masks | 8 (`MASK_NUM`) |
 | Graph hidden / embedding dim | 128 / 64 (`GRAPH_HIDDEN` / `GRAPH_EMB_DIM`) |

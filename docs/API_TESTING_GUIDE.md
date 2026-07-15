@@ -29,6 +29,11 @@ Expected containers:
 | `nicfrauddetectionproject-redis-1` | Message broker |
 | `nicfrauddetectionproject-nic-api-1` | FastAPI server (port 8000) |
 | `nicfrauddetectionproject-nic-worker-1` | Celery worker (runs training jobs) |
+| `nicfrauddetectionproject-nginx-1` | Front door — review console + API proxy (port 8080) |
+
+> The review console (UI) is at `http://localhost:8080/`. Every endpoint below
+> is also reachable through nginx at `http://localhost:8080/...` (same paths) —
+> the direct `:8000` URLs here are for backend debugging.
 
 ---
 
@@ -120,8 +125,10 @@ terminal or a headless server.
 
 | Endpoint | Returns | Cost |
 |---|---|---|
-| `GET /v3/monitoring/{app_id}/card` | Interactive reviewer card: risk placement, ranked reason codes, per-field declared-vs-model-expected breakdown, closed-form fusion split, and a lightweight identity ego-graph | Cheap — reads pre-computed `explanation_cards_v3.json` |
+| `GET /v3/monitoring/{app_id}/card` | Interactive reviewer card: risk placement, ranked reason codes, per-field declared-vs-model-expected breakdown, closed-form fusion split, the **model-traceability trail** (which model drove the score + fired which trigger), and a lightweight identity ego-graph | Cheap — reads pre-computed `explanation_cards_v3.json` |
 | `GET /v3/monitoring/{app_id}/ring` | Rotatable Plotly 3D identity ring (the deep-dive) | **Lazy** — the ring is computed only on this request (i.e. when the card's "Examine full ring in 3D" link is clicked), never in batch |
+| `GET /v3/monitoring/{app_id}/export` | Zip bundle for one flagged application: `<id>_scorecard.csv` (flat audit row incl. model-traceability summary) + `<id>_card.html` + `<id>_evidence.json` | Cheap — projects `explanation_cards_v3.json` |
+| `GET /v3/monitoring/export/bulk` | Zip of **all** flagged applications: `manifest.csv` (one scorecard row each) + `cards/<id>.html` + `evidence/<id>.json` | Renders every card once — seconds for the top-N set |
 
 Cards exist **only for flagged (suspicious) applications** — those that crossed an
 EVT threshold, carry a self-training trigger, or hold a confirmed/pseudo label.
@@ -149,6 +156,23 @@ curl.exe -s "http://localhost:8000/v3/monitoring/GJ202526000221788/ring" -o ring
 Start-Process ring.html
 ```
 
+**Export one application (scorecard CSV + card + evidence JSON, zipped):**
+```powershell
+curl.exe -s "http://localhost:8000/v3/monitoring/GJ202526000221788/export" -o GJ202526000221788_export.zip
+Expand-Archive GJ202526000221788_export.zip -DestinationPath .\one_export
+```
+
+**Export every flagged application at once (manifest + all cards + evidence):**
+```powershell
+curl.exe -s "http://localhost:8000/v3/monitoring/export/bulk" -o flagged_export.zip
+Expand-Archive flagged_export.zip -DestinationPath .\bulk_export   # manifest.csv is the master list
+```
+The same bundles are available offline via the CLI, no server needed:
+```powershell
+.\.venv\Scripts\python.exe -m src.export_v3 --app-id GJ202526000221788   # -> outputs/exports/
+.\.venv\Scripts\python.exe -m src.export_v3 --bulk
+```
+
 **Check the status codes without downloading the body:**
 ```powershell
 # 200 = flagged application, card available
@@ -165,6 +189,8 @@ curl.exe -s -o NUL -w "card: %{http_code}`n" "http://localhost:8000/v3/monitorin
 | Flagged app, `/ring` | `200` | `text/html` Plotly page (self-contained) |
 | Unflagged / unknown app | `404` | `{"detail": "No card for this application — not flagged, or scores/cards not yet generated"}` |
 | App with no graph edges, `/ring` | `404` | `{"detail": "Application not in identity graph (no shared IP/mobile/name/pincode edges)"}` |
+| Flagged app, `/export` | `200` | `application/zip` attachment (`<id>_export.zip`) |
+| `/export/bulk` | `200` | `application/zip` attachment (`flagged_export_<ts>.zip`) |
 
 > The card's inline ego-graph is the at-a-glance view; the **"Examine full ring in
 > 3D"** link points at `/ring`, so Plotly cost is paid per view, not per batch —
@@ -194,14 +220,14 @@ curl.exe -s http://localhost:8000/v3/model/checkpoint-info
 {
   "exists": true,
   "size_mb": 0.71,
-  "n_features": 68,
+  "n_features": 44,
   "graph_emb_dim": 64,
   "n_edge_types": 5,
   "versioned_checkpoints": []
 }
 ```
 
-`n_features` must be 68, `graph_emb_dim` must be 64, `n_edge_types` must be 5. Any other value means a wrong checkpoint is loaded.
+`n_features` must be 44 (68 minus the 24 dropped `IDENTIFIER_FEATURES`, adopted 2026-07-15), `graph_emb_dim` must be 64, `n_edge_types` must be 5. Any other value means a wrong checkpoint is loaded.
 
 ---
 
@@ -316,7 +342,7 @@ After full GPU training on the laptop, transfer the checkpoint via this endpoint
 curl.exe -s -X POST http://localhost:8000/v3/training/upload-checkpoint `
   -F "file=@models/hybrid_graphmcm_v3.pth" `
   -F "cycle=2025-26" `
-  -F "mlflow_run_id=abc123"
+  -F "source_ref=abc123"
 ```
 
 **Expected:**
@@ -677,11 +703,14 @@ Get-Content outputs\risk_scores_v3.csv | Select-String "ZZ202627000900001"
 curl.exe -s "http://localhost:8000/v3/monitoring/top-suspicious?n=20"
 ```
 
-`top-suspicious` reads `outputs/top_suspicious_v3.tsv`, which `main_v3.py`
-already regenerates on every full run (`_log_top_suspicious`, default
-`top_n=20`) — no extra step needed after a `full_retrain`. After an
-`incremental` update this file is only refreshed by a subsequent full run;
-for incremental, pull individual application scores from
+`top-suspicious` ranks `outputs/risk_scores_v3.csv` (by `risk_score_v3`, desc)
+— the SAME file `xai_layer_v3` ranks to build the explanation cards — so every
+row in the queue is guaranteed to have a reviewer card (for `n` ≤ the number of
+cards generated). It falls back to `outputs/top_suspicious_v3.tsv` only if
+`risk_scores_v3.csv` is absent. (Previously it read the TSV directly, which
+could drift out of sync with the cards across partial runs and leave queued
+rows with no card.) For richer per-application scores from an incremental
+update, pull individual application scores from
 `outputs/risk_scores_v3.csv` / `outputs/explanation_cards_v3.json` instead.
 
 ### 9.5 Reset between attempts
@@ -734,3 +763,54 @@ Remove-Item outputs\drift_audit_log.json, outputs\staged_scores_*.csv, `
   on the same fraud shape than the pre-retrain model did, since it has now
   seen that pattern. That comparison is the actual "did retraining help"
   evidence, not just "did the job finish."
+
+---
+
+## 10. Console build — model audit endpoints (MLflow replacement)
+
+These back the "Model audit & deploy" console tab. All are also reachable via
+nginx at `http://localhost:8080/...`.
+
+### 10.1 Running-model status strip
+
+```powershell
+curl.exe -s http://localhost:8000/v3/model/stats
+```
+
+Returns the live checkpoint metadata, `latest_run`, `latest_incremental_metrics`
+(PR-AUC etc.), scored-population size, confirmed/false-positive counts, and total
+run count. Cheap — safe to poll.
+
+### 10.2 Run history (replaces the MLflow run list)
+
+```powershell
+curl.exe -s "http://localhost:8000/v3/model/registry?limit=25"
+```
+
+Newest-first list of runs from `outputs/model_registry.json`. Each has
+`run_type` (`incremental` | `full` | `checkpoint_swap`), `timestamp`, `cycle`,
+`params`, `metrics`, `checkpoint`. Optional `&run_type=incremental` filter.
+
+### 10.3 Upload a cohort CSV (browser intake, schema-validated)
+
+```powershell
+curl.exe -s -X POST http://localhost:8000/v3/monitoring/upload-dataset `
+  -F "file=@data/raw/new_cohort_2026.csv"
+```
+
+**Expected:**
+```json
+{"dataset_path": "data/uploads/new_cohort_2026.csv", "filename": "new_cohort_2026.csv",
+ "n_rows": 500, "n_cols": 136, "expected_cols": 136, "schema_ok": true,
+ "missing_columns": [], "extra_columns": [], "duplicate_ids": []}
+```
+
+Saves the file under `data/uploads/` and validates its columns against the raw
+schema **without mutating anything**. `schema_ok: false` (with `missing_columns`
+populated) means the console blocks evaluate/retrain. Feed the returned
+`dataset_path` into §9.1 (`evaluate-dataset`) or the `decision` endpoint.
+
+> **Run history is written automatically** by the pipeline: incremental updates
+> (`retraining_orchestrator`), full runs (`run_full_pipeline_task`), and every
+> checkpoint swap (`validate_and_hotswap` — upload / dvc pull / rollback) each
+> append a record. There is no MLflow server to start.

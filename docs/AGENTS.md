@@ -417,7 +417,7 @@ data/raw/data_for_ml_model.csv
         │
         ▼
 src/tabular_feature_engine_v3.py
-        │  68 features (63 original + 5 degree-aware)
+        │  44 features (39 kept base + 5 degree-aware; 24 nominal identifiers dropped 2026-07-15, see MODEL_ARCHITECTURE_REVIEW A.4)
         │  data/processed/engineered_features_v3.csv
         │  data/processed/v3_feature_schema.json
         ▼
@@ -426,7 +426,7 @@ src/graph_builder_v3.py
         │  data/processed/degree_features_v3.csv   ← 5 per-edge-type degrees
         ▼
 src/synthetic_exposure_builder_v3.py
-        │  data/processed/synthetic_exposure_set_v3.pt   (750 × 68)
+        │  data/processed/synthetic_exposure_set_v3.pt   (750 × 44)
         ▼
 src/hybrid_graphmcm_v3.py          ← THE CORE MODEL
         │  models/hybrid_graphmcm_v3.pth
@@ -465,7 +465,7 @@ src/evaluate_model_v3.py
 ### 4.1 Two streams, one model
 
 ```
-Node i: features x_i (68-dim) + neighbors N(i)
+Node i: features x_i (44-dim) + neighbors N(i)
               │
     ┌─────────┴──────────┐
     ▼                    ▼
@@ -476,7 +476,7 @@ Node i: features x_i (68-dim) + neighbors N(i)
     │                    │
     └─────────┬──────────┘
               ▼
-    Concat([masked_x_i ; h_N(i)])   → 68 + GRAPH_EMB_DIM
+    Concat([masked_x_i ; h_N(i)])   → 44 + GRAPH_EMB_DIM
               │
              MLP
               │
@@ -595,7 +595,7 @@ Never hardcode these numbers in module code — import from `src/config_v3.py`.*
 ```python
 # src/config_v3.py  (agent must create this file)
 
-N_FEATURES      = 68    # 63 original + 5 degree-aware features
+N_FEATURES      = 44    # 39 kept base + 5 degree; 24 nominal identifiers dropped 2026-07-15
 N_EDGE_TYPES    = 5     # shares_mobile, shares_ip, shares_father_name,
                         # shares_mother_name, shares_pincode
 MASK_NUM        = 8     # number of learned masks in GraphMCM
@@ -692,12 +692,12 @@ listing which signals fired for that application.
 ### Concat dimension check (all agents must verify)
 
 ```
-masked_x_i shape:  (B, N_FEATURES)         = (B, 68)
+masked_x_i shape:  (B, N_FEATURES)         = (B, 44)
 h_N(i) shape:      (B, GRAPH_EMB_DIM)      = (B, 64)
 concat shape:      (B, N_FEATURES + GRAPH_EMB_DIM) = (B, 132)
 MLP input:         132
 MLP output (z):    Z_DIM = 64
-decoder output:    N_FEATURES = 68
+decoder output:    N_FEATURES = 44
 ```
 
 If any module produces a tensor that violates these shapes, it must raise a
@@ -712,11 +712,11 @@ another module's source files directly. No embeddings cross module boundaries.
 
 | File | Producer | Consumer | Schema |
 |---|---|---|---|
-| `data/processed/engineered_features_v3.csv` | feature_engine | graph_builder, hybrid, subspace_if, evaluate | N×68 numeric + application_id |
+| `data/processed/engineered_features_v3.csv` | feature_engine | graph_builder, hybrid, subspace_if, evaluate | N×44 numeric + application_id |
 | `data/processed/v3_feature_schema.json` | feature_engine | all modules | `{features, aggregation_features, degree_features, excluded, n_features, log1p_cols}` |
 | `data/processed/identity_graph_v3.pt` | graph_builder | hybrid, evaluate | PyG HeteroData, 5 edge types |
 | `data/processed/degree_features_v3.csv` | graph_builder | feature_engine (written back) | N×5, cols=`degree_shares_*` |
-| `data/processed/synthetic_exposure_set_v3.pt` | synthetic_builder | hybrid | (750, 68) float32 tensor |
+| `data/processed/synthetic_exposure_set_v3.pt` | synthetic_builder | hybrid | (750, 44) float32 tensor |
 | `models/hybrid_graphmcm_v3.pth` | hybrid | xai, evaluate | `{model_state_dict, centroid, config}` |
 | `outputs/hybrid_scores_v3.csv` | hybrid | evt, self_training, fusion, xai | `application_id, hybrid_anomaly_score, feature_pred_error, edge_pred_error, per_feature_error_json, per_feature_predicted_json` — predicted column added 2026-07-03 (project-lead approved) so XAI states expected-vs-actual with direction; all three scoring paths (train, incremental, API staged) emit it via `hybrid_graphmcm_v3.compute_score_frame()` |
 | `outputs/subspace_if_scores_v3.csv` | subspace_if | fusion, xai | `application_id, subspace_if_score, group_scores_json` |
@@ -727,7 +727,7 @@ another module's source files directly. No embeddings cross module boundaries.
 | `data/processed/confirmed_fraud.json` | API / supervisor endpoint | retraining_orchestrator, self_training, fusion | `{confirmed: [{application_id, fraud_type, confirmed_by, cycle, feature_vec, confirmed_at, notes}], false_positives: [{application_id, confirmed_by, confirmed_at, notes}]}` |
 | `models/checkpoints/hybrid_v3_<cycle>_<run_id>.pth` | checkpoint_manager | rollback command, MLflow | same schema as `hybrid_graphmcm_v3.pth` (`model_state_dict`, `centroid`, `config`); keep last 5; filename encodes cycle and mlflow_run_id |
 | `outputs/prev_cycle_scores_ks.json` | retraining_orchestrator (end of cycle) | next-cycle drift check | `{scores: [float, ...]}` — score distribution baseline for KS test; overwritten after every completed inference cycle |
-| `outputs/feature_drift_v3.json` | retraining_orchestrator | API `/monitoring/drift` endpoint | `{feature_name: {ks_stat, p_value, mean_prev, mean_curr}}` for all 68 engineered features |
+| `outputs/feature_drift_v3.json` | retraining_orchestrator | API `/monitoring/drift` endpoint | `{feature_name: {ks_stat, p_value, mean_prev, mean_curr}}` for all 44 engineered features |
 | `outputs/staged_scores_<dataset_name>.csv` | `POST /v3/monitoring/evaluate-dataset` (ADR-014) | `GET /v3/monitoring/dataset-xai` | same schema as `hybrid_scores_v3.csv`, filtered to only the staged dataset's rows; read-only preview, not fused into `risk_scores_v3.csv` |
 | `outputs/staged_features_<dataset_name>.csv` | `POST /v3/monitoring/evaluate-dataset` (ADR-014) | `GET /v3/monitoring/dataset-xai` | scaled feature values for the staged rows, captured before canonical files are restored |
 | `outputs/staged_scores_meta_<dataset_name>.json` | `POST /v3/monitoring/evaluate-dataset` (ADR-014) | `POST /v3/training/decision` | `{dataset_path, n_rows, p_value, recommendation, drift_detected}` — carries the drift result into the audit log at decision time |
@@ -735,7 +735,7 @@ another module's source files directly. No embeddings cross module boundaries.
 | `data/backups/<timestamp>_<label>/` | `src/api/dataset_ops.backup_canonical_files()` (ADR-014) | `restore_canonical_files()`, manual rollback | snapshot of `RAW_CSV, NODEG_CSV, FINAL_CSV, SCHEMA_JSON, GRAPH_PT, DEGREE_CSV` before any merge; `evaluate-dataset` deletes its own backup after restoring, `decision` (incremental/full_retrain) keeps it |
 
 **Hard rule:** `per_feature_error_json` and `per_feature_predicted_json` are
-each a JSON string of `{feature_name: float}` for all 68 features. Downstream
+each a JSON string of `{feature_name: float}` for all 44 features. Downstream
 XAI reads these columns — their key sets must exactly match the feature names
 in `v3_feature_schema.json`. If they diverge, the XAI layer must raise, not
 silently skip unknown keys. Note: predicted values come from an unbounded
@@ -775,7 +775,7 @@ final feature CSV. Resolution:
    node degrees per edge type, writes `degree_features_v3.csv`.
 3. `tabular_feature_engine_v3.py` has a second entry point `add_degree_features()`
    that reads `degree_features_v3.csv`, merges into the temp CSV, writes the
-   final `engineered_features_v3.csv` with all 68 features, and updates
+   final `engineered_features_v3.csv` with all 44 features, and updates
    `v3_feature_schema.json`.
 
 `main_v3.py` must call them in this order:
@@ -797,7 +797,7 @@ row, stop and confirm scope.
 | Feature engine | `src/tabular_feature_engine_v3.py` | raw CSV | `engineered_features_v3.csv`, `v3_feature_schema.json` | no model code |
 | Graph builder | `src/graph_builder_v3.py` | `engineered_features_v3_nodeg.csv` | `identity_graph_v3.pt`, `degree_features_v3.csv` | no training code |
 | Config | `src/config_v3.py` | — | — | no logic, constants only |
-| Synthetic exposure | `src/synthetic_exposure_builder_v3.py` | `engineered_features_v3.csv` | `synthetic_exposure_set_v3.pt` (750×68) | no training code |
+| Synthetic exposure | `src/synthetic_exposure_builder_v3.py` | `engineered_features_v3.csv` | `synthetic_exposure_set_v3.pt` (750×44) | no training code |
 | Hybrid model | `src/hybrid_graphmcm_v3.py` | `identity_graph_v3.pt`, `synthetic_exposure_set_v3.pt`, `engineered_features_v3.csv` | `hybrid_scores_v3.csv`, `hybrid_graphmcm_v3.pth` | no rule thresholds |
 | Subspace IF | `src/subspace_if_v3.py` | `engineered_features_v3.csv` | `subspace_if_scores_v3.csv` | no neural network code |
 | EVT scorer | `src/evt_scorer_v3.py` | `hybrid_scores_v3.csv`, `subspace_if_scores_v3.csv` | `evt_thresholds_v3.json` | no model training |
@@ -840,7 +840,7 @@ row, stop and confirm scope.
 
 **Additional V3 stops:**
 
-9. **Dimension constants are in `config_v3.py` only.** Never hardcode `68`,
+9. **Dimension constants are in `config_v3.py` only.** Never hardcode `44`,
    `64`, `132`, `8`, or `5` inside module code.
 10. **`h_N(i)` never leaves `hybrid_graphmcm_v3.py`.** Raw graph embeddings
     are not outputs.
@@ -848,7 +848,7 @@ row, stop and confirm scope.
     `torch.zeros(GRAPH_EMB_DIM)` for isolated nodes is forbidden. The model
     must have a trainable `nn.Parameter` named `isolated_embedding` of shape
     `(GRAPH_EMB_DIM,)` initialized to `torch.randn`.
-12. **Degree features are always in the 63:68 slice.** Columns 0–62 are the
+12. **Degree features are always in the 39:44 slice.** Columns 0–38 are the
     original 63 features in V2 order. Columns 63–67 are
     `degree_shares_mobile`, `degree_shares_ip`, `degree_shares_father_name`,
     `degree_shares_mother_name`, `degree_shares_pincode`. Use named indexing
@@ -1381,7 +1381,7 @@ against `config_v3.py` before any swap. Rollback dispatched via `POST /v3/model/
 features (e.g., a policy change that inflates all reported incomes by 2×) is
 not caught until it shows up as anomaly score drift — a lagging indicator.
 **Decision:** After each cycle, compute and store mean and standard deviation
-of each of the 68 engineered features. At the next cycle, compute KS
+of each of the 44 engineered features. At the next cycle, compute KS
 statistics per feature and flag any feature where p < 0.01. Log to the MLflow
 run as a metric artifact `feature_drift_v3.json`. Alert but do not block
 inference — the supervisor decides whether to proceed or wait for full retrain.
@@ -1585,7 +1585,7 @@ baseline). Report per-category PR-AUC deltas.
 
 **Status:** Accepted (2026-07-03); implementation sequenced after ADR-015 on
 `v4-han-graphmcm`. Project-lead directed ML-architecture change.
-**Context:** Confirmed fraud today enters exposure as a 68-dim *feature vector*
+**Context:** Confirmed fraud today enters exposure as a 44-dim *feature vector*
 (`confirmed_fraud_store.get_exposure_tensor`), and in the graph stream even
 that collapses to the single `isolated_embedding` (`_get_synth_h` force-
 isolates every exposure node). So the model never learns fraud *topology* — a
@@ -1708,7 +1708,7 @@ path needing explicit sign-off under hard stop #2).
 | Both running simultaneously | ~14 GB — 4× safety margin within 64 GB |
 
 No module may hold more than one full copy of the feature matrix
-(15,000 × 68 float32 ≈ 4 MB) AND the full graph (`identity_graph_v3.pt`,
+(15,000 × 44 float32 ≈ 2.6 MB) AND the full graph (`identity_graph_v3.pt`,
 ≈ 400–800 MB) AND the model weights (≈ 300–600 MB) simultaneously in the
 same process outside of the training window.
 
