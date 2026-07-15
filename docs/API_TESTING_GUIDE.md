@@ -117,6 +117,42 @@ If `drift_detected: true` — stop and call the project lead before running any 
 
 ---
 
+### 2.2b Drift explanation — plain-English full-retrain rationale
+
+Narrates the same drift decision for a human reviewer, using **only** numbers the
+pipeline already computed (no new thresholds): the overall score-KS p-value vs
+`DRIFT_KS_THRESHOLD`, plus the per-feature KS table. Feature counts are scoped to
+the **44 model features** — the 24 dropped nominal identifiers (`v3_feature_schema.json`)
+are excluded and reported separately, so the panel reflects what a retrain would
+actually relearn.
+
+```powershell
+curl.exe -s "http://localhost:8000/v3/monitoring/drift-explain?top=12"
+```
+
+**Expected (shape):**
+```json
+{
+  "recommendation": "full_retrain",
+  "drift_detected": true,
+  "p_value": 1.74e-26,
+  "ks_threshold": 0.01,
+  "overall_explanation": "The score distribution shifted significantly: KS p-value ... a full GPU retrain is recommended ...",
+  "n_features": 44,
+  "n_drifted": 0,
+  "n_excluded_nonmodel": 24,
+  "feature_summary": "None of the 44 model features drifted this cycle (24 non-model identifier columns excluded).",
+  "top_features": [ { "feature": "...", "ks_stat": 0.0, "p_value": 1.0, "mean_shift": 0.0, "direction": "unchanged", "drifted": false, "explanation": "..." } ]
+}
+```
+
+`n_features` is the count of model features present in the drift file; if
+`feature_drift_v3.json` predates the 68→44 migration it still holds 68 entries,
+but this endpoint reports only the 44 (the surplus lands in `n_excluded_nonmodel`).
+Surfaced in the console's **admin → "Drift explanation"** panel.
+
+---
+
 ### 2.3 Reviewer explanation cards — *why* an application is suspicious
 
 Two HTML endpoints render the evidence for a single application. They are meant
@@ -129,6 +165,7 @@ terminal or a headless server.
 | `GET /v3/monitoring/{app_id}/ring` | Rotatable Plotly 3D identity ring (the deep-dive) | **Lazy** — the ring is computed only on this request (i.e. when the card's "Examine full ring in 3D" link is clicked), never in batch |
 | `GET /v3/monitoring/{app_id}/export` | Zip bundle for one flagged application: `<id>_scorecard.csv` (flat audit row incl. model-traceability summary) + `<id>_card.html` + `<id>_evidence.json` | Cheap — projects `explanation_cards_v3.json` |
 | `GET /v3/monitoring/export/bulk` | Zip of **all** flagged applications: `manifest.csv` (one scorecard row each) + `cards/<id>.html` + `evidence/<id>.json` | Renders every card once — seconds for the top-N set |
+| `GET /v3/monitoring/export/selected?ids=a,b,c` | Zip of a **reviewer-chosen subset**: `manifest.csv` + `cards/<id>.html` + **`rings/<id>.html`** (interactive 3D ring) + `evidence/<id>.json`; unknown ids listed in `_skipped.txt` | Renders one lazy Plotly ring per id (~5 MB each) — cap 200 ids |
 
 Cards exist **only for flagged (suspicious) applications** — those that crossed an
 EVT threshold, carry a self-training trigger, or hold a confirmed/pseudo label.
@@ -166,6 +203,13 @@ Expand-Archive GJ202526000221788_export.zip -DestinationPath .\one_export
 ```powershell
 curl.exe -s "http://localhost:8000/v3/monitoring/export/bulk" -o flagged_export.zip
 Expand-Archive flagged_export.zip -DestinationPath .\bulk_export   # manifest.csv is the master list
+```
+
+**Export a chosen subset (from the queue's multi-select — adds the 3D ring per app):**
+```powershell
+curl.exe -s "http://localhost:8000/v3/monitoring/export/selected?ids=GJ202526000221788,GJ202526000239186" -o selected_export.zip
+Expand-Archive selected_export.zip -DestinationPath .\selected_export   # cards/ + rings/ + evidence/ + manifest.csv
+# 400 = no ids supplied or >200 ids; 404 = none of the ids have a card
 ```
 The same bundles are available offline via the CLI, no server needed:
 ```powershell
@@ -423,6 +467,85 @@ Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/confirm-frau
 ```json
 {"detail": "application_id 'APP_FAKE' not found in data/processed/engineered_features_v3.csv"}
 ```
+
+---
+
+### 5.1b Confirm a batch, then optionally retrain (multi-select)
+
+Labels a reviewer-selected batch in one call — each item is either a
+confirmed-fraud (needs `fraud_type`) or a false-positive. Confirmed examples flow
+into the same confirmed-fraud store the incremental trainer reads (3× weight,
+RGCN frozen). Set `dispatch_retrain: true` to fire **one** human-gated
+incremental fine-tune afterwards (this is the console's "Record + retrain"
+action); `false` records the labels only. Per-item failures (bad `fraud_type`,
+unknown id, unknown verdict) are collected in `errors` without aborting the batch.
+
+```powershell
+Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/confirm-batch" `
+  -ContentType "application/json" `
+  -Body '{
+    "items": [
+      {"application_id": "GJ202526000239186", "verdict": "confirmed_fraud", "fraud_type": "IP_CLUSTER", "notes": "shared IP ring"},
+      {"application_id": "GJ202526000221788", "verdict": "false_positive", "notes": "legit rural school"}
+    ],
+    "confirmed_by": "investigator_name",
+    "cycle": "2025-26",
+    "dispatch_retrain": false,
+    "smoke_test": false
+  }'
+```
+
+**Expected:**
+```json
+{"status": "ok", "n_recorded": 2, "recorded": [...], "errors": [],
+ "n_confirmed": 1, "n_false_positives": 2, "retrain_dispatched": false, "job_id": null}
+```
+
+With `dispatch_retrain: true`, the response carries `retrain_dispatched: true` and
+a `job_id` you poll at `GET /v3/training/jobs/{job_id}` (section 4.3). Recording
+labels alone never advances training — the explicit retrain flag is the gate
+(hard stop #5).
+
+---
+
+### 5.1c Bring in a brand-new fraud pattern (CSV → relational LOE)
+
+For a **relationally-complex ring the model has never seen** that a supervisor
+discovered independently. Upload the ring (full raw-schema rows, fresh
+application_ids) via `/v3/monitoring/upload-dataset`, then:
+
+**Test read-only** — does the current model already catch it? Merges the ring,
+rebuilds features + the identity graph (so shared IP/name edges are real), scores
+just the ring, restores everything. Takes ~1 min.
+```powershell
+Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/pattern/test" `
+  -ContentType "application/json" -Body '{"dataset_path": "data/uploads/ring.csv"}'
+```
+```json
+{"n_members": 6, "members": [{"application_id": "...", "hybrid_anomaly_score": 0.46}, ...],
+ "mean_score": 0.44, "max_score": 0.47, "min_score": 0.39}
+```
+
+**Ingest as a relational pattern** — permanently merge the ring, extract its real
+intra-ring subgraph, append it as a topology-exposure cluster, record it in both
+confirmed stores, and (optionally) dispatch the human-gated retrain.
+```powershell
+Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/pattern/ingest" `
+  -ContentType "application/json" -Body '{
+    "dataset_path": "data/uploads/ring.csv", "fraud_type": "IP_CLUSTER",
+    "confirmed_by": "lead_1", "notes": "landlord-address ring",
+    "dispatch_retrain": true, "smoke_test": true }'
+```
+```json
+{"status": "ok", "pattern_id": "pat_ab12cd34", "n_rows_added": 6, "n_members": 6,
+ "topology_exposure": {"cluster_id": 50, "n_nodes": 6, "n_edges_directed": 60,
+   "edges_per_relation": {"shares_ip": 30, "shares_mother_name": 30},
+   "topology_exposure_total_nodes": 1299},
+ "n_confirmed_recorded": 6, "retrain_dispatched": true, "job_id": "job_retrain_xxxxxxxx"}
+```
+`ingest` permanently mutates the dataset + exposure set; `test` restores
+everything. 422 if the members share no identity attribute (no connected ring) or
+the fraud_type is invalid.
 
 ---
 

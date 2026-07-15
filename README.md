@@ -400,15 +400,16 @@ NIC fraud Detection Project/
 │   ├── fusion_classifier_v3.py             # Weighted SCORE-LEVEL fusion: subspace + dense-block-IP + hybrid → risk
 │   ├── xai_layer_v3.py                     # Evidence-first explanation cards: population percentiles, expected-vs-actual values, EVT-threshold quotes, deterministic narratives
 │   ├── evaluate_model_v3.py                # Category-specific subspace IF + degree-stratified PR-AUC
+│   ├── pattern_ingest_v3.py                # Supervisor CSV fraud-ring intake: test (read-only) + ingest as topology-exposure pattern
 │   ├── checkpoint_manager.py               # ADR-008: atomic checkpoint validation + hot-swap
 │   └── api/
 │       ├── main.py                         # FastAPI app entry point + structlog setup
 │       ├── schemas.py                      # Pydantic request/response models
 │       ├── tasks.py                        # Celery task definitions (5 tasks)
 │       └── handlers/
-│           ├── supervisor.py               # POST confirm-fraud, mark-false-positive, patterns/*
+│           ├── supervisor.py               # POST confirm-fraud, mark-false-positive, confirm-batch, pattern/test, pattern/ingest, patterns/*
 │           ├── training.py                 # POST incremental/full/decision, GET jobs/{id}, upload/pull checkpoint
-│           ├── monitoring.py               # GET drift, fraud-store-summary, top-suspicious, {id}/card|ring|topology|export, export/bulk; POST evaluate-dataset, upload-dataset
+│           ├── monitoring.py               # GET drift, drift-explain, fraud-store-summary, top-suspicious, {id}/card|ring|topology|export, export/bulk, export/selected; POST evaluate-dataset, upload-dataset
 │           └── model.py                    # GET checkpoint-info, stats, registry; POST rollback
 │
 ├── data/
@@ -522,6 +523,56 @@ screen-by-screen operator walkthrough see `docs/OPERATIONS_RUNBOOK.md`.
 ---
 
 ## Changelog
+
+### 2026-07-15 — Supervisor CSV fraud-pattern intake (relational LOE)
+
+Supervisors can now bring in a **brand-new, relationally-complex fraud ring the
+model has never seen** as a CSV of full raw-schema rows — not only patterns the
+model surfaced. New module `src/pattern_ingest_v3.py` + a purpose toggle on the
+admin **Intake** step ("New cohort to score" vs "New fraud pattern"):
+
+- **Test (read-only)** — `POST /v3/supervisor/pattern/test`: merges the ring,
+  rebuilds features **and the identity graph** (so the members' shared
+  IP/mobile/name/pincode edges are real), scores just the ring with the current
+  checkpoint, then restores every canonical file. Answers "does the model already
+  catch this?"
+- **Ingest as relational pattern** — `POST /v3/supervisor/pattern/ingest`:
+  permanently merges the ring, extracts its **real intra-ring subgraph across all
+  5 relations**, appends it as a new **topology-exposure cluster**
+  (`synthetic_exposure_graph_v3.pt`), records it in both confirmed stores (graph
+  pattern + tabular rows), and optionally dispatches the human-gated incremental
+  fine-tune. A **re-test** then shows detection after the model has learned it.
+- **Implemented the previously-stubbed topology-LOE injection.**
+  `confirmed_fraud_graph_store.promote()` now actually appends promoted patterns
+  to the topology-exposure set (extracting real edges, falling back to a clique on
+  the reviewer-asserted relation) — so the **Pattern queue → Promote** path also
+  feeds the RGCN exposure stream, not just the state machine.
+
+### 2026-07-15 — Triage-first console: multi-select batch label/retrain, export selected, drift explanation
+
+Reworked the review queue into a triage surface and added three supervisor
+workflows on top of the existing console (every prior control + endpoint
+preserved):
+
+- **Multi-select queue** — per-row checkboxes + select-all, an application-ID
+  filter and risk-level filter, colored **risk badges** (high/med/low), and a
+  session-local **remove/restore** so triaged rows stay out of the way without
+  mutating server data.
+- **Label / retrain selected** — a batch modal tags each selected application as
+  confirmed-fraud (with type) or false-positive, writes them to the confirmed-
+  fraud store, and optionally dispatches the **human-gated** incremental
+  fine-tune (confirmed at 3× weight, RGCN frozen). New endpoint
+  `POST /v3/supervisor/confirm-batch`. Recording labels never auto-advances
+  training — the "Record + retrain" click is the gate (hard stop #5).
+- **Export selected** — bundles a chosen subset as one zip (per-app scorecard
+  CSV + reviewer-card HTML + interactive identity-ring HTML + evidence JSON +
+  combined manifest). New endpoint `GET /v3/monitoring/export/selected?ids=…`
+  and `build_selected_export()` in `src/export_v3.py`.
+- **Drift explanation panel** (admin) — plain-English full-retrain rationale from
+  existing stats only: overall score-KS p-value vs `DRIFT_KS_THRESHOLD` plus the
+  per-feature KS table. New endpoint `GET /v3/monitoring/drift-explain`. Counts
+  are scoped to the **44 model features** (the 24 dropped nominal identifiers are
+  excluded via `v3_feature_schema.json`), so it reflects what a retrain relearns.
 
 ### 2026-07-10 — Review console + nginx front door, MLflow retired
 

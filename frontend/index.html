@@ -39,6 +39,23 @@
           <button id="btn-refresh-queue" class="ghost">↻ Refresh</button>
         </div>
       </div>
+      <div class="queue-toolbar" id="queue-toolbar" style="display:none;">
+        <label class="qt-select"><input type="checkbox" id="chk-select-all"> Select all</label>
+        <span class="qt-count" id="qt-count">0 selected</span>
+        <div class="qt-filters">
+          <input id="queue-search" type="search" placeholder="Filter by application ID…">
+          <select id="queue-risk-filter">
+            <option value="all">All risk levels</option>
+            <option value="high">High only</option>
+            <option value="med">Medium+</option>
+          </select>
+        </div>
+        <div class="spacer"></div>
+        <button id="btn-label-selected" class="ghost accent-btn" disabled>⚑ Label / retrain selected</button>
+        <button id="btn-export-selected" class="ghost" disabled>⤓ Export selected</button>
+        <button id="btn-remove-selected" class="ghost danger" disabled>✕ Remove selected</button>
+        <button id="btn-restore-removed" class="ghost" style="display:none;">↺ Restore removed</button>
+      </div>
       <div class="panel-body" id="queue-body">
         <div class="empty-state">Loading…</div>
       </div>
@@ -114,6 +131,15 @@
       </div>
     </div>
 
+    <!-- ---- DRIFT EXPLANATION (full-retrain rationale) ---- -->
+    <div class="panel">
+      <div class="panel-head">
+        <span>Drift explanation &mdash; should you full-retrain?</span>
+        <button id="btn-refresh-drift-explain" class="ghost">↻ Refresh</button>
+      </div>
+      <div class="panel-body" id="drift-explain-body"><div class="empty-state">Loading…</div></div>
+    </div>
+
     <!-- ---- DEPLOYMENT LOOP ---- -->
     <div class="panel">
       <div class="panel-head"><span>Deployment loop</span></div>
@@ -121,20 +147,51 @@
 
         <!-- Step 1 — intake -->
         <div class="step">
-          <div class="step-h"><span class="step-n">1</span> Intake — upload a new cohort (CSV, raw schema)</div>
+          <div class="step-h"><span class="step-n">1</span> Intake — upload data (CSV, raw schema)</div>
+          <div class="field" style="margin-bottom:12px;">
+            <label>What is this data for?</label>
+            <div class="seg intake-purpose" id="intake-purpose">
+              <button type="button" class="on" data-purpose="cohort">New cohort to score</button>
+              <button type="button" data-purpose="pattern">New fraud pattern (relational LOE)</button>
+            </div>
+          </div>
           <div class="dropzone" id="dropzone">
             <input type="file" id="file-input" accept=".csv" hidden>
             <div class="dz-inner">
               <div class="dz-icon">⬆</div>
-              <div>Drop a cohort CSV here, or <button class="linkbtn" id="btn-browse">browse</button></div>
-              <div class="dz-note">Validated against the canonical raw schema before anything is touched.</div>
+              <div>Drop a CSV here, or <button class="linkbtn" id="btn-browse">browse</button></div>
+              <div class="dz-note" id="dz-note">Validated against the canonical raw schema before anything is touched.</div>
             </div>
           </div>
           <div id="intake-report" class="job-status" style="display:none;"></div>
+
+          <!-- Pattern intake actions (shown only when purpose = new fraud pattern) -->
+          <div id="pattern-actions" class="pattern-actions" style="display:none;">
+            <p class="pa-note">
+              A supervisor-supplied fraud ring the model has never seen. <b>Test</b> scores the
+              group read-only (rebuilds features + the identity graph, so the members' shared
+              IP / mobile / name / pincode edges are real) — showing whether the current model
+              already catches it. <b>Ingest</b> permanently adds the ring, extracts its real
+              subgraph as a new topology-exposure cluster, records it in the confirmed stores,
+              and (if ticked) dispatches the human-gated incremental fine-tune so the model learns it.
+            </p>
+            <div class="pa-row">
+              <div class="field" style="flex:1;min-width:150px;margin:0;"><label>Reviewer name</label><input id="pattern-by" type="text" placeholder="your name"></div>
+              <div class="field" style="flex:1;min-width:150px;margin:0;"><label>Fraud type</label><select id="pattern-ftype"></select></div>
+            </div>
+            <div class="field" style="margin:10px 0 0;"><label>Notes (what makes this a ring?)</label><input id="pattern-notes" type="text" placeholder="e.g. 6 applications sharing one landlord address + mother name"></div>
+            <label class="pa-smoke"><input type="checkbox" id="pattern-smoke"> smoke test (fast retrain, for a dry run)</label>
+            <div class="pa-btns">
+              <button id="btn-pattern-test" class="ghost" disabled>◎ Test detection (read-only)</button>
+              <button id="btn-pattern-ingest" class="primary" disabled>⬇ Ingest as pattern + retrain</button>
+              <button id="btn-pattern-retest" class="ghost" style="display:none;">↻ Re-test after retrain</button>
+            </div>
+            <div id="pattern-result" class="job-status" style="display:none;"></div>
+          </div>
         </div>
 
         <!-- Step 2 — evaluate -->
-        <div class="step">
+        <div class="step cohort-step">
           <div class="step-h"><span class="step-n">2</span> Evaluate — score read-only + drift check</div>
           <div class="field">
             <label>Active dataset path (auto-filled from intake, or type a server-side path)</label>
@@ -145,7 +202,7 @@
         </div>
 
         <!-- Step 3 — decide -->
-        <div class="step">
+        <div class="step cohort-step">
           <div class="step-h"><span class="step-n">3</span> Decide — human-gated, acts on the active cohort</div>
           <div style="display:flex;gap:12px;flex-wrap:wrap;">
             <div class="field" style="flex:1;min-width:140px;"><label>Cycle</label><input id="decision-cycle" type="text" placeholder="2026H1"></div>
@@ -259,6 +316,40 @@
         <button id="btn-loe-cancel" class="ghost">Cancel</button>
         <button id="btn-loe-submit" class="primary">Record pattern</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ BATCH LABEL & RETRAIN MODAL ============ -->
+<div class="modal-backdrop" id="batch-modal">
+  <div class="modal" style="height:auto;max-height:92vh;width:min(760px,96vw);">
+    <div class="modal-head">
+      <span class="m-title">Label &amp; retrain · <span class="num" id="batch-count">0</span> selected</span>
+      <div class="spacer"></div>
+      <button id="btn-batch-close" class="ghost">✕ Close</button>
+    </div>
+    <div class="modal-body" style="background:var(--panel);overflow:auto;padding:18px;">
+      <p style="font-size:12px;color:var(--muted);margin:0 0 14px;">
+        Confirmed-fraud examples feed the confirmed-fraud store (3× weight, RGCN frozen);
+        false-positives become hard negatives. Recording labels alone changes nothing until
+        you dispatch the human-gated incremental fine-tune.
+      </p>
+      <div class="batch-shared">
+        <div class="field" style="margin:0;"><label>Reviewer name</label><input id="batch-by" type="text" placeholder="your name"></div>
+        <div class="field" style="margin:0;"><label>Cycle (optional)</label><input id="batch-cycle" type="text" placeholder="2026H1"></div>
+      </div>
+      <div class="batch-bulkset">
+        <span>Set all to:</span>
+        <button class="ghost" data-bulk="confirmed_fraud">confirmed fraud</button>
+        <button class="ghost" data-bulk="false_positive">false positive</button>
+      </div>
+      <div id="batch-list" class="batch-list"></div>
+      <label class="batch-smoke"><input type="checkbox" id="batch-smoke"> smoke test (fast, no real training)</label>
+      <div class="batch-actions">
+        <button id="btn-batch-record" class="ghost">Record labels only</button>
+        <button id="btn-batch-retrain" class="primary">Record + retrain (incremental)</button>
+      </div>
+      <div id="batch-result" class="job-status" style="display:none;"></div>
     </div>
   </div>
 </div>

@@ -41,6 +41,123 @@ def check_drift():
     )
 
 
+@router.get("/drift-explain")
+def drift_explain(top: int = 12):
+    """Plain-English drift report for the full-retrain decision — surfaces ONLY
+    numbers the pipeline already computed:
+
+      * overall score-distribution KS (src.retraining_orchestrator._check_drift):
+        p-value + recommendation, judged against config DRIFT_KS_THRESHOLD.
+      * per-feature KS (outputs/feature_drift_v3.json): the features that shifted
+        most between the previous and current cohort, with their mean shift.
+
+    No thresholds are invented here (hard stop #1) — the only cutoff cited is the
+    existing DRIFT_KS_THRESHOLD, and the per-feature 'drifted' flags are read
+    straight from the file. This endpoint narrates; it never re-decides.
+    """
+    from src.retraining_orchestrator import _check_drift
+
+    p_value, recommendation = _check_drift()
+    drift_detected = recommendation == "full_retrain"
+
+    # Overall sentence — faithful to _check_drift's own branches.
+    if recommendation == "no_scores":
+        overall_text = ("No scored cohort is staged yet, so there is nothing to compare - "
+                        "run an evaluation first.")
+    elif recommendation == "first_run":
+        overall_text = ("This is the first scored cohort, so there is no previous cycle to "
+                        "compare against - no drift can be measured yet.")
+    elif drift_detected:
+        overall_text = (f"The score distribution shifted significantly: KS p-value {p_value:.4g} "
+                        f"is below the alert threshold of {DRIFT_KS_THRESHOLD} (smaller p = a "
+                        f"bigger shift), so a full GPU retrain is recommended before the next "
+                        f"incremental update.")
+    else:
+        overall_text = (f"The score distribution is stable: KS p-value {p_value:.4g} is at or "
+                        f"above the alert threshold of {DRIFT_KS_THRESHOLD}, so an incremental "
+                        f"fine-tune is sufficient - no full retrain needed.")
+
+    # Per-feature detail from the file the incremental cycle writes. The drift
+    # file is computed over ALL raw columns, but only the model's feature set
+    # (44 numeric features after the 2026-07-15 noid drop) actually feeds the
+    # detector — so restrict the narrative to those. The 24 nominal identifier
+    # columns dropped from the model are excluded from the drift count; showing
+    # them would misrepresent what a retrain would relearn.
+    feat_path   = Path("outputs/feature_drift_v3.json")
+    schema_path = Path("data/processed/v3_feature_schema.json")
+    model_features: set[str] | None = None
+    if schema_path.exists():
+        model_features = set(json.loads(schema_path.read_text()).get("features", [])) or None
+
+    features_total = 0
+    n_drifted = 0
+    n_excluded_nonmodel = 0
+    drifted_feats: list[dict] = []
+    if feat_path.exists():
+        fd_all = json.loads(feat_path.read_text())
+        # Keep only model features when the schema is available; otherwise fall
+        # back to every column (older runs without a schema file).
+        if model_features is not None:
+            fd = {k: v for k, v in fd_all.items() if k in model_features}
+            n_excluded_nonmodel = len(fd_all) - len(fd)
+        else:
+            fd = fd_all
+        features_total = len(fd)
+        n_drifted = sum(1 for s in fd.values() if s.get("drifted"))
+        rows = []
+        for name, s in fd.items():
+            mean_curr = s.get("mean_curr")
+            mean_prev = s.get("mean_prev")
+            shift = None
+            direction = "unchanged"
+            if isinstance(mean_curr, (int, float)) and isinstance(mean_prev, (int, float)):
+                shift = mean_curr - mean_prev
+                direction = "higher" if shift > 0 else "lower" if shift < 0 else "unchanged"
+            rows.append({
+                "feature":   name,
+                "ks_stat":   s.get("ks_stat"),
+                "p_value":   s.get("p_value"),
+                "mean_prev": mean_prev,
+                "mean_curr": mean_curr,
+                "mean_shift": shift,
+                "direction": direction,
+                "drifted":   bool(s.get("drifted", False)),
+                "explanation": (
+                    f"'{name}' shifted {direction} (mean {mean_prev} -> {mean_curr}); "
+                    f"KS {s.get('ks_stat')}, p={s.get('p_value')}"
+                    + (" - flagged as drifted." if s.get("drifted") else " - within normal variation.")
+                ),
+            })
+        # Drifted first, then by KS statistic descending (largest shift first).
+        rows.sort(key=lambda r: (not r["drifted"], -(r["ks_stat"] or 0.0)))
+        drifted_feats = rows[:max(0, top)]
+
+    excluded_note = (f" ({n_excluded_nonmodel} non-model identifier columns excluded)"
+                     if n_excluded_nonmodel else "")
+    if features_total == 0:
+        feature_text = "No per-feature drift file yet - run an incremental cycle to populate it."
+    elif n_drifted == 0:
+        feature_text = (f"None of the {features_total} model features drifted this cycle{excluded_note}.")
+    else:
+        feature_text = (f"{n_drifted} of {features_total} model features drifted{excluded_note}; "
+                        f"the largest shifts are listed below.")
+
+    log.info("monitoring.drift_explain", p_value=p_value, recommendation=recommendation,
+             n_features=features_total, n_drifted=n_drifted, n_excluded_nonmodel=n_excluded_nonmodel)
+    return {
+        "recommendation":  recommendation,
+        "drift_detected":  drift_detected,
+        "p_value":         p_value,
+        "ks_threshold":    DRIFT_KS_THRESHOLD,
+        "overall_explanation": overall_text,
+        "n_features":      features_total,
+        "n_drifted":       n_drifted,
+        "n_excluded_nonmodel": n_excluded_nonmodel,
+        "feature_summary": feature_text,
+        "top_features":    drifted_feats,
+    }
+
+
 @router.get("/fraud-store-summary", response_model=FraudStoreSummaryResponse)
 def fraud_store_summary():
     from src.confirmed_fraud_store import load_confirmed, load_false_positive_ids
@@ -290,6 +407,46 @@ def export_bulk():
         )
     filename, data = result
     log.info("monitoring.export_bulk", filename=filename, bytes=len(data))
+    return Response(
+        content=data, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/export/selected")
+def export_selected(ids: str = ""):
+    """
+    Export a reviewer-chosen subset of flagged applications as one zip:
+    manifest.csv + cards/<id>.html + evidence/<id>.json + rings/<id>.html
+    (the interactive 3D identity ring, self-contained). `ids` is a
+    comma-separated list of application IDs (from the queue's multi-select).
+
+    IDs with no card are skipped and listed in _skipped.txt; IDs with a card but
+    no graph edges get card+evidence but no ring. Built from existing artefacts —
+    the only render is the lazy Plotly ring. 404 if none of the IDs have a card.
+    """
+    from fastapi.responses import Response
+    from src.export_v3 import build_selected_export
+
+    id_list = [s.strip() for s in ids.split(",") if s.strip()]
+    if not id_list:
+        raise HTTPException(status_code=400, detail="No application IDs supplied (?ids=a,b,c)")
+    # Each ring embeds Plotly (~5 MB); cap the batch so a stray request can't
+    # build a multi-GB zip. Operational guard, not a domain threshold.
+    if len(id_list) > 200:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many IDs ({len(id_list)}); export at most 200 at once, or use Export all flagged",
+        )
+
+    result = build_selected_export(id_list)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail="None of the selected applications have a card (not flagged, or cards not generated)",
+        )
+    filename, data = result
+    log.info("monitoring.export_selected", n_requested=len(id_list), filename=filename, bytes=len(data))
     return Response(
         content=data, media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},

@@ -15,7 +15,10 @@ from src.api.schemas import (
     FalsePositiveRequest,
     ClearLabelRequest,
     ConfirmPatternRequest,
-    PromotePatternRequest
+    PromotePatternRequest,
+    ConfirmBatchRequest,
+    PatternTestRequest,
+    PatternIngestRequest,
 )
 
 log    = structlog.get_logger()
@@ -89,6 +92,139 @@ def clear_label(req: ClearLabelRequest):
         )
     log.info("supervisor.clear_label", app_id=req.application_id, **result)
     return {"status": "ok", "application_id": req.application_id, **result}
+
+
+@router.post("/confirm-batch")
+def confirm_batch(req: ConfirmBatchRequest):
+    """Record supervisor verdicts for a reviewer-selected batch, then optionally
+    dispatch ONE incremental fine-tune over the (now label-augmented) data.
+
+    Each item is either a confirmed-fraud (needs fraud_type — one of
+    confirmed_fraud_store.VALID_FRAUD_TYPES) or a false-positive. Per-item errors
+    (unknown fraud_type, id not in features, unknown verdict) are collected and
+    reported without aborting the whole batch; already-labelled ids are recorded
+    as 'skipped'. Confirmed examples flow into the SAME confirmed_fraud_store the
+    incremental trainer reads (3x LightGBM weight, RGCN frozen) — this endpoint
+    builds no ad-hoc training set.
+
+    Training is dispatched ONLY when dispatch_retrain is true (the "retrain on
+    selected" action). Recording labels alone never advances training — hard
+    stop #5 (no automatic self-training rounds) is respected: the reviewer's
+    explicit click is the gate.
+    """
+    from src.confirmed_fraud_store import (
+        add_confirmed, add_false_positive, load_confirmed, load_false_positive_ids,
+    )
+
+    if not req.items:
+        raise HTTPException(status_code=400, detail="items is empty — nothing to label")
+
+    recorded, errors = [], []
+    for item in req.items:
+        aid = item.application_id
+        try:
+            if item.verdict == "confirmed_fraud":
+                add_confirmed(
+                    app_id=aid, fraud_type=item.fraud_type,
+                    confirmed_by=req.confirmed_by, notes=item.notes, cycle=req.cycle,
+                )
+            elif item.verdict == "false_positive":
+                add_false_positive(app_id=aid, confirmed_by=req.confirmed_by, notes=item.notes)
+            else:
+                errors.append({"application_id": aid,
+                               "error": f"unknown verdict '{item.verdict}' "
+                                        f"(expected confirmed_fraud | false_positive)"})
+                continue
+            recorded.append({"application_id": aid, "verdict": item.verdict})
+        except ValueError as e:
+            errors.append({"application_id": aid, "error": str(e)})
+
+    n_confirmed = len(load_confirmed())
+    n_fp        = len(load_false_positive_ids())
+
+    job_id = None
+    if req.dispatch_retrain and recorded:
+        # Mirror the pattern-promotion dispatch: pin the Celery task_id to our
+        # job_id so GET /v3/training/jobs/{job_id} can poll it. Incremental
+        # orchestrator retrains on existing (now label-augmented) data — no
+        # dataset_path needed.
+        import uuid
+        job_id = f"job_retrain_{uuid.uuid4().hex[:8]}"
+        from src.api.tasks import run_incremental_task
+        run_incremental_task.apply_async(
+            kwargs=dict(cycle=req.cycle or "supervisor_batch", smoke_test=req.smoke_test),
+            task_id=job_id,
+        )
+
+    log.info(
+        "supervisor.confirm_batch",
+        n_recorded=len(recorded), n_errors=len(errors),
+        n_confirmed=n_confirmed, n_false_positives=n_fp,
+        dispatched=bool(job_id),
+    )
+    return {
+        "status": "ok",
+        "n_recorded": len(recorded),
+        "recorded": recorded,
+        "errors": errors,
+        "n_confirmed": n_confirmed,
+        "n_false_positives": n_fp,
+        "retrain_dispatched": bool(job_id),
+        "job_id": job_id,
+    }
+
+
+@router.post("/pattern/test")
+def pattern_test(req: PatternTestRequest):
+    """Read-only: score a supervisor-uploaded fraud ring against the CURRENT
+    model. Merges the ring, rebuilds features + the identity graph (so the
+    members' real shared-IP/name edges exist), scores just the ring, then
+    restores every canonical file. Answers 'does the model already catch it?'.
+    Synchronous and can take ~1 min (a full feature+graph rebuild), like
+    /v3/monitoring/evaluate-dataset.
+    """
+    from src.pattern_ingest_v3 import test_pattern
+    try:
+        result = test_pattern(req.dataset_path)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    log.info("supervisor.pattern_test", dataset_path=req.dataset_path, n_members=result["n_members"])
+    return result
+
+
+@router.post("/pattern/ingest")
+def pattern_ingest(req: PatternIngestRequest):
+    """Permanently ingest a supervisor ring as a RELATIONAL pattern: merge it
+    into the dataset, extract its real intra-ring subgraph (all 5 relations),
+    append it as a new cluster to the topology-exposure set, and record it in
+    both confirmed stores (graph pattern + tabular rows). Optionally dispatch the
+    human-gated incremental fine-tune afterwards (dispatch_retrain — the gate;
+    recording alone never trains, hard stop #5). Synchronous merge+rebuild (~1 min)
+    then an async retrain job.
+    """
+    from src.pattern_ingest_v3 import ingest_pattern
+    try:
+        result = ingest_pattern(
+            csv_path=req.dataset_path, fraud_type=req.fraud_type,
+            confirmed_by=req.confirmed_by, notes=req.notes, cycle=req.cycle,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    job_id = None
+    if req.dispatch_retrain:
+        import uuid
+        job_id = f"job_retrain_{uuid.uuid4().hex[:8]}"
+        from src.api.tasks import run_incremental_task
+        run_incremental_task.apply_async(
+            kwargs=dict(cycle=req.cycle or "pattern_ingest", smoke_test=req.smoke_test),
+            task_id=job_id,
+        )
+    result["retrain_dispatched"] = bool(job_id)
+    result["job_id"] = job_id
+    log.info("supervisor.pattern_ingest", pattern_id=result["pattern_id"],
+             n_members=result["n_members"], dispatched=bool(job_id))
+    return result
 
 
 @router.get("/patterns")

@@ -59,7 +59,21 @@ This is the reviewer's main screen.
 - **Status tiles** (top): confirmed-fraud count, false-positive count, live
   checkpoint size, and the current drift recommendation.
 - **Top suspicious applications**: the ranked queue from the last pipeline run.
-  Click any row to open it.
+  Click any row to open it. Each row carries a colored **risk badge**
+  (High / Medium / Low).
+- **Triage toolbar** (above the queue): tick rows (or **Select all**), then
+  filter by application-ID or risk level. With rows selected you can:
+  - **⚑ Label / retrain selected** — opens a batch dialog where you tag each
+    application confirmed-fraud (with type) or false-positive, enter your name,
+    then either **Record labels only** or **Record + retrain (incremental)**.
+    The retrain is the human gate — recording labels alone changes nothing.
+    Tick **smoke test** for a fast dry run. The job id + live status appear in
+    the dialog.
+  - **⤓ Export selected** — downloads one zip of the chosen applications
+    (scorecard CSV + reviewer card + 3D identity ring + evidence, per app,
+    plus a combined `manifest.csv`).
+  - **✕ Remove selected** / **↺ Restore removed** — hide triaged rows for this
+    session only; server data is untouched.
 - **Reviewer card** (opens below the row): the full evidence card for that
   application — a risk gauge, the ranked reason codes, per-field
   *declared-vs-model-expected* comparison bars, and an interactive identity
@@ -83,9 +97,10 @@ Candidate patterns flagged from reviewer cards land here.
 
 - Each pending pattern shows its id, fraud type, and the sub-graph you flagged.
 - Tick the ones you want to act on and click **Promote selected patterns**.
-  Promotion records the patterns as confirmed and dispatches an **incremental
-  retrain** so the model learns them. Tick **smoke test** first for a fast,
-  no-real-training dry run.
+  Promotion appends each pattern's ring to the model's **topology-exposure set**
+  (extracting the members' real shared-attribute edges, or a clique on the
+  relation you asserted) and dispatches an **incremental retrain** so the model
+  learns them. Tick **smoke test** first for a fast, no-real-training dry run.
 - The job id and live status appear beneath the button.
 
 ---
@@ -103,11 +118,29 @@ edge counts), the scored-population size, confirmed / false-positive counts, the
 drift recommendation, the last evaluation's PR-AUC numbers, and the last run.
 Hit **↻ Refresh** to re-read.
 
+**Drift explanation — should you full-retrain?**: plain-English rationale for the
+drift decision, built only from numbers the pipeline already computed — the
+overall score-distribution KS p-value vs the alert threshold, and a table of the
+model features that shifted most. Counts cover the **44 model features** (the 24
+dropped identifier columns are excluded and noted). A red verdict means a full
+retrain is recommended before the next incremental update.
+
 **Deployment loop** — four numbered steps, top to bottom:
 
-1. **Intake** — drag a new cohort **CSV** onto the drop-zone (or *browse*). It's
-   saved server-side and checked against the raw schema; you get a row count and
-   a pass/fail. A schema mismatch blocks the next steps.
+1. **Intake** — first pick **what the data is for**:
+   - **New cohort to score** (default) — drag a cohort **CSV** onto the drop-zone
+     (or *browse*). It's saved server-side and checked against the raw schema; you
+     get a row count and a pass/fail. A schema mismatch blocks the next steps.
+   - **New fraud pattern (relational LOE)** — for a brand-new fraud **ring** a
+     supervisor found that the model has never seen. Upload the ring (full
+     raw-schema rows, fresh IDs), then use the pattern box that appears:
+     **Test detection** scores the ring read-only (rebuilds features + the graph,
+     so the members' shared IP/name edges are real) to show whether the current
+     model catches it; **Ingest as pattern + retrain** permanently adds the ring,
+     appends its real subgraph as a topology-exposure cluster, records it in the
+     confirmed stores, and dispatches the human-gated fine-tune. **Re-test after
+     retrain** shows detection once the model has learned it. (Steps 2–3 below are
+     for cohorts and are hidden in this mode; the retrain job still shows in step 4.)
 2. **Evaluate** — scores the uploaded cohort read-only (no model change) and
    reports a drift p-value. The dataset path is filled in for you from step 1.
    *This rebuilds features + graph synchronously and can take a few minutes.*

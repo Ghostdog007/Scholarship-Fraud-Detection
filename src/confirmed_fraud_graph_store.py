@@ -119,13 +119,33 @@ def promote(pattern_ids: list[str]) -> list[dict]:
                 p["state"] = "PROMOTED"
                 p["updated_at"] = datetime.utcnow().isoformat()
                 promoted.append(p)
-                
+
     _save_store(store)
-    
-    # In a full implementation, we would extract the node features from `subgraph` 
-    # and append them to `synthetic_exposure_graph_v3.pt` here.
-    # The actual feature extraction logic would depend on whether `subgraph` stores full features or just IDs.
-    
+
+    # Append each promoted pattern's ring to the topology-exposure set so the
+    # RGCN stream actually learns it (previously a no-op stub). The subgraph
+    # carries the member application_ids (Flag-for-LOE stores {"nodes": [...],
+    # "edges": [{"type": <relation>}]}); we extract their REAL intra-ring edges
+    # from the identity graph, falling back to a clique on the reviewer-asserted
+    # relation when the members share no typed attribute. Best-effort: a pattern
+    # whose members aren't in the current graph is skipped, not fatal.
+    from src.pattern_ingest_v3 import append_ring_to_topology_exposure
+    for p in promoted:
+        sg = p.get("subgraph") or {}
+        member_ids = [str(m) for m in (sg.get("nodes") or sg.get("member_ids") or [])]
+        if not member_ids:
+            member_ids = [str(p.get("center_app_id"))] if p.get("center_app_id") else []
+        asserted = [e.get("type") for e in (sg.get("edges") or []) if isinstance(e, dict) and e.get("type")]
+        if len(member_ids) < 2:
+            p["exposure"] = {"appended": False, "reason": "fewer than 2 members"}
+            continue
+        try:
+            info = append_ring_to_topology_exposure(member_ids, fallback_edge_types=asserted or None)
+            p["exposure"] = {"appended": True, **info}
+        except Exception as e:  # noqa: BLE001 — never let a bad subgraph break promotion
+            p["exposure"] = {"appended": False, "reason": str(e)}
+
+    _save_store(store)
     return promoted
 
 

@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 CARDS_JSON = Path("outputs/explanation_cards_v3.json")
+RISK_CSV   = Path("outputs/risk_scores_v3.csv")
 OUT_DIR    = Path("outputs/exports")
 
 # Flat scorecard columns, in order. Kept explicit so the CSV schema is stable
@@ -152,6 +153,73 @@ def build_bulk_export() -> tuple[str, bytes] | None:
     return f"flagged_export_{ts}.zip", buf.getvalue()
 
 
+def _ring_html_bytes(app_id: str, risk_map: dict | None) -> bytes | None:
+    """Render the interactive 3D identity-ring HTML for one application, or None
+    if the application has no typed edges (not in the identity graph). This is
+    the 'relevant SVG' for the selected bundle — a self-contained rotatable
+    Plotly view, not a static image (no kaleido dependency)."""
+    from src.xai_card_html_v3 import build_ring_html
+    html = build_ring_html(app_id, risk_map=risk_map)
+    if html is None:
+        return None
+    return html.encode("utf-8")
+
+
+def build_selected_export(app_ids: list[str]) -> tuple[str, bytes] | None:
+    """Zip bytes for a reviewer-chosen subset of flagged applications.
+
+    Per app, bundles: scorecard row (combined manifest.csv) + reviewer-card HTML
+    (cards/) + interactive identity-ring HTML (rings/) + evidence JSON
+    (evidence/). IDs with no card are skipped and listed in _skipped.txt; IDs
+    with a card but no graph edges get a card+evidence but no ring (noted in the
+    manifest is not needed — absence of the rings/ file is the signal).
+
+    Like the other builders, this recomputes NOTHING except the lazy Plotly ring
+    (which is a pure render of existing graph + risk artefacts). Returns
+    (filename, data), or None if none of the requested IDs have a card."""
+    cards = _load_cards()
+    if not cards:
+        return None
+
+    # Preserve caller order; de-dupe while keeping first occurrence.
+    seen: set[str] = set()
+    ordered_ids = [x for x in (str(a) for a in app_ids)
+                   if not (x in seen or seen.add(x))]
+
+    picked  = [(aid, _find_card(cards, aid)) for aid in ordered_ids]
+    found   = [(aid, c) for aid, c in picked if c is not None]
+    skipped = [aid for aid, c in picked if c is None]
+    if not found:
+        return None
+
+    # Load risk_map once and reuse for every ring render (build_ring_html would
+    # otherwise re-read risk_scores_v3.csv per application).
+    risk_map: dict = {}
+    if RISK_CSV.exists():
+        import pandas as pd
+        rdf = pd.read_csv(RISK_CSV)
+        risk_map = dict(zip(rdf["application_id"], rdf["risk_score_v3"]))
+
+    rows = [scorecard_row(c) for _, c in found]
+    ts   = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    buf  = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("manifest.csv", _scorecard_csv_bytes(rows))
+        for aid, c in found:
+            safe = str(aid).replace("/", "_")
+            z.writestr(f"cards/{safe}.html",    _card_html_bytes(aid))
+            z.writestr(f"evidence/{safe}.json", json.dumps(c, indent=2).encode("utf-8"))
+            ring = _ring_html_bytes(aid, risk_map)
+            if ring is not None:
+                z.writestr(f"rings/{safe}.html", ring)
+        if skipped:
+            z.writestr("_skipped.txt",
+                       ("These requested IDs had no reviewer card and were skipped "
+                        "(not flagged, or cards not generated):\n"
+                        + "\n".join(skipped)).encode("utf-8"))
+    return f"selected_export_{len(found)}apps_{ts}.zip", buf.getvalue()
+
+
 def _write(result: tuple[str, bytes] | None, label: str) -> None:
     if result is None:
         print(f"[export] nothing to export for {label} — is outputs/explanation_cards_v3.json present?")
@@ -168,8 +236,12 @@ if __name__ == "__main__":
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--app-id", help="export a single flagged application")
     g.add_argument("--bulk", action="store_true", help="export all flagged applications")
+    g.add_argument("--ids", help="export a chosen subset: comma-separated application IDs")
     args = ap.parse_args()
     if args.bulk:
         _write(build_bulk_export(), "bulk")
+    elif args.ids:
+        ids = [s.strip() for s in args.ids.split(",") if s.strip()]
+        _write(build_selected_export(ids), f"selected ({len(ids)} ids)")
     else:
         _write(build_single_export(args.app_id), f"application {args.app_id}")

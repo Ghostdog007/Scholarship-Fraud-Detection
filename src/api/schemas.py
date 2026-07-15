@@ -38,6 +38,43 @@ class PromotePatternRequest(BaseModel):
     smoke_test: bool = False
 
 
+class PatternTestRequest(BaseModel):
+    """Read-only detection test for a supervisor-uploaded fraud ring (already
+    uploaded via /v3/monitoring/upload-dataset — pass its server-side path)."""
+    dataset_path: str
+
+
+class PatternIngestRequest(BaseModel):
+    """Permanently ingest a supervisor ring as a relational pattern (topology
+    exposure + confirmed stores), then optionally dispatch the human-gated
+    incremental fine-tune."""
+    dataset_path: str
+    fraud_type: str           # one of confirmed_fraud_store.VALID_FRAUD_TYPES
+    confirmed_by: str
+    notes: str = ""
+    cycle: str = ""
+    dispatch_retrain: bool = False
+    smoke_test: bool = False
+
+
+class BatchLabelItem(BaseModel):
+    application_id: str
+    verdict: str              # "confirmed_fraud" | "false_positive"
+    fraud_type: str = ""      # required when verdict == "confirmed_fraud"
+    notes: str = ""
+
+
+class ConfirmBatchRequest(BaseModel):
+    """Label a reviewer-selected batch in one call, then optionally dispatch the
+    human-gated incremental fine-tune. dispatch_retrain is the explicit human
+    gate — recording labels never auto-advances training on its own."""
+    items: list[BatchLabelItem]
+    confirmed_by: str
+    cycle: str = ""
+    dispatch_retrain: bool = False
+    smoke_test: bool = False
+
+
 # ── Training jobs ─────────────────────────────────────────────────────────────
 
 class JobResponse(BaseModel):
