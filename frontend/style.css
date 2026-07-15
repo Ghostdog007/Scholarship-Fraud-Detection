@@ -306,14 +306,24 @@ iframe.card-embed {
 }
 .qt-select input { accent-color: var(--cyan); width: 15px; height: 15px; cursor: pointer; }
 .qt-count { font-size: 12px; color: var(--muted); font-family: var(--mono); min-width: 74px; }
-.qt-filters { display: inline-flex; align-items: center; gap: 8px; }
+.qt-filters { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .qt-filters input[type="search"], .qt-filters select {
-  font-family: var(--sans); font-size: 12.5px; padding: 6px 10px;
-  border: 1px solid var(--border2); border-radius: 8px; background: var(--ground); color: var(--fg);
+  font-family: var(--sans); font-size: 12.5px; padding: 6px 10px; height: 32px;
+  border: 1px solid var(--border2); border-radius: 8px; background-color: var(--ground); color: var(--fg);
 }
-.qt-filters input[type="search"] { width: 210px; }
+.qt-filters input[type="search"] { width: 210px; max-width: 100%; }
 .qt-filters input[type="search"]:focus, .qt-filters select:focus { outline: none; border-color: var(--cyan); }
 .qt-filters input[type="search"]::placeholder { color: var(--faint); }
+
+/* Custom dropdown chevron — native <select> arrows can render invisible on the
+   dark theme in some browsers, which makes the control look broken/unclickable.
+   appearance:none + an inline SVG chevron guarantees a visible affordance. */
+.qt-filters select, .field select, .batch-row select {
+  -webkit-appearance: none; -moz-appearance: none; appearance: none;
+  padding-right: 30px; cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238b949e' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 10px center; background-size: 10px 7px;
+}
 
 /* ---- queue row cells: checkbox + risk badge ---- */
 .qcell-chk { width: 34px; text-align: center; }
