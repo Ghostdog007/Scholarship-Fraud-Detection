@@ -224,6 +224,30 @@ function updateSelectionUI() {
   all.checked = chks.length > 0 && [...chks].every((c) => c.checked);
 }
 
+// Open one application's reviewer card in the detail panel below the queue.
+// (Distinct from the multi-select checkboxes: this is the single-row "Open"
+// action — clicking a row, or its "Open →" button.)
+async function selectApp(appId, rowEl) {
+  selectedAppId = appId;
+  document.querySelectorAll("#queue-body tr").forEach((r) => r.classList.remove("row-selected"));
+  if (rowEl) rowEl.classList.add("row-selected");
+
+  document.getElementById("detail-section").style.display = "block";
+  document.getElementById("detail-app-id").textContent = appId;
+  document.getElementById("detail-section").scrollIntoView({ behavior: "smooth", block: "start" });
+
+  const frame = document.getElementById("card-frame");
+  frame.style.height = "420px";
+  frame.onload = () => autosizeFrame(frame);
+  frame.srcdoc = "<p style='font-family:sans-serif;padding:14px;color:#c9d1d9;background:#0d1117;margin:0;'>Loading card…</p>";
+  try {
+    const html = await apiGetText(`/v3/monitoring/${encodeURIComponent(appId)}/card`);
+    frame.srcdoc = html ?? "<p style='font-family:sans-serif;padding:14px;color:#c9d1d9;background:#0d1117;margin:0;'>No card for this application.</p>";
+  } catch (e) {
+    frame.srcdoc = `<p style='font-family:sans-serif;padding:14px;color:#ffb3b5;background:#0d1117;margin:0;'>Failed to load card: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
 document.getElementById("btn-refresh-queue").addEventListener("click", loadQueue);
 document.getElementById("queue-search").addEventListener("input", renderQueue);
 document.getElementById("queue-risk-filter").addEventListener("change", renderQueue);
