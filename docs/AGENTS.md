@@ -20,8 +20,9 @@ two chained decisions, plus the human workflow that feeds them:
    clusters are captured as subgraphs, staged in a review queue, visualized on
    the FastAPI surface (IDs kept, 1-hop, ~50-node cap), and — on supervisor
    selection — spliced into the synthetic exposure set for a batched, human-
-   triggered retrain. MLflow is the audit/lineage record; FastAPI is the only
-   interactive + action surface.
+   triggered retrain. `model_registry.json` + the admin console's run history
+   are the audit/lineage record (originally MLflow — since removed, see the
+   ADR-016 status addendum); FastAPI is the only interactive + action surface.
 
 See ADR-015 and ADR-016 (Appendix F) for the full decision records.
 
@@ -109,9 +110,15 @@ exposure**; set `ENCODER_ARCH="rgcn"`, `TOPO_EXPOSURE_ENABLED=True`
   deviation: `last_beta_r` is a global `[5]` vector, not per-node.
 - **Supervisor cycle + viz (T6):** `topology_view.py`,
   `confirmed_fraud_graph_store.py`, new endpoints in `api/handlers/
-  {monitoring,supervisor}.py`, MLflow SVG logging in `main_v3.py`. Built and
-  smoke-tested; the promote/exposure-write action path is cleared to enable
-  now that topology exposure is validated.
+  {monitoring,supervisor}.py`. Built and smoke-tested. The promote/
+  exposure-write action path is **implemented (2026-07-15)**:
+  `confirmed_fraud_graph_store.promote()` appends each promoted pattern's
+  real subgraph (via `pattern_ingest_v3.append_ring_to_topology_exposure`)
+  as one cluster in `synthetic_exposure_graph_v3.pt`, recording the result
+  in the pattern's `exposure` field. Note: MLflow was later removed from the
+  stack (replaced by `model_registry.json` + the admin console); the SVG
+  logging referenced in ADR-016 no longer exists — see the ADR-016 status
+  addendum.
 - **Reviewer-card presentation + review loop (2026-07-06):** new module
   `src/xai_card_html_v3.py` renders the evidence-first cards
   (`explanation_cards_v3.json`) as interactive HTML — **suspicious/flagged
@@ -123,8 +130,9 @@ exposure**; set `ENCODER_ARCH="rgcn"`, `TOPO_EXPOSURE_ENABLED=True`
   review via the card's buttons → `POST /v3/supervisor/{confirm-fraud,
   mark-false-positive,clear-label}`. `clear-label` (new; `remove_label()` in
   `confirmed_fraud_store.py`) undoes a label so the detection loop can be
-  re-demoed. `main_v3.py` renders the cards after `run_xai` and logs
-  `outputs/cards` to MLflow (`artifact_path="cards"`). The dead LightGBM/SHAP
+  re-demoed. `main_v3.py` renders the cards after `run_xai` (originally also
+  logged to MLflow as a `cards` artifact — MLflow since removed; cards are
+  served from `outputs/cards/` directly). The dead LightGBM/SHAP
   path in `xai_layer_v3.py` was replaced with the exact closed-form fusion
   attribution. (Also fixed a pre-existing committed syntax error in
   `api/handlers/supervisor.py` — an unterminated module docstring — that had
@@ -1638,6 +1646,31 @@ synthetic (the current `min_real=5` heuristic may not transfer to subgraphs);
 whether β_r signatures are stored for retrieval-style matching (a new export
 path needing explicit sign-off under hard stop #2).
 **Phase:** — (ML architecture, outside the MLOps phase track)
+
+**Status addendum (2026-07-16, applied under project-lead direction):**
+- **Promote path implemented (2026-07-15).** `promote()` in
+  `confirmed_fraud_graph_store.py` is no longer a stub: it appends each
+  promoted pattern's subgraph to `synthetic_exposure_graph_v3.pt` as one new
+  cluster (real intra-ring typed edges from `identity_graph_v3.pt`; clique
+  fallback on the reviewer-asserted relation when members share no typed
+  attribute), and records `{"appended": ...}` per pattern in an `exposure`
+  field. Retraining remains a separate, supervisor-triggered dispatch
+  (no-auto-retrain decision unchanged).
+- **New entry point into this lifecycle: supervisor CSV pattern intake
+  (2026-07-15).** `src/pattern_ingest_v3.py` +
+  `POST /v3/supervisor/pattern/{test,ingest}` let a supervisor bring in a
+  brand-new relational fraud ring as full raw-schema rows: *test* scores it
+  read-only (merge → rebuild → score → restore); *ingest* permanently merges
+  it, then enters this ADR's lifecycle via
+  `add_confirmed_pattern → select → promote` (the promote step above does the
+  exposure append), plus tabular `add_confirmed` per member. Exposure data is
+  real supervisor-confirmed records, consistent with hard stop #7.
+- **MLflow surface removed.** The audit/lineage surface described under
+  "Surfaces" (static SVG artifacts + decision records in MLflow) was replaced
+  by `model_registry.json` + the admin console's run-history view. The
+  decision record (pattern IDs, reviewer, exposure result) now lives in
+  `confirmed_fraud_graph_store.json`; PII/access-control rules stated above
+  carry over to it.
 
 ---
 
