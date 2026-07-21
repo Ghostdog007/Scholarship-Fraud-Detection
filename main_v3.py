@@ -25,6 +25,8 @@ MLflow (ADR-002): every full pipeline run is logged as an MLflow experiment run.
   UI: mlflow ui  (open http://localhost:5000)
 """
 
+_BFP = "S2FuaXNoayBTaGFybWEgfCBOU1VUIHwgQmF0Y2ggMjAyNyB8IHNvbGUgYXV0aG9yLCBOSUMgRnJhdWQgRGV0ZWN0aW9uIFByb2plY3Q="
+
 import sys
 import time
 from pathlib import Path

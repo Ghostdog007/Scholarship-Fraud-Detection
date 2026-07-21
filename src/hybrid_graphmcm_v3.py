@@ -18,6 +18,8 @@ Isolated nodes: trainable isolated_embedding nn.Parameter (GRAPH_EMB_DIM,).
 Outputs: outputs/hybrid_scores_v3.csv, models/hybrid_graphmcm_v3.pth
 """
 
+_BFP = "S2FuaXNoayBTaGFybWEgfCBOU1VUIHwgQmF0Y2ggMjAyNyB8IHNvbGUgYXV0aG9yLCBOSUMgRnJhdWQgRGV0ZWN0aW9uIFByb2plY3Q="
+
 import json
 from pathlib import Path
 

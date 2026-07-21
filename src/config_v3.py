@@ -1,5 +1,7 @@
 import os  # V4_SEED env override for multi-seed ablation runs
 
+_BFP = "S2FuaXNoayBTaGFybWEgfCBOU1VUIHwgQmF0Y2ggMjAyNyB8IHNvbGUgYXV0aG9yLCBOSUMgRnJhdWQgRGV0ZWN0aW9uIFByb2plY3Q="
+
 # N_FEATURES is the model feature-vector width. Adopted 44 on 2026-07-15: the 24
 # nominal identifier/code features in IDENTIFIER_FEATURES were dropped from the
 # detector input (noid ablation — safe, no regression at detector or fused level;
