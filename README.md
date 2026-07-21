@@ -63,6 +63,46 @@ kept as an independent audit signal, not a fusion input.
 
 ---
 
+## V4-Scale — PostgreSQL + Kubernetes Remodel (`V4-Scale` branch, implemented)
+
+The detection architecture above is **fixed** — V4-Scale doesn't touch model
+math, it rebuilds the I/O around it so the system can process **30–40 lakh
+(3–4 million) applications** on the production Kubernetes server (16 vCPU,
+64 GB RAM, no GPU) instead of the 15k it was built against. Full detail,
+including the real Postgres schema, the external-GPU-checkpoint mechanism,
+and measured scale numbers: **`docs/TECHNICAL_REFERENCE_AND_SCALING.md`**.
+
+**What changed:**
+- **PostgreSQL is the system of record** — every application, feature
+  vector, score, label, LOE pattern, and training run lives in Postgres
+  (10 tables, `deploy/postgres/schema.sql`), not flat files. A `db-init`
+  container auto-applies the schema and ingests/replays data on every
+  `docker compose up`, so Postgres is populated the moment the API starts.
+- **SQL-pushdown feature engineering** replaces whole-frame pandas — proven
+  **bit-exact** against the old pipeline on all 44 model features.
+- **Hub-capped identity graph** replaces all-pairs edge construction (a
+  shared value with thousands of members would otherwise produce millions of
+  edges) — capped to a clique below a threshold, a star above it.
+- **Exact-neighborhood mini-batch training** replaces full-graph RGCN
+  passes — proven **bit-exact** against full-graph scoring on 15k, and
+  measured at **3.53 GB peak memory on a synthetic 1M-application test**
+  (memory is not the constraint at 3.5M; training *time*, projected at
+  ~101 h for a full retrain, is — hence the next point).
+- **External GPU-checkpoint ingestion** — a model trained entirely outside
+  the cluster (e.g. a GPU laptop, same `config_v3.py`) can be uploaded
+  through the admin console, schema-validated, and atomically hot-swapped
+  in, with zero in-cluster training time.
+- **Console CSV intake is unchanged** — upload/Evaluate/Decide behave
+  identically; underneath, rows now land in a Postgres staging batch instead
+  of a file.
+
+All five migration steps are implemented and gate-tested (bit-for-bit parity
+checks, live-stack verification via Playwright) — see `docs/IMPLEMENTATION.md`
+for the step-by-step evidence and `docs/HISTORY.md` for how the detection
+architecture above was locked in the first place.
+
+---
+
 ## What This Is
 
 An unsupervised fraud detection system for 15,000 NIC scholarship applications.
@@ -381,7 +421,7 @@ NIC fraud Detection Project/
 ├── main_v3.py                              # Pipeline orchestrator (V3)
 ├── README.md                               # This file
 ├── Dockerfile                              # CPU image (python:3.12-slim)
-├── docker-compose.yml                      # Redis + nic-api + nic-worker + nginx
+├── docker-compose.yml                      # postgres + db-init + redis + nic-api + nic-worker + nginx
 ├── docker-compose.override.yml             # Dev-only frontend hot-mount (auto-merged)
 ├── celeryconfig.py                         # Celery broker/worker config (concurrency=1)
 ├── requirements-docker.txt                 # Linux min-version pins for Docker builds
@@ -389,28 +429,41 @@ NIC fraud Detection Project/
 ├── src/
 │   ├── config_v3.py                        # All dimension constants (single source of truth)
 │   ├── model_registry.py                   # Run/metric/checkpoint history (replaces MLflow)
-│   ├── tabular_feature_engine_v3.py        # engineer, then drop 24 identifiers → 44
-│   ├── graph_builder_v3.py                 # 5 typed edges + degree computation
+│   ├── tabular_feature_engine_v3.py        # engineer, then drop 24 identifiers → 44 (+ SQL-pushdown path)
+│   ├── graph_builder_v3.py                 # 5 typed edges + degree computation (+ hub-capped PG path)
 │   ├── synthetic_exposure_builder_v3.py    # 750 × 44 LOE tensor (graph-side only)
-│   ├── hybrid_graphmcm_v3.py               # Core model: feature stream + graph stream
+│   ├── hybrid_graphmcm_v3.py               # Core model: feature stream + graph stream (+ NeighborLoader path)
 │   ├── subspace_if_v3.py                   # 3-group subspace isolation forest (tabular backbone)
 │   ├── dense_block_detector_v3.py          # FRAUDAR greedy peeling on shares_ip (IP specialist)
 │   ├── evt_scorer_v3.py                    # GPD tail fit on 6 signals (hybrid + 5 subspace)
 │   ├── self_training_loop_v3.py            # Pseudo-label promotion (human-gated, ≥2 of 5 EVT signals)
 │   ├── fusion_classifier_v3.py             # Weighted SCORE-LEVEL fusion: subspace + dense-block-IP + hybrid → risk
 │   ├── xai_layer_v3.py                     # Evidence-first explanation cards: population percentiles, expected-vs-actual values, EVT-threshold quotes, deterministic narratives
+│   ├── xai_card_html_v3.py                 # Interactive reviewer cards (base + cohort-preview, PG-backed rings)
+│   ├── topology_view.py                    # Ego-graph extraction (PG-backed + staged-cohort fallback)
+│   ├── retraining_orchestrator.py          # Drift check + retrain dispatch (PG-backed baselines)
 │   ├── evaluate_model_v3.py                # Category-specific subspace IF + degree-stratified PR-AUC
 │   ├── pattern_ingest_v3.py                # Supervisor CSV fraud-ring intake: test (read-only) + ingest as topology-exposure pattern
-│   ├── checkpoint_manager.py               # ADR-008: atomic checkpoint validation + hot-swap
+│   ├── checkpoint_manager.py               # ADR-008: atomic checkpoint validation + hot-swap (external GPU checkpoints too)
+│   ├── confirmed_fraud_store.py / confirmed_fraud_graph_store.py  # JSON stores, dual-written to Postgres
+│   ├── db/                                 # ALL SQL lives here (hard stop 14) — see docs/TECHNICAL_REFERENCE_AND_SCALING.md §11
+│   │   ├── connection.py · migrate.py · bootstrap.py   # pool/config, schema apply, one-shot startup init
+│   │   ├── ingest.py                       # primary-batch ingest + staged-batch lifecycle (stage/evaluate/merge/delete)
+│   │   ├── reads.py                        # payload-exact PG read mirrors (queue, ego-graph, fraud summary)
+│   │   ├── features.py                     # SQL-pushdown aggregates, persisted-scaler save/load, hub-capped edges
+│   │   ├── stores.py / drift.py            # dual-write mirrors for the JSON stores + drift baselines
 │   └── api/
 │       ├── main.py                         # FastAPI app entry point + structlog setup
 │       ├── schemas.py                      # Pydantic request/response models
-│       ├── tasks.py                        # Celery task definitions (5 tasks)
+│       ├── tasks.py                        # Celery task definitions
 │       └── handlers/
 │           ├── supervisor.py               # POST confirm-fraud, mark-false-positive, confirm-batch, pattern/test, pattern/ingest, patterns/*
 │           ├── training.py                 # POST incremental/full/decision, GET jobs/{id}, upload/pull checkpoint
 │           ├── monitoring.py               # GET drift, drift-explain, fraud-store-summary, top-suspicious, {id}/card|ring|topology|export, export/bulk, export/selected; POST evaluate-dataset, upload-dataset
 │           └── model.py                    # GET checkpoint-info, stats, registry; POST rollback
+│
+├── scripts/
+│   └── profile_group_sizes.py              # K_CAP profiling query (rerun against real-scale data)
 │
 ├── data/
 │   ├── raw/data_for_ml_model.csv           # 15,000 × 136 (unchanged)
@@ -440,12 +493,15 @@ NIC fraud Detection Project/
 │
 ├── deploy/
 │   ├── README.md                           # Local Docker + Kubernetes deploy guide
+│   ├── postgres/schema.sql                 # The system-of-record schema (10 tables)
 │   ├── nginx/                              # front-door image (serves frontend + proxies API)
-│   └── k8s/nic-fraud.yaml                  # Kubernetes manifests
+│   └── k8s/nic-fraud.yaml                  # Kubernetes manifests (incl. postgres pod)
 │
 └── docs/
-    ├── AGENTS.md                           # Architecture contract (do not edit autonomously)
-    ├── IMPLEMENTATION.md                   # Settled V4 detection architecture
+    ├── AGENTS.md                           # Architecture + scale contract (do not edit autonomously)
+    ├── TECHNICAL_REFERENCE_AND_SCALING.md  # Full model + Postgres + scaling reference (start here for depth)
+    ├── IMPLEMENTATION.md                   # 5-step Postgres migration plan + gate evidence
+    ├── HISTORY.md                          # How the detection architecture was locked, with metrics
     ├── OPERATIONS_RUNBOOK.md               # Start Docker → open the console → what each screen does
     └── API_TESTING_GUIDE.md                # Manual curl testing guide for the API
 ```
@@ -483,15 +539,25 @@ docker compose up -d
 docker compose down
 ```
 
-Docker starts four containers: `redis` (broker), `nic-api` (FastAPI), `nic-worker`
-(Celery, concurrency=1), and `nginx` (the **front door** — serves the `frontend/`
-console and reverse-proxies the API, so the browser only needs `:8080`). Training
-jobs dispatched from the console run inside `nic-worker` and write to the mounted
-`data/`, `models/`, `outputs/` volumes.
+Docker starts six containers: `postgres` (system of record, host port **5433**
+— not 5432, to avoid colliding with a locally-installed PostgreSQL), `db-init`
+(one-shot — applies the schema and ingests/replays data into Postgres, then
+exits; `nic-api`/`nic-worker` wait for it to finish before starting), `redis`
+(broker), `nic-api` (FastAPI), `nic-worker` (Celery, concurrency=1), and
+`nginx` (the **front door** — serves the `frontend/` console and
+reverse-proxies the API, so the browser only needs `:8080`). Training jobs
+dispatched from the console run inside `nic-worker` and write to the mounted
+`data/`, `models/`, `outputs/` volumes and to Postgres.
 
-For operating the console screen-by-screen see `docs/OPERATIONS_RUNBOOK.md`; for
-the full local + Kubernetes deployment (storage, worker-singleton, no-GPU notes)
-see `deploy/README.md`; for raw endpoint testing see `docs/API_TESTING_GUIDE.md`.
+**Gotcha:** if you rebuild only `nic-api`/`nic-worker` (not the whole stack),
+`nginx` keeps the old container's cached IP and every request 502s — run
+`docker compose restart nginx` after a partial rebuild.
+
+For operating the console screen-by-screen see `docs/OPERATIONS_RUNBOOK.md`;
+for the full model architecture, the Postgres schema, and the scaling story
+see `docs/TECHNICAL_REFERENCE_AND_SCALING.md`; for the full local +
+Kubernetes deployment (storage, worker-singleton, no-GPU notes) see
+`deploy/README.md`; for raw endpoint testing see `docs/API_TESTING_GUIDE.md`.
 
 ---
 
@@ -523,6 +589,55 @@ screen-by-screen operator walkthrough see `docs/OPERATIONS_RUNBOOK.md`.
 ---
 
 ## Changelog
+
+### 2026-07-21 — V4-Scale: PostgreSQL system of record + Kubernetes-scale remodel
+
+Branch `V4-Scale`. Detection architecture unchanged (locked, see above);
+every I/O boundary rebuilt for 30–40 lakh (3–4M) applications. Full detail:
+`docs/TECHNICAL_REFERENCE_AND_SCALING.md`; step-by-step gate evidence:
+`docs/IMPLEMENTATION.md`.
+
+- **PostgreSQL system of record** — 10-table schema (`deploy/postgres/
+  schema.sql`): `applications`, `identity_keys`, `features`,
+  `feature_scaling`, `scores`, `confirmed_fraud`, `loe_patterns`,
+  `evt_thresholds`, `training_runs`, `drift_baselines`. All access through
+  the new `src/db/` package (hard stop: no inline SQL elsewhere).
+- **`db-init` bootstrap** — a one-shot container service applies the schema
+  and ingests/replays data into Postgres on every `docker compose up`;
+  `nic-api`/`nic-worker` wait for it, so Postgres is populated the moment
+  the API starts, not just reachable.
+- **Reads flip to Postgres by default** (`NIC_READS_FROM_PG=1`), falling
+  back to files automatically on any query failure — the review queue,
+  status tiles, 3D rings, and ego-graphs are now served from indexed SQL
+  instead of whole-file parses / an in-memory graph. Verified identical to
+  the old file/graph paths across 150 sampled ego-graphs and 60 rings.
+- **CSV intake unchanged, staging added underneath** — uploads land in a
+  Postgres staging batch (raw rows only; nothing derived until Evaluate),
+  Evaluate populates preview scores, Decide → Merge makes it permanent. The
+  cohort-preview reviewer card was rebuilt to share the same rendering
+  components as the base card (real identity-network view, ranked reason
+  codes, expandable fields) instead of a separate flat-table template.
+- **SQL-pushdown feature engineering + persisted scaler** — proven
+  bit-exact against the file pipeline on all 44 features; the scaler now
+  persists its fitted parameters instead of refitting per batch (closes a
+  batch-statistics leak).
+- **Hub-capped identity graph + exact-neighborhood training** — replaces
+  all-pairs edge construction and full-graph RGCN passes. Every truncating
+  NeighborLoader fan-out tested deviated from full-graph scores; exact
+  2-hop batching reproduces them bit-for-bit while keeping memory bounded.
+  Measured on a synthetic 1M-application population: **3.53 GB peak RSS**;
+  full-retrain wall-clock projects to ~101 h at 3.5M on CPU (training time,
+  not memory, is the real scaling constraint).
+- **External GPU-checkpoint ingestion** — a checkpoint trained entirely
+  outside the cluster can be uploaded via the admin console, schema-
+  validated (rejected outright on any mismatch, live model untouched), and
+  atomically hot-swapped in.
+- **K_CAP profiling query built** (`scripts/profile_group_sizes.py`) and
+  dry-run tested on the 15k primary population; the production threshold
+  still needs a real-scale ingest to derive (open decision).
+- Two real deployment bugs found and fixed via a live `docker compose up`
+  test: `postgres:18`'s changed volume-mount convention, and the Dockerfile
+  not copying `deploy/postgres/schema.sql` into the image.
 
 ### 2026-07-15 — Supervisor CSV fraud-pattern intake (relational LOE)
 
