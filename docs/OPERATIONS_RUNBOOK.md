@@ -227,7 +227,44 @@ history) and roll the live model back to it — the undo for a bad install.
 
 ---
 
-## 6. Quick reference
+## 6. What columns each data case needs
+
+Every CSV that enters the system — whatever the case — must carry the **full
+raw schema: all 136 columns of `data/raw/data_for_ml_model.csv`**, same
+names. The intake check hard-fails and blocks the next steps if any column is
+missing (extra columns are reported but tolerated). **Never pre-engineer
+anything** — you supply raw columns; the system does its own feature
+engineering (raw → 44 model features) and identity extraction. The
+downloadable **sample CSV** (admin → Intake) is a ready-to-fill template with
+every required column.
+
+| Case | How it enters | Column requirements on top of the full raw schema |
+|---|---|---|
+| **Valid applications / new cohort to score** | Admin → Intake → "New cohort to score" → Evaluate | Fresh, unique `application_id`s (not already in the base data). Populate the identity fields honestly — they build the graph and 3D rings. |
+| **Fraudulent ring / new LOE pattern** | Admin → Intake → "New fraud pattern (relational LOE)" | Fresh `application_id`s, and the ring members must actually **share the linking value** (same `ip_address`, or same `mobile_no`, etc.) so their real edges materialise; otherwise the system falls back to the relation you assert in the dialog. |
+| **Confirmed fraud / false positives (individual labels)** | No CSV — reviewer card buttons or the batch Label/retrain dialog | Only an `application_id` that already exists in the scored population. Feature vectors are pulled automatically. |
+| **Bulk / portal ingestion (V4-Scale, in progress)** | Direct to PostgreSQL staging | Same contract: raw-schema rows only into the staging batch; nothing derived until an admin triggers Evaluate/Merge. |
+
+Columns that actually drive detection (get these right first):
+
+- **Identity / graph (the 5 relations + rings):** `ip_address`, `mobile_no`,
+  `father_name`, `mother_name`, `permanent_pincode` — plus `applicant_name`
+  for the name-similarity signals.
+- **Financial:** `annual_family_income`, `admission_fee`, `tution_fee`,
+  `misc_fee`.
+- **Temporal:** `date_of_birth`, `registered_date` (→ age at registration).
+- **Context:** `permanent_district_id`, `domicile_state_id` (income
+  rank/deviation), `c_institution_id` (institute concentration), `gender`,
+  `rural_urban`, and the boolean flags (`disability_flag`, `orphan_flag`,
+  `hosteller`, `is_singlegirlchild`).
+- **Ignored by the model but still required by the schema check:** the
+  null/duplicate/audit columns (`updated_by`, `delete_*`, `state_id-2`, …)
+  and `sanity` / `jwt` (never used — hard stop). Fill them with empty/0
+  values if you have nothing; they just have to exist.
+
+---
+
+## 7. Quick reference
 
 | I want to… | Where |
 |---|---|
