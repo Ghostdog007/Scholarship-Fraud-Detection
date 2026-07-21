@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS feature_scaling (
     feature_name    TEXT NOT NULL,
     col_min         DOUBLE PRECISION NOT NULL,
     col_max         DOUBLE PRECISION NOT NULL,
+    -- sklearn MinMaxScaler's exact fitted parameters (transform is
+    -- x*scale_factor + offset) — stored verbatim so the persisted apply is
+    -- bit-identical to the original fit_transform (Gate 4).
+    scale_factor    DOUBLE PRECISION NOT NULL,
+    offset_         DOUBLE PRECISION NOT NULL,
     log1p           BOOLEAN NOT NULL DEFAULT FALSE,
     fitted_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (schema_version, feature_name)

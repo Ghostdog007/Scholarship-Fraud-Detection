@@ -130,7 +130,26 @@ evaluated cohort must render exactly as today — beautified reviewer cards,
 3D identity rings, ego-graphs, exports — for cohort applications as well as
 the base population (the user-visible console loses nothing).
 
-## Step 4 — Feature engineering + graph at scale ☐
+## Step 4 — Feature engineering + graph at scale ✅ (gate passed 2026-07-21)
+
+> Gate evidence (15k):
+> **Features:** `build_base_pg()` (raw from PG JSONB via CSV-round-trip
+> reconstruction, aggregates pushed to SQL) reproduces the canonical outputs
+> **bit-for-bit — 63/63 nodeg columns and 44/44 final columns exact**, incl.
+> the pandas-rank replication ((RANK+(ties−1)/2)/n) and PERCENTILE_CONT
+> median. **Scaler persisted** (sklearn's exact scale_/min_ in
+> `feature_scaling`); `apply_stored_scaling()` reproduces fit_transform
+> within **1 ULP** (max abs diff 1.11e-16 — hex-verified single-rounding/FMA
+> context difference in the identical x·scale+min expression; pipeline-path
+> bit-parity is the binding check and is exact). Hard-stop-11 enforced:
+> missing params raise, never refit.
+> **Graph:** `build_graph_pg()` from `identity_keys` groups — degree features
+> **5/5 bit-exact**, adjacency **identical on all 5 relations** (317k
+> directed edges). **Hub-cap machinery verified but OFF by default** (1,657
+> groups starred at k_cap=3 smoke; pincode 104k→10.7k undirected edges);
+> K_CAP + ceiling remain open decision #1 (lead-owned, needs 3.5M
+> profiling). Outputs land in separate `_pg` files until cut-over (hard
+> stop 13); `main_v3.py` still runs the file path.
 
 First model-module edits; one module at a time.
 
