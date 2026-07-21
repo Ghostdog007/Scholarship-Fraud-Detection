@@ -278,9 +278,16 @@ allowed anywhere in the system (hard stop #1).
 
 ### 6.6 Fusion (`fusion_classifier_v3.py`) — LOCKED score-level weighted sum
 
-The original LightGBM stacker was **removed**: with only 14 positives it
-destroyed calibrated components (subspace PR-AUC 0.966 → 0.315). The locked
-replacement (AGENTS.md H.8):
+> **Fusion history — read this if your records mention LightGBM.** LightGBM
+> was the *former* fusion layer and is **superseded**. Any recorded
+> "LightGBM fusion, PR-AUC ~0.639" describes the removed stacker, not the
+> current system. Source: `docs/AGENTS.md` §H.8 and
+> `outputs/ablation/tier_comparison.json`.
+
+The original LightGBM stacker was **removed**: with only 14 positives the
+meta-learner had essentially no signal to fit combination weights on, and it
+destroyed calibrated components (subspace PR-AUC 0.966 → 0.315, RGCN IP
+0.51 → 0.169). The locked replacement (AGENTS.md H.8):
 
 ```
 final_risk = minmax( 1.0 · minmax(subspace_if_score)
@@ -367,6 +374,13 @@ of several ingestion paths into PostgreSQL, not a replaced feature.
 ---
 
 # PART II — REMODEL FOR 30–40 LAKH APPLICATIONS (PostgreSQL + Kubernetes)
+
+> **Scale target, stated once:** 30–40 **lakh** = **3.0–4.0 million**
+> applications. All sizing in Part II assumes **≤ 4M rows**. A 30–40 *million*
+> target would invalidate the single-node PostgreSQL and k3s pod sizing below —
+> at that order, single-primary write throughput (one-shot ingest + feature +
+> score table rewrites) becomes the bottleneck before the GNN does, and a
+> separate design round would be required. Do not reuse these numbers for it.
 
 ## 10. Scale delta and what actually breaks
 
@@ -503,10 +517,21 @@ handler internals behind the same endpoints.
 
 ### 12.1 Ingest
 
-`COPY` (or `psycopg` `copy_expert`) loads ~3.5M rows in minutes. At ingest
-time, per-row normalisation happens once: identity keys lowercased/stripped
-into `identity_keys`, dates parsed, money coerced. The 23 null/duplicate
-column drops become simply "not selected".
+`COPY` (or `psycopg` `copy_expert`) loads ~3.5M rows in single-digit minutes.
+Benchmarks: pganalyze measured **14 s via COPY vs ~9,000 s via single-row
+INSERTs for 10M rows**; Tiger Data's benchmark establishes a ~100,000 rows/s
+sustained baseline for plain COPY; CYBERTEC's PostgreSQL 16 10M-row benchmark
+confirms the same COPY-vs-INSERT gap. At ingest time, per-row normalisation
+happens once: identity keys lowercased/stripped into `identity_keys`, dates
+parsed, money coerced. The 23 null/duplicate column drops become simply "not
+selected".
+
+⚠ These numbers are **ingest throughput only** — they say nothing about
+concurrent read/write contention while `nic-api` pods serve the review queue
+during a merge or retrain window. At ≤ 4M batch-cadence writes this is
+manageable; it is the first thing that stops holding if the target ever grows
+toward 30–40M (single-primary write throughput is what eventually forces
+workloads off Postgres — see the Part II scale note).
 
 ### 12.2 Feature engineering: push the aggregates into SQL
 
@@ -580,7 +605,15 @@ AGENTS.md Appendix F, now made concrete.)
 
 - IF: `fit` on a uniform sample (e.g. 500k rows is statistically ample for
   iForest), `score_samples` over the population in chunks. Minutes on 16 vCPU.
-- EVT: operates on score vectors (3.5M floats ≈ 14 MB) — unchanged.
+- EVT: operates on score vectors (3.5M floats ≈ 14 MB) — logic unchanged, and
+  **reliability improves at this scale**. GPD shape estimation is known to be
+  unstable at low exceedance counts: Hosking & Wallis (1987) show measurably
+  worse bias/RMSE for probability-weighted-moment GPD estimators below ~500
+  exceedances, with empirical stabilization reported above ~150–500. The tail
+  sample at a 99.9th-percentile threshold grows from **~15 points (15k rows) to
+  ~3,500 (3.5M rows)** — moving shape estimation from a known-unstable regime
+  into an established-stable one, which should reduce how often the
+  `EVT_SHAPE_MIN/MAX` rejection fires and falls back to empirical quantiles.
 - Fusion: three-vector weighted sum — unchanged. Writes `scores` instead of CSV.
 
 ### 13.2 Hybrid GraphMCM: neighbor-sampled mini-batch training
@@ -589,12 +622,23 @@ The one real model change. Replace full-graph forward passes with **PyG
 `NeighborLoader`**: sample e.g. [15, 10] neighbors per layer per relation,
 batch 1024 seed nodes. Memory per batch is bounded regardless of graph size;
 all losses (masked-feature, edge, LOE margin, DeepSVDD) compute per-batch
-already. Estimated full retrain on the 16 vCPU server: the current 8–16 h
-CPU envelope grows with data but sampling caps per-epoch cost — expect
-**24–48 h for a full retrain at 3.5M**, which is acceptable for a
-once-or-twice-yearly cycle (plan it in the operational calendar). Incremental
-fine-tune (MLP-only, RGCN frozen) stays cheap: score-relevant subsets only,
-~1–3 h.
+already.
+
+**Retrain time: unvalidated projection.** The working estimate is **24–48 h
+for a full retrain at 3.5M** on the 16 vCPU server (vs the current 8–16 h at
+15k), acceptable for a once-or-twice-yearly cycle. However, **no published
+CPU-only benchmark validates this at our node count and architecture.** The
+closest primary source, DistGNN-MB (arXiv:2211.06385), benchmarks minibatch
+GraphSAGE/GAT on x86 CPU at OGBN-Products/Papers100M scale but reports
+relative speedups, not single-node wall-clock hours. Most other NeighborLoader
+benchmarks are CPU-sample + GPU-train hybrids where host-to-device copy
+consumes 60–80 % of per-batch time (arXiv:2106.06150) — that bottleneck does
+not exist on a pure-CPU worker, so their throughput numbers do not transfer.
+**Acceptance gate:** the migration-step-5 synthetic-1M test must record
+epochs/hour; extrapolate linearly from that measurement before scheduling the
+first real 3.5M retrain. Incremental fine-tune (MLP-only, RGCN frozen) stays
+cheap: score-relevant subsets only, ~1–3 h (same caveat: confirm on the 1M
+test).
 
 **Scoring** (inference) streams the population through the same sampler —
 no training graph in memory at once. Score direction, exports, and hard stops
@@ -602,8 +646,16 @@ no training graph in memory at once. Score direction, exports, and hard stops
 
 ### 13.3 Dense-block detector
 
-k-core + peeling on the IP relation only. With the frequency ceiling of §12.4,
-the IP edge set is modest; peeling is near-linear in edges. No design change.
+k-core + peeling on the IP relation only. The near-linear claim is sourced:
+**FRAUDAR** (Hooi et al., KDD 2016, DOI 10.1145/2939672.2939747) reports
+near-linear greedy peeling — priority-tree over vertex degrees giving
+logarithmic-time minimum-degree retrieval per removal (the Charikar-2000
+densest-subgraph approach) — validated on a real **1.47-billion-edge** Twitter
+graph. k-core decomposition itself is **O(V+E)** (Batagelj & Zaveršnik).
+**Design dependency, stated explicitly:** the §12.4 frequency ceiling (capping
+hub-degree groups before edges are built) is what keeps the IP edge set in the
+regime this literature was validated at — the ceiling and the peeling are one
+design, not two independent choices. No detector-logic change.
 
 ### 13.4 What does NOT change
 
@@ -654,8 +706,17 @@ untouched until step 5):**
 1. **K_CAP and the group-size frequency ceiling** (§12.4) — derive from the
    real 3.5M group-size distribution; needs one profiling query after first
    ingest.
-2. **NeighborLoader fan-out** ([15, 10] is a starting point) — ablate on the
-   15k set against full-graph scores before trusting it at scale.
+2. **NeighborLoader fan-out — ablate shape, not just magnitude.** [15, 10] is
+   only a starting point. Fan-out is multiplicative across layers (a [15, 10]
+   fan-out touches up to 150 nodes per seed, and per-edge-type sampling on
+   heterogeneous graphs multiplies the same way — PyG NeighborLoader
+   semantics), which practically caps depth at 2–3 layers (neighborhood
+   explosion). Published evidence favors **front-loaded / adaptive fan-out**
+   over flat: DistGNN (arXiv:2104.06700) and DAFOS (arXiv:2507.08845) both use
+   uneven, degree-aware per-layer allocation — DAFOS reports a 12.6× speedup
+   on Reddit and ogbn-products F1 73.78 % → 76.88 % vs flat fan-out. Ablate
+   symmetric ([15, 15]) vs front-loaded ([25, 10]) on the 15k set against
+   full-graph scores before trusting either at scale.
 3. **`pg_trgm` vs `difflib`** for name similarity — equivalence check required;
    they are not identical metrics.
 4. **Postgres HA** — single node is fine for this server; decide whether a
@@ -663,3 +724,25 @@ untouched until step 5):**
 5. **Batch cadence** — one 3.5M yearly batch vs rolling monthly cohorts changes
    the drift-check and retrain calendar (OPERATIONS_RUNBOOK §6 needs a rev
    once decided).
+
+---
+
+## 16. External references (verified 2026-07-21, external-review pass)
+
+Citations below were located and link-verified during the external evidence
+review of this document. Claims that could **not** be sourced are marked as
+unvalidated projections at their point of use (notably the §13.2 retrain
+wall-clock estimate).
+
+| Claim (section) | Source |
+|---|---|
+| Shared-attribute fraud graphs produce power-law fan-out / dense components; hub-capping is the standard mitigation (§12.4) | 2026 shared-infrastructure fraud-graph benchmark (arXiv) |
+| CPU minibatch GNN training at scale — closest available benchmark; reports relative speedups only (§13.2) | DistGNN-MB, arXiv:2211.06385 |
+| CPU→GPU copy = 60–80 % of per-batch time in hybrid setups; does not transfer to pure-CPU (§13.2) | Global Neighbor Sampling, arXiv:2106.06150 |
+| Multiplicative fan-out / neighborhood explosion; per-edge-type sampling on hetero graphs (§15 #2) | PyG NeighborLoader docs; Kumo.ai PyG production guide |
+| Front-loaded / adaptive fan-out beats flat (12.6× speedup; F1 73.78→76.88 on ogbn-products) (§15 #2) | DistGNN arXiv:2104.06700; DAFOS arXiv:2507.08845 |
+| GPD shape-estimator instability below ~500 exceedances; stabilization above ~150–500 (§13.1) | Hosking & Wallis 1987 (via ScienceDirect S0167947303000872); US8175830 |
+| Near-linear greedy peeling, validated at 1.47B edges (§13.3) | FRAUDAR, Hooi et al., KDD 2016, DOI 10.1145/2939672.2939747 |
+| k-core decomposition is O(V+E) (§13.3) | Batagelj & Zaveršnik |
+| COPY: 10M rows in ~14 s vs ~9,000 s row-by-row; ~100k rows/s sustained (§12.1) | pganalyze benchmark; Tiger Data benchmark; CYBERTEC PostgreSQL 16 benchmark |
+| Single-primary Postgres limits are write-side, not read-side (Part II scale note, §12.1) | OpenAI Postgres-scaling engineering account |
