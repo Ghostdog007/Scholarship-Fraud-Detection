@@ -18,9 +18,12 @@ services:
 
   postgres:
     # System of record (V4-Scale step 0). Schema applied by `python -m src.db.migrate`.
+    # Host port 5433 (not 5432): avoids colliding with a native/host-installed
+    # PostgreSQL also using 5432 for local dev. Containers still reach this
+    # service at postgres:5432 internally — only the host-side mapping moved.
     image: postgres:18
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
       - POSTGRES_DB=${NIC_DB_NAME:-nic_fraud}
       - POSTGRES_USER=${NIC_DB_USER:-nic_app}
