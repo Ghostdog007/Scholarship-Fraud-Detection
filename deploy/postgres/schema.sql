@@ -159,6 +159,19 @@ CREATE TABLE IF NOT EXISTS training_runs (
     checkpoint  JSONB
 );
 
+-- ── Drift baselines (yearly cycle KS test) ────────────────────────────────────
+-- Replaces outputs/prev_cycle_scores_ks.json + prev_cycle_features_ks.json.
+-- Single row per kind, overwritten each cycle (matches the file behaviour —
+-- only the immediately-previous cycle is kept). At 3.5M rows the JSON files
+-- would hold ~3.5M floats (scores) or 68 x 3.5M floats (features) each — this
+-- table is the same payload shape, just queryable/indexed instead of a flat
+-- file re-read whole on every drift check.
+CREATE TABLE IF NOT EXISTS drift_baselines (
+    baseline_kind TEXT PRIMARY KEY CHECK (baseline_kind IN ('scores', 'features')),
+    payload       JSONB NOT NULL,
+    saved_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ── Schema migrations ledger (versioned migrations, hard stop 14) ─────────────
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version     INT PRIMARY KEY,
