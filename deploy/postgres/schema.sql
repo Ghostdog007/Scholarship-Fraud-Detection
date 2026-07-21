@@ -68,19 +68,21 @@ CREATE TABLE IF NOT EXISTS feature_scaling (
 );
 
 -- ── Scores (all components + fusion; higher = more anomalous, hard stop 3) ────
+-- DOUBLE PRECISION (not REAL): the file outputs are float64 CSVs, and Gate 2
+-- requires byte-identical endpoint payloads — float32 round-trip would change
+-- the JSON representation of every score.
 CREATE TABLE IF NOT EXISTS scores (
     application_id      TEXT NOT NULL REFERENCES applications(application_id),
     batch_id            INT NOT NULL REFERENCES batches(batch_id),
     model_version       TEXT NOT NULL,
-    hybrid_anomaly_score REAL,
-    feature_pred_error  REAL,
-    edge_pred_error     REAL,
-    subspace_if_score   REAL,
-    subspace_financial  REAL,
-    subspace_identity   REAL,
-    subspace_network    REAL,
-    dense_block_ip      REAL,
-    final_risk_score    REAL,
+    hybrid_anomaly_score DOUBLE PRECISION,
+    feature_pred_error  DOUBLE PRECISION,
+    edge_pred_error     DOUBLE PRECISION,
+    subspace_if_score   DOUBLE PRECISION,
+    group_scores        JSONB,   -- per-group subspace IF scores
+    dense_block_ip      DOUBLE PRECISION,
+    final_risk_score    DOUBLE PRECISION,
+    label_source        TEXT,    -- risk_scores_v3.csv provenance column
     risk_bucket         TEXT CHECK (risk_bucket IN ('High', 'Medium', 'Low')),
     feature_errors      JSONB,   -- per-feature error vector (XAI)
     predicted_values    JSONB,   -- model-expected values (XAI)

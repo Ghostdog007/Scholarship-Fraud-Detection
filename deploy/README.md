@@ -184,3 +184,9 @@ and depend on its healthcheck. K8s: PVC + Deployment + Service appended to
 `deploy/k8s/nic-fraud.yaml`; create the `nic-db` Secret first (command in the
 manifest comment). All SQL access goes through `src/db/` — see
 `docs/AGENTS.md` hard stop 14.
+
+**Read path (V4-Scale step 2):** the review queue, fraud-store summary, and
+scored-population count are served from Postgres (Gate 2 parity passed);
+`NIC_READS_FROM_PG=0` forces the file path, and handlers fall back to files
+automatically if a query fails. Re-mirror the file outputs into Postgres after
+each pipeline run with `python -m src.db.ingest`.

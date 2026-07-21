@@ -56,7 +56,22 @@ authoritative (hard stop 13).
 > verbatim — `deploy/postgres/schema.sql` is the authoritative DDL, and the
 > §11.1 draft in TECHNICAL_REFERENCE (BIGINT) is superseded on these points.
 
-## Step 2 — Serve reads from Postgres ☐
+## Step 2 — Serve reads from Postgres ✅ (gate passed 2026-07-21)
+
+> Gate evidence: `src/db/ingest.py` mirrored the primary 15k batch
+> (applications + identity_keys + features + scores). Parity harness passed:
+> (1) full 15k `top-suspicious` ranking identical (score sequence equal;
+> tie-groups compared as sets — 14,998 distinct scores); (2) fraud-store
+> summary identical; (3) ego-graph neighbourhoods from the indexed
+> `identity_keys` join equal the `.pt` graph adjacency for 298 sampled apps
+> × 5 relations covering 15,419 edges. Reads flipped to Postgres
+> (`NIC_READS_FROM_PG=0` is the escape hatch; handlers fall back to files on
+> query failure). Deliberately still file-based, by design: reviewer-card /
+> ring / topology **HTML builders** (they render from unchanged output files
+> — parity holds trivially; the proven `ego_neighbors()` query replaces the
+> `.pt` load at step 4 when the graph becomes hub-capped) and **drift**
+> (compares staged cohort files; moves to Postgres with staging in step 3).
+> Rerun `python -m src.db.ingest` after each pipeline run until cut-over.
 
 - Ingest the 15k scored outputs into `scores`; the review-queue,
   card-metadata, drift, and stats endpoints read from `src/db/` instead of
