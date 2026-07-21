@@ -571,9 +571,15 @@ def _field_accordions(card: dict) -> str:
                 stand = (f"higher than <span class='num'>{vp:.1f}%</span>" if vp >= 50
                          else f"lower than <span class='num'>{100 - vp:.1f}%</span>") + " of applicants"
             direction = "above" if (val > exp) else "below"
-            why = (f"<div class='why'><b>What this means:</b> the declared value is {stand}"
-                   + (f" (population median {med:+.3f})" if med is not None else "")
-                   + f", while the model — reading the rest of the record and the application's network "
+            # "stand" (value_percentile) is only known when population stats were
+            # passed to _top_features — absent for a cohort preview (no committed
+            # population to rank against). Without it, drop the "declared value is
+            # {stand}, while" lead-in entirely rather than leave a grammatical gap.
+            lead = (f"the declared value is {stand}"
+                    + (f" (population median {med:+.3f})" if med is not None else "")
+                    + ", while ") if stand else ""
+            why = (f"<div class='why'><b>What this means:</b> {lead}the model — reading the rest "
+                   f"of the record and the application's network "
                    f"context — expected about <span class='num'>{exp:+.3f}</span>; the declared value is "
                    f"<b>{direction}</b> expectation"
                    + (f", and this miss is larger than <span class='num'>{ep:.1f}%</span> of all "
@@ -660,6 +666,52 @@ def _action(card: dict) -> str:
         </div>
         <div id="rv-status"></div>
       </div>"""
+
+
+def _right_pane_preview(card: dict) -> str:
+    """Right pane for a pre-fusion cohort PREVIEW card. Reuses _reason_codes and
+    _field_accordions verbatim (both already degrade gracefully on empty
+    evt_crossings/graph_connections) — omits _action (reviewer decision form),
+    since confirm-fraud requires the app to exist in the committed features
+    file (confirmed_fraud_store.add_confirmed reads engineered_features_v3.csv),
+    which a staged-but-uncommitted cohort app is not in."""
+    ev = card["evidence"]
+    score = float(card.get("risk_score_v3", 0.0))
+    pct = ev.get("risk_percentile")
+    rank = ev.get("risk_rank")
+    n = ev.get("population_size")
+    gcol = _risk_color(score)
+    sub = (f"Anomaly score <b class='num'>{score:.4f}</b> — higher than "
+           f"<b class='num'>{pct:.2f}%</b> of <b class='num'>{n}</b> cohort application(s)"
+           + (f" · <b>rank {rank}</b>" if rank else "")) if pct is not None and n else \
+          f"Anomaly score <b class='num'>{score:.4f}</b> (higher = more anomalous)"
+    headline = ("Highest-risk application in this cohort" if rank == 1
+                else "Elevated anomaly score" if score >= 0.5 else "Ranking context")
+    commit_note = (
+        "<div class='action' style='background:linear-gradient(180deg,#4cc9f01a,#4cc9f008);"
+        "border:1px solid #4cc9f047'>"
+        "<div class='at' style='color:#4cc9f0'>Pre-fusion preview</div>"
+        "<div class='ab'>This score is the raw hybrid-detector output for this uploaded cohort, "
+        "not the committed fused risk — subspace IF, dense-block, and EVT triggers only exist "
+        "after a committed pipeline run. Labeling, export, and the ego-graph unlock once this "
+        "cohort is committed (admin → Decide → Merge + incremental/full retrain).</div></div>")
+    return f"""
+    <div class="card"><div class="card-b">
+      <div class="riskhead">
+        <div class="gauge" style="background:conic-gradient({gcol} {score*100:.0f}%,rgba(255,255,255,.07) 0)">
+          <b>{score:.2f}</b></div>
+        <div class="rh-txt"><div class="big">{headline}</div><div class="sub">{sub}</div></div>
+      </div>
+      <div class="section-t">Why it flagged — ranked reason codes</div>
+      {_reason_codes(card)}
+      <div class="section-t">What's happening in each field — declared vs. model-expected</div>
+      {_field_accordions(card)}
+      {commit_note}
+      <div class="footnote">Pre-fusion preview card: the raw hybrid-detector reconstruction error
+        for this uploaded cohort, computed read-only against the current checkpoint. No hand-set
+        thresholds. Commit this cohort for the full fused-risk card with EVT triggers and
+        model-traceability breakdown.</div>
+    </div></div>"""
 
 
 def _right_pane(card: dict) -> str:
@@ -857,21 +909,33 @@ def build_ring_html(app_id: str, risk_map: dict | None = None,
 
 
 def build_staged_card_html(name: str, app_id: str) -> str | None:
-    """Lightweight PREVIEW reviewer card for a staged cohort application (scored
-    read-only by evaluate-dataset). Pre-fusion: shows the hybrid_anomaly_score and
-    the top interpretable feature drivers (declared-vs-model-expected where
-    available) plus the narrative — NOT the committed fused risk_score_v3 or EVT
-    triggers (those need a committed pipeline run). Returns None if the app isn't
-    in the cohort's staged scores."""
+    """PREVIEW reviewer card for a staged cohort application (scored read-only
+    by evaluate-dataset) — reuses the SAME chrome, tabs, identity-network mini
+    view, signal-driver rendering, and field accordions as the committed-card
+    path (_left_pane/_right_pane_preview/_page), fed by a pseudo evidence dict
+    built from what a pre-fusion cohort actually has: the hybrid detector's
+    per-feature error/predicted vectors and, when the cohort's graph bundle was
+    persisted (Evaluate ran with a graph), REAL shares_ip neighbours from it.
+
+    Genuinely absent pre-commit (never fabricated): subspace_groups,
+    dense_block_ip, fusion_contributions, evt_crossings — these require a
+    committed pipeline run. _reason_codes/_signal_bars/_model_trace already
+    degrade gracefully on empty inputs, so omitting them is a truthful gap,
+    not a rendering failure. The reviewer-decision form is omitted (not
+    disabled-and-shown) because confirm-fraud reads the COMMITTED features
+    file and would 422 on an uncommitted app_id.
+
+    Returns None if the app isn't in the cohort's staged scores."""
     import json as _json
-    from src.xai_layer_v3 import _top_features, _narrative
+    from src.xai_layer_v3 import _degree_counts_from_index, _top_features
 
     scores_path = Path(f"outputs/staged_scores_{name}.csv")
     feats_path  = Path(f"outputs/staged_features_{name}.csv")
     if not scores_path.exists():
         return None
     sdf = pd.read_csv(scores_path)
-    match = sdf[sdf["application_id"].astype(str) == str(app_id)]
+    sdf["application_id"] = sdf["application_id"].astype(str)
+    match = sdf[sdf["application_id"] == str(app_id)]
     if match.empty:
         return None
     row = match.iloc[0]
@@ -886,52 +950,70 @@ def build_staged_card_html(name: str, app_id: str) -> str | None:
         if not fm.empty:
             actual_vals = fm.iloc[0].to_dict()
 
-    top_feats = _top_features(per_feat, actual_vals, k=6, predicted=predicted)
-    score  = float(row["hybrid_anomaly_score"])
-    pseudo = {"risk_score_v3": score, "triggers": [],
-              "top_graph_neighbors": [], "top_feature_errors": top_feats}
-    narrative = _narrative(pseudo)
+    # Real identity-network preview: shares_ip neighbours from the cohort's
+    # persisted graph bundle (same mechanism the 3D ring uses). Absent only
+    # if Evaluate ran before graph persistence was added (stale cohort) —
+    # degrades to "no shared-IP co-applications found", not a crash.
+    graph_pt  = Path(f"outputs/staged_graph_{name}.pt")
+    nodeorder = Path(f"outputs/staged_nodeorder_{name}.csv")
+    graph_connections: list[dict] = []
+    neighbor_idxs = None
+    risk_map = dict(zip(sdf["application_id"], sdf["hybrid_anomaly_score"]))
+    if graph_pt.exists() and nodeorder.exists():
+        ctx = _graph_ctx(graph_pt, nodeorder)
+        if ctx is not None:
+            g_app_ids, id_to_idx, nidx, _rel_id = ctx
+            t = id_to_idx.get(str(app_id))
+            if t is not None:
+                ip_neighbors = [e["neighbor_idx"] for e in nidx.get(t, [])
+                                if e["edge_type"] == "shares_ip"]
+                if ip_neighbors:
+                    from src.config_v3 import EDGE_TYPES as _ALL_EDGE_TYPES
+                    degree = _degree_counts_from_index(nidx, len(g_app_ids), _ALL_EDGE_TYPES)["shares_ip"]
+                    this_degree = len(ip_neighbors)
+                    pct = 100.0 * (degree < this_degree).sum() / max(len(degree), 1)
+                    graph_connections.append({
+                        "edge_type": "shares_ip", "count": this_degree,
+                        "percentile": round(float(pct), 1),
+                        "sample_ids": [str(g_app_ids[i]) for i in ip_neighbors[:6]],
+                    })
+                    neighbor_idxs = ip_neighbors
 
-    rows_html = ""
-    for f in top_feats:
-        label = _esc(f.get("feature_label") or f.get("feature"))
-        err   = f.get("error")
-        val   = f.get("value")
-        exp   = f.get("expected")
-        cmp   = ""
-        if val is not None and exp is not None:
-            cmp = f"scaled {val:.3f} · model-expected {exp:.3f}"
-        elif val is not None:
-            cmp = f"scaled {val:.3f}"
-        rows_html += (f"<tr><td>{label}</td><td class='num'>{_esc(err)}</td>"
-                      f"<td class='muted'>{_esc(cmp)}</td></tr>")
+    top_feats = _top_features(per_feat, actual_vals, k=6, predicted=predicted,
+                              neighbor_idxs=neighbor_idxs)
+    score = float(row["hybrid_anomaly_score"])
 
-    return f"""<!DOCTYPE html><html><head><meta charset='utf-8'><style>
-    body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:16px;font-size:13px;}}
-    .hdr{{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px;}}
-    .aid{{font-family:ui-monospace,Consolas,monospace;color:#4cc9f0;font-weight:600;font-size:14px;}}
-    .badge{{padding:2px 10px;border-radius:999px;font-size:11px;font-weight:700;background:rgba(244,162,97,.16);color:#f4a261;border:1px solid rgba(244,162,97,.4);}}
-    .score{{font-family:ui-monospace,monospace;font-size:20px;font-weight:700;margin-left:auto;}}
-    .note{{font-size:11.5px;color:#8b949e;margin:2px 0 14px;line-height:1.5;}}
-    .narr{{background:#161b22;border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:12px 14px;line-height:1.55;margin-bottom:14px;}}
-    table{{width:100%;border-collapse:collapse;}}
-    th,td{{text-align:left;padding:7px 10px;border-bottom:1px solid rgba(255,255,255,.09);}}
-    th{{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:#6b7280;}}
-    td{{font-family:ui-monospace,Consolas,monospace;color:#c9d1d9;}}
-    .num{{color:#e6edf3;}} .muted{{color:#8b949e;font-family:'Segoe UI',sans-serif;}}
-    </style></head><body>
-    <div class='hdr'>
-      <span class='aid'>{_esc(app_id)}</span>
-      <span class='badge'>PREVIEW · pre-fusion</span>
-      <span class='score'>{score:.4f}</span>
-    </div>
-    <div class='note'>Read-only cohort score (hybrid anomaly score, higher = more anomalous).
-    This is <b>not</b> the committed fused risk_score_v3 — that needs a committed pipeline run.
-    Use the 3D identity ring above to inspect this application's relationships.</div>
-    <div class='narr'>{_esc(narrative)}</div>
-    <table><thead><tr><th>Signal driver</th><th>Error</th><th>Declared vs model-expected</th></tr></thead>
-    <tbody>{rows_html}</tbody></table>
-    </body></html>"""
+    # Within-cohort ranking — the only "population" a pre-fusion preview has.
+    risk_rank = int((sdf["hybrid_anomaly_score"] > score).sum()) + 1
+    risk_percentile = 100.0 * (sdf["hybrid_anomaly_score"] < score).sum() / max(len(sdf), 1)
+
+    pseudo_card = {
+        "application_id": app_id,
+        "risk_score_v3": score,
+        "triggers": [],
+        "top_feature_errors": top_feats,
+        "evidence": {
+            "subspace_groups": {}, "dense_block_ip": {}, "fusion_contributions": {},
+            "graph_connections": graph_connections, "evt_crossings": [],
+            "risk_percentile": risk_percentile, "risk_rank": risk_rank,
+            "population_size": len(sdf), "label_source": "preview",
+        },
+    }
+
+    ring_href = f"/v3/monitoring/cohort/{name}/{_esc(app_id)}/ring"
+    body = f"""
+    <div class="wrap">
+      <div class="topbar">
+        <div><div class="eyebrow">Scholarship fraud review · NIC v3 · cohort preview</div>
+          <div class="appid">{_esc(app_id)}</div></div>
+        <div class="spacer"></div>
+        <div class="status" style="color:#f4a261;background:#f4a26122;border:1px solid #f4a26155">
+          <span class="dot"></span>PREVIEW · pre-fusion</div>
+      </div>
+      <div class="grid">{_left_pane(pseudo_card, ring_href)}{_right_pane_preview(pseudo_card)}</div>
+    </div>"""
+    nodes_json = json.dumps(_ego_nodes(pseudo_card, risk_map))
+    return _page(f"Reviewer card (preview) — {app_id}", body, nodes_json)
 
 
 def generate_ego_rings(cards: list[dict], risk_map: dict) -> dict[str, str]:
