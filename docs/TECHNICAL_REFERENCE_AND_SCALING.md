@@ -640,30 +640,50 @@ AGENTS.md Appendix F, now made concrete.)
 
 ### 13.2 Hybrid GraphMCM: neighbor-sampled mini-batch training
 
-The one real model change. Replace full-graph forward passes with **PyG
-`NeighborLoader`**: sample e.g. [15, 10] neighbors per layer per relation,
-batch 1024 seed nodes. Memory per batch is bounded regardless of graph size;
-all losses (masked-feature, edge, LOE margin, DeepSVDD) compute per-batch
-already.
+The one real model change. Full-graph forward passes are replaced with PyG
+`NeighborLoader` batching. The fan-out ablation (open decision #2, resolved
+2026-07-21, `IMPLEMENTATION.md` step 5) found every truncating fan-out
+([15,15], [25,10], [50,50]) deviates up to 0.41 from full-graph scores —
+**exact-neighborhood batching (fanout (-1,-1)) is adopted instead**: a
+2-layer RGCN only ever sees the 2-hop neighborhood, so batching it exactly is
+bit-equal to full-graph scoring (max deviation 0.00000 on the 15k set) while
+keeping memory bounded — bounded because the graph itself is hub-capped
+(§12.4), not because the fan-out is truncated. Losses (masked-feature, edge,
+LOE margin, DeepSVDD) compute per-batch on seed nodes with GLOBAL edge
+targets, so batching never distorts the objective.
 
-**Retrain time: unvalidated projection.** The working estimate is **24–48 h
-for a full retrain at 3.5M** on the 16 vCPU server (vs the current 8–16 h at
-15k), acceptable for a once-or-twice-yearly cycle. However, **no published
-CPU-only benchmark validates this at our node count and architecture.** The
-closest primary source, DistGNN-MB (arXiv:2211.06385), benchmarks minibatch
-GraphSAGE/GAT on x86 CPU at OGBN-Papers100M scale — but on **32-node
-distributed clusters**, reporting epoch times and relative speedups, not
-single-node wall-clock hours. Most other NeighborLoader benchmarks are
-CPU-sample + GPU-train hybrids where host-to-device data copy is identified as
-the dominant per-batch bottleneck (arXiv:2106.06150 — the paper quantifies no
-percentage; an earlier-circulated "60–80 %" figure is not in it) — that
-bottleneck does not exist on a pure-CPU worker, so hybrid throughput numbers
-do not transfer.
-**Acceptance gate:** the migration-step-5 synthetic-1M test must record
-epochs/hour; extrapolate linearly from that measurement before scheduling the
-first real 3.5M retrain. Incremental fine-tune (MLP-only, RGCN frozen) stays
-cheap: score-relevant subsets only, ~1–3 h (same caveat: confirm on the 1M
-test).
+**Retrain time: MEASURED, not projected** (synthetic-1M scale test,
+`IMPLEMENTATION.md` Gate 5(b), completed 2026-07-21 — raw stdout in session).
+1,000,000 nodes, hub-capped graph (test parameters k_cap=50/ceiling=200 — not
+the production K_CAP), exact-neighborhood batching, laptop CPU 8 threads (the
+server thread config): **Stage 1 epoch 406 s; Stage 2 epochs 639 s / 550 s
+(mean 595 s); scoring the full 1M in 56 s; peak RSS 3.53 GB.**
+
+Extrapolating to the real training schedule (80 Stage-1 + 120 Stage-2 epochs,
+`config_v3.EPOCHS_STAGE1/2`): 80×406s + 120×595s ≈ **28.9 h at 1M**, scaling
+linearly to **≈101 h (~4.2 days) at 3.5M**. **This exceeds the retired
+24–48 h guess by 2–4×** — reported as measured, not softened.
+
+Caveats on this number, stated plainly:
+- **Laptop CPU, not the production 16 vCPU server.** Re-measure there before
+  committing to a retrain calendar.
+- **Batch size (512/2048) and threading were not tuned.** This is an
+  untuned baseline; real optimization work (larger batches, data-loader
+  parallelism) could materially shorten it.
+- **Linear row-count scaling is an approximation, not a bound** — edge count
+  can grow faster than linear as more rows collide per identity value at
+  3.5M (§12.4's ceiling caps this per-relation, but the *number* of
+  near-ceiling groups can still grow superlinearly with population).
+- **Memory is comfortably NOT the bottleneck**: 3.53 GB at 1M extrapolates to
+  ~12 GB at 3.5M, well inside the `nic-worker` pod budget (§14) — training
+  *time*, not memory, is the real constraint to plan around.
+
+**Action for the lead:** a ~101 h full retrain is workable for a
+once-or-twice-yearly cycle only with matching lead time in the operational
+calendar (batch cadence, open decision #5) — this must be checked before
+scheduling the first real 3.5M retrain, not discovered mid-cycle. Incremental
+fine-tune (MLP-only, RGCN frozen, 10 epochs) is unaffected by any of this and
+stays cheap regardless.
 
 **Scoring** (inference) streams the population through the same sampler —
 no training graph in memory at once. Score direction, exports, and hard stops
@@ -731,19 +751,17 @@ untouched until step 5):**
 1. **K_CAP and the group-size frequency ceiling** (§12.4) — derive from the
    real 3.5M group-size distribution; needs one profiling query after first
    ingest.
-2. **NeighborLoader fan-out — ablate shape, not just magnitude.** [15, 10] is
-   only a starting point. Fan-out is multiplicative across layers (a [15, 10]
-   fan-out touches up to 150 nodes per seed, and per-edge-type sampling on
-   heterogeneous graphs multiplies the same way — PyG NeighborLoader
-   semantics), which practically caps depth at 2–3 layers (neighborhood
-   explosion). Published evidence favors **adaptive / degree-aware fan-out**
-   over flat: DAFOS (arXiv:2507.08845) dynamically adjusts fan-out and
-   prioritises high-degree nodes, reporting a 12.6× speedup on Reddit and
-   ogbn-products F1 73.78 % → 76.88 % vs flat fan-out (verified against the
-   abstract). (DistGNN arXiv:2104.06700 is *full-batch* distributed CPU
-   training — it has no fan-out and is not evidence here.) Ablate
-   symmetric ([15, 15]) vs front-loaded ([25, 10]) on the 15k set against
-   full-graph scores before trusting either at scale.
+2. ~~NeighborLoader fan-out~~ — **CLOSED (lead, 2026-07-21).** Ablated
+   symmetric ([15,15]), front-loaded ([25,10]), [15,10], [50,50] against the
+   full-graph reference on 15k (deterministic CPU, frozen checkpoint): every
+   truncating fan-out deviated up to 0.41 (bar was 0.03–0.04) — high-degree
+   nodes lose too much of their neighborhood. Exact-neighborhood batching
+   ((-1,-1)) instead reproduced full-graph scores **bit-for-bit** (max
+   deviation 0.00000): a 2-layer RGCN only ever sees the 2-hop neighborhood,
+   so batching it exactly changes nothing. **Adopted as the production
+   sampled path** — paired with the hub-capped graph (§12.4) for bounded
+   memory, the fan-out magnitude/shape question is moot. Full results and the
+   1M-scale timing this enabled: `IMPLEMENTATION.md` step 5, Gates 5(a)/5(b).
 3. **`pg_trgm` vs `difflib`** for name similarity — equivalence check required;
    they are not identical metrics.
 4. **Postgres HA** — single node is fine for this server; decide whether a

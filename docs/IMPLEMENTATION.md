@@ -167,7 +167,7 @@ where floating-point summation order differs), and graph degree/count
 features match. Any discrepancy halts the step (quantitative claims protocol
 #6).
 
-## Step 5 — NeighborLoader training + scale test ◐ (gate 5a passed; 1M run in progress)
+## Step 5 — NeighborLoader training + scale test ✅ (gates 5a + 5b passed 2026-07-21)
 
 > **Fan-out ablation (open decision #2) — resolved by evidence, 2026-07-21**
 > (deterministic CPU, frozen checkpoint, 15k, vs full-graph reference):
@@ -190,9 +190,40 @@ features match. Any discrepancy halts the step (quantitative claims protocol
 > **ADOPTED — lead direction 2026-07-21: exact-neighborhood mode
 > (fanout (-1,-1)) is the production sampled path. Open decision #2 closed.**
 >
-> Gate 5(b): synthetic-1M run (hub-capped k_cap=50 TEST parameter, exact
-> batching, CPU 8 threads) in progress — epochs/hour, peak RSS, scoring time
-> to be recorded here from raw stdout.
+> **Gate 5(b) — synthetic-1M scale test, completed 2026-07-21** (raw stdout
+> preserved in session; k_cap=50/ceiling=200 are TEST parameters, not the
+> production K_CAP — open decision #1 unaffected). Laptop CPU, 8 threads
+> (`torch.set_num_threads(8)`, the server config), exact-neighborhood
+> ((-1,-1)) batched training/scoring, hub-capped graph via the production
+> `_edges_from_groups`/`derive_group_ceiling` machinery, batch_size=512/2048.
+>
+> | Measurement | Value |
+> |---|---|
+> | Population | 1,000,000 nodes, 44 features |
+> | Directed edges (hub-capped) | 17,562,098 (5 relations; e.g. pincode 4.92M directed after 1,109 groups starred + 100 ceiling-skipped out of 119,561 groups) |
+> | Stage 1 epoch (measured, n=1) | 406 s |
+> | Stage 2 epoch (measured, n=2) | 639 s, 550 s (mean 595 s) |
+> | Scoring (full 1M) | 56 s |
+> | Peak RSS | 3.53 GB |
+> | Total wall time (this test) | 31.2 min |
+>
+> **Full-retrain extrapolation (80 S1 + 120 S2 epochs, config_v3 EPOCHS_STAGE1/2):**
+> 80×406s + 120×595s = 28.9 h at 1M → **≈101 h (~4.2 days) at 3.5M** (linear
+> row-count scaling). This **exceeds the retired 24–48 h guess by 2–4×** —
+> report it as measured, not softened. Caveats, stated plainly:
+> (1) laptop CPU, not the production 16 vCPU server — re-measure there before
+> committing to a calendar; (2) batch_size=512/threading were not tuned —
+> this is a baseline, not an optimized number; (3) edge count may grow
+> **faster than linear** in row count as more rows collide per identity
+> value at 3.5M — the ×3.5 scaling is an approximation, not a bound.
+> **Memory is not the bottleneck**: 3.53 GB at 1M extrapolates to ~12 GB at
+> 3.5M, comfortably inside the `nic-worker` 24–40 GB budget (Appendix-G-style
+> sizing) — training time, not memory, is the real cut-over question.
+> **Action for the lead:** a ~101 h full retrain is workable for a
+> once-or-twice-yearly cycle only if scheduled with matching lead time in
+> the operational calendar (batch cadence, open decision #5) — flag this
+> before committing to a retrain window. Incremental fine-tune (MLP-only, 10
+> epochs, RGCN frozen) is unaffected and stays cheap regardless.
 
 - `hybrid_graphmcm_v3.py`: training and scoring loops move to PyG
   `NeighborLoader` mini-batching. Model classes, losses, hyperparameters, and
