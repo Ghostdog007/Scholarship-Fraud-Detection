@@ -183,8 +183,11 @@ loop) happen only in their designated steps, one module at a time.
 Tracked in `TECHNICAL_REFERENCE_AND_SCALING.md` §15:
 1. K_CAP and the group-size ceiling — needs a profiling query on real 3.5M
    ingest.
-2. NeighborLoader fan-out magnitude **and shape** (symmetric vs front-loaded)
-   — ablate on 15k first.
+2. ~~NeighborLoader fan-out magnitude and shape~~ — **CLOSED (lead,
+   2026-07-21): exact-neighborhood batching adopted** (fanout (-1,-1); ablation
+   in IMPLEMENTATION.md step 5 — truncating fan-outs deviate up to 0.44,
+   exact mode is bit-equal to full-graph for the 2-layer RGCN; memory bounded
+   by the hub cap).
 3. `pg_trgm` vs `difflib` name similarity — equivalence check required.
 4. Postgres HA / warm standby — NIC ops policy call.
 5. Batch cadence (yearly 3.5M vs rolling cohorts) — drives the retrain

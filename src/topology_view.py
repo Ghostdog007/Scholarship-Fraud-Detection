@@ -36,6 +36,18 @@ def extract_ego(app_id: str, hops: int = 1, node_cap: int = 50,
     """
     import numpy as np
 
+    # Committed-graph requests go through Postgres (indexed queries) when
+    # allowed; staged-cohort requests (graph_pt passed) keep the bundle path.
+    if graph_pt is None:
+        try:
+            from src.db.reads import reads_from_pg
+            if reads_from_pg():
+                ego = _extract_ego_pg(str(app_id), hops=hops, node_cap=node_cap)
+                if ego is not None:
+                    return ego
+        except Exception as e:  # noqa: BLE001 — PG outage must not kill ego view
+            print(f"[topology_view] WARNING: PG ego path failed, falling back to graph: {e}")
+
     gpt        = Path(graph_pt) if graph_pt else GRAPH_PT
     ids_source = Path(ids_csv) if ids_csv else HYBRID_CSV
     if not ids_source.exists() or not gpt.exists():
@@ -140,6 +152,55 @@ def extract_ego(app_id: str, hops: int = 1, node_cap: int = 50,
         "edges": uniq_edges,
         "shown": len(nodes),
         "total": len(visited)
+    }
+
+
+def _extract_ego_pg(app_id: str, hops: int = 1, node_cap: int = 50) -> dict | None:
+    """extract_ego for the committed population via Postgres — BFS over
+    ego_neighbors (indexed 1-hop per relation), induced typed edges among the
+    kept set, scores from the scores table. Returns None if the application
+    is unknown (caller falls back / returns {}). Same shape and semantics as
+    the graph path: score-descending cap, center always kept, undirected
+    dedup of typed edges."""
+    from src.db.reads import (ego_neighbors, identity_row_exists,
+                              induced_subgraph_edges, risk_scores_for)
+
+    if not identity_row_exists(app_id):
+        return {}
+
+    visited = {app_id}
+    frontier = [app_id]
+    for _depth in range(hops):
+        nxt = []
+        for node in frontier:
+            for nbrs in ego_neighbors(node).values():
+                for n in nbrs:
+                    if n not in visited:
+                        visited.add(n)
+                        nxt.append(n)
+        frontier = nxt
+
+    node_list = list(visited)
+    # File path reads HYBRID_CSV -> hybrid_anomaly_score; match it.
+    score_map = risk_scores_for(node_list, score_col="hybrid_anomaly_score")
+    if len(node_list) > node_cap:
+        node_list.remove(app_id)
+        node_list.sort(key=lambda a: float(score_map.get(a, 0.0)), reverse=True)
+        kept = [app_id] + node_list[:node_cap - 1]
+    else:
+        kept = node_list
+    kept_set = set(kept)
+
+    nodes = [{"id": a, "score": float(score_map.get(a, 0.0)),
+              "is_center": a == app_id} for a in kept]
+    uniq_edges = [{"source": a, "target": b, "type": rel}
+                  for a, b, rel in induced_subgraph_edges(list(kept_set))]
+    return {
+        "center": app_id,
+        "nodes": nodes,
+        "edges": uniq_edges,
+        "shown": len(nodes),
+        "total": len(visited),
     }
 
 

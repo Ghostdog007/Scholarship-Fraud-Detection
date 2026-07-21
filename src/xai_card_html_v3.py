@@ -782,6 +782,41 @@ def _graph_ctx(graph_pt: "Path | None" = None, nodeorder_csv: "Path | None" = No
     return app_ids, id_to_idx, nidx, rel_id
 
 
+def _ring_fig_from_pg(app_id: str, risk_map: dict | None):
+    """Cut-over path: build the ring figure from indexed Postgres queries
+    (ego_neighbors + induced_subgraph_edges) — no .pt graph load. Node and
+    edge SETS are identical to the graph path (Gate 2 + the render-parity
+    check); node ordering is sorted, so layout is deterministic."""
+    import numpy as np
+    from src.config_v3 import EDGE_TYPES
+    from src.db import reads as db_reads
+    from src.graph_viz_v3 import _figure_for_ring
+
+    if not db_reads.identity_row_exists(str(app_id)):
+        return None  # unknown application — same as "not in the graph"
+    nbrs = db_reads.ego_neighbors(str(app_id))
+    neighbor_ids = sorted(set().union(*nbrs.values())) if nbrs else []
+    node_ids = [str(app_id)] + [n for n in neighbor_ids if n != str(app_id)]
+    # isolated-but-known apps render a 1-node ring, like the graph path
+    local = {a: i for i, a in enumerate(node_ids)}
+    rel_id = {name: i for i, name in enumerate(EDGE_TYPES)}
+    edges = []
+    for a, b, rel in db_reads.induced_subgraph_edges(node_ids):
+        if a in local and b in local:
+            edges.append((local[a], local[b], rel_id.get(rel, 0)))
+    if risk_map is None:
+        risk_map = db_reads.risk_scores_for(node_ids)
+    scores = np.array([float(risk_map.get(a, 0.0)) for a in node_ids], dtype=float)
+    sg = {"node_ids": list(range(len(node_ids))), "scores": scores, "edges": edges}
+    fig = _figure_for_ring(sg, np.array(node_ids), 1)
+    n_edges = len(set((min(a, b), max(a, b)) for a, b, _ in edges))
+    fig.update_layout(title=dict(text=(
+        f"<b>Identity ring — {app_id}</b>"
+        f"<span style='color:#8b949e'>    {len(node_ids)} nodes · {n_edges} edges · "
+        f"risk {float(scores[0]):.3f}</span>")))
+    return fig
+
+
 def build_ring_html(app_id: str, risk_map: dict | None = None,
                     graph_pt: "Path | None" = None,
                     nodeorder_csv: "Path | None" = None) -> str | None:
@@ -789,7 +824,23 @@ def build_ring_html(app_id: str, risk_map: dict | None = None,
     on demand (this is what the API's /ring endpoint calls when a link is
     clicked). plotly.js is embedded inline so the response is self-contained.
     Returns None if the application is not in the graph. Pass graph_pt +
-    nodeorder_csv to render against a staged cohort graph (see _graph_ctx)."""
+    nodeorder_csv to render against a staged cohort graph (see _graph_ctx).
+
+    Committed-graph requests are served from Postgres (indexed 1-hop +
+    induced-edge queries) when NIC_READS_FROM_PG allows, falling back to the
+    .pt graph on any failure. Staged-cohort requests (graph_pt passed) always
+    use the staged bundle."""
+    if graph_pt is None:
+        try:
+            from src.db.reads import reads_from_pg
+            if reads_from_pg():
+                fig = _ring_fig_from_pg(app_id, risk_map)
+                if fig is not None:
+                    return fig.to_html(include_plotlyjs=True, full_html=True)
+                return None
+        except Exception as e:  # noqa: BLE001 — PG outage must not kill rings
+            print(f"[xai_card_html] WARNING: PG ring path failed, falling back to graph: {e}")
+
     ctx = _graph_ctx(graph_pt, nodeorder_csv)
     if ctx is None:
         return None

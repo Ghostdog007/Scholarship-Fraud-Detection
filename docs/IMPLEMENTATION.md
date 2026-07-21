@@ -167,7 +167,32 @@ where floating-point summation order differs), and graph degree/count
 features match. Any discrepancy halts the step (quantitative claims protocol
 #6).
 
-## Step 5 — NeighborLoader training + scale test ☐
+## Step 5 — NeighborLoader training + scale test ◐ (gate 5a passed; 1M run in progress)
+
+> **Fan-out ablation (open decision #2) — resolved by evidence, 2026-07-21**
+> (deterministic CPU, frozen checkpoint, 15k, vs full-graph reference):
+>
+> | fanout | max abs Δ | mean | spearman | top-500 overlap | verdict |
+> |---|---|---|---|---|---|
+> | (15,15) | 0.414 | 0.020 | 0.957 | 71.0% | FAIL |
+> | (25,10) | 0.359 | 0.021 | 0.950 | 73.4% | FAIL |
+> | (15,10) | 0.435 | 0.024 | 0.951 | 69.4% | FAIL |
+> | (50,50) | 0.241 | 0.004 | 0.997 | 94.4% | FAIL |
+> | **(-1,-1) exact 2-hop, batched** | **0.00000** | 0.000 | **1.000** | **100%** | **PASS (exact)** |
+>
+> Truncating fan-outs are unusable on an uncapped graph (high-degree nodes
+> lose most of their neighbourhood). **Exact-neighborhood batching is
+> bit-equal to full-graph scoring for the 2-layer RGCN** — a 2-layer GNN
+> only ever sees the 2-hop neighbourhood, so batching it exactly changes
+> nothing. Paired with the hub-capped graph (bounded degree K_CAP → per-seed
+> 2-hop ≤ 1+K+K² nodes), memory is bounded with **zero sampling noise**:
+> fan-out magnitude/shape is moot. **Gate 5(a) passed in exact mode.**
+> **ADOPTED — lead direction 2026-07-21: exact-neighborhood mode
+> (fanout (-1,-1)) is the production sampled path. Open decision #2 closed.**
+>
+> Gate 5(b): synthetic-1M run (hub-capped k_cap=50 TEST parameter, exact
+> batching, CPU 8 threads) in progress — epochs/hour, peak RSS, scoring time
+> to be recorded here from raw stdout.
 
 - `hybrid_graphmcm_v3.py`: training and scoring loops move to PyG
   `NeighborLoader` mini-batching. Model classes, losses, hyperparameters, and

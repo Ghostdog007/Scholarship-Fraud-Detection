@@ -64,6 +64,53 @@ def fraud_store_summary() -> dict:
     }
 
 
+def identity_row_exists(app_id: str) -> bool:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT 1 FROM identity_keys WHERE application_id = %s", (app_id,)
+        ).fetchone() is not None
+
+
+def induced_subgraph_edges(app_ids: list[str]) -> list[tuple[str, str, str]]:
+    """All typed edges among the GIVEN node set (undirected, src<dst), from
+    indexed identity_keys — powers ring/ego rendering without loading the
+    .pt graph. Same shared-value semantics as the graph builder."""
+    relations = {
+        "shares_mobile":      "mobile_no",
+        "shares_ip":          "ip_address",
+        "shares_father_name": "father_name_norm",
+        "shares_mother_name": "mother_name_norm",
+        "shares_pincode":     "pincode",
+    }
+    out: list[tuple[str, str, str]] = []
+    with get_connection() as conn:
+        for rel, col in relations.items():
+            rows = conn.execute(
+                f"SELECT a.application_id, b.application_id FROM identity_keys a"
+                f" JOIN identity_keys b ON b.{col} = a.{col}"
+                f" AND a.application_id < b.application_id"
+                f" WHERE a.application_id = ANY(%s) AND b.application_id = ANY(%s)"
+                f" AND a.{col} IS NOT NULL",
+                (app_ids, app_ids),
+            ).fetchall()
+            out.extend((r[0], r[1], rel) for r in rows)
+    return out
+
+
+def risk_scores_for(app_ids: list[str], score_col: str = "final_risk_score") -> dict[str, float]:
+    """Score lookup for the given apps (primary batch), for ring/ego
+    colouring. score_col is whitelisted — rings colour by final_risk_score,
+    ego-graphs by hybrid_anomaly_score (matching their file-path sources)."""
+    assert score_col in {"final_risk_score", "hybrid_anomaly_score"}
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"SELECT application_id, {score_col} FROM scores"
+            f" WHERE model_version = %s AND application_id = ANY(%s)",
+            (MODEL_VERSION, app_ids),
+        ).fetchall()
+    return {r[0]: r[1] for r in rows if r[1] is not None}
+
+
 def ego_neighbors(app_id: str) -> dict[str, list[str]]:
     """1-hop typed neighbourhood from indexed identity_keys — the Postgres
     replacement for scanning the in-memory .pt graph. Returns
