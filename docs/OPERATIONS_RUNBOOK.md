@@ -56,19 +56,45 @@ and **Model audit & deploy (admin)**.
 
 This is the reviewer's main screen.
 
+- **Dataset switcher** (top-left of the queue): **Primary dataset · 15k scored
+  applications** or any **evaluated cohort** you uploaded (admin → Intake →
+  Evaluate). The primary dataset is the population the unsupervised detector is
+  fit on *and* scores (not a held-out test set — genuinely unseen data is scored
+  via an evaluated cohort). Pick a cohort to review how the model scored that
+  ingested data *read-only*, before committing it. In cohort mode a cyan banner
+  reminds you the scores are **pre-fusion** (`hybrid_anomaly_score`, bucketed by
+  within-cohort percentile). The review tools have **full parity** — reviewer
+  card, **3D ring**, **ego-graph**, and **export** (single / all / selected) all
+  work on cohort apps. Only the training-feeding actions (**Flag-for-LOE**,
+  **label/retrain**) stay gated: they need the cohort ingested (committed) first.
+  Switch back to the **Primary dataset** for those.
+  A **✕ Remove cohort** button (cohort mode only) drops that cohort from the
+  console — it deletes only the cohort's read-only preview files (and its uploaded
+  CSV); the base data and the downloadable sample CSV are untouched. Re-evaluate
+  the CSV to bring it back. (Good for a demo: add a dataset, show it, remove it.)
 - **Status tiles** (top): confirmed-fraud count, false-positive count, live
   checkpoint size, and the current drift recommendation.
-- **Top suspicious applications**: the ranked queue from the last pipeline run.
-  Click any row to open it. Each row carries a colored **risk badge**
-  (High / Medium / Low).
-- **Triage toolbar** (above the queue): tick rows (or **Select all**), then
-  filter by application-ID or risk level. With rows selected you can:
+- **Top suspicious applications**: the ranked queue from the last pipeline run,
+  paged **50 per page** with **← Prev / Next →** at the bottom (it covers the full
+  flagged set — ~500 carded applications — not just the top 50). The pager shows
+  "Showing a–b of N flagged · Page x / y". Click any row to open it. Each row
+  carries a colored **risk badge** (High / Medium / Low).
+- **Triage toolbar** (above the queue): tick rows (or **Select all** — which
+  selects the current page), then filter by application-ID or risk level.
+  **Selection persists across pages**, so you can gather members of one ring from
+  several pages before acting. With rows selected you can:
   - **⚑ Label / retrain selected** — opens a batch dialog where you tag each
     application confirmed-fraud (with type) or false-positive, enter your name,
     then either **Record labels only** or **Record + retrain (incremental)**.
     The retrain is the human gate — recording labels alone changes nothing.
     Tick **smoke test** for a fast dry run. The job id + live status appear in
     the dialog.
+  - **◈ Flag for LOE (selected)** — sends every selected application to the
+    Pattern queue together as one candidate ring. Opens the same Flag-for-LOE
+    dialog (below) pre-filled with all the IDs; set the fraud type, shared link,
+    and your name, then **Record pattern**. The console then jumps to the Pattern
+    queue where the new candidate shows as *pending*. (Use this to flag a ring in
+    bulk; use the per-card **⚑ Flag for LOE** to flag a single open application.)
   - **⤓ Export selected** — downloads one zip of the chosen applications
     (scorecard CSV + reviewer card + 3D identity ring + evidence, per app,
     plus a combined `manifest.csv`).
@@ -88,6 +114,13 @@ This is the reviewer's main screen.
   button, and close on **Esc** or clicking outside.
 - **⚑ Flag for LOE** — records the application (and the ring of IDs you name) as
   a candidate fraud *pattern*, sending it to the Pattern queue.
+- **"Already flagged?" banner** — when you open a flagged application, the console
+  checks whether its **IP cluster** has already been flagged in a previous session
+  (a soft match on the shared-IP link). If so, an amber banner names the earlier
+  pattern(s) and whether they're already in LOE exposure. It's a **heuristic, not a
+  block** — open the **◎ 3D identity ring** to confirm it's the same ring before
+  re-flagging, so the same cluster isn't added twice. Cross-check under **Pattern
+  queue → Flagged history**.
 
 ---
 
@@ -102,6 +135,18 @@ Candidate patterns flagged from reviewer cards land here.
   relation you asserted) and dispatches an **incremental retrain** so the model
   learns them. Tick **smoke test** first for a fast, no-real-training dry run.
 - The job id and live status appear beneath the button.
+- **Flagged history** (bottom panel) — the persistent record of **every** ring
+  flagged for LOE across all sessions (survives restarts), with a state badge
+  (pending / promoted / rejected), an **"in LOE exposure"** tag + cluster id once
+  promoted, its members, and who flagged it when. This is the store the
+  "already flagged?" banner matches against — use it to verify before re-adding.
+  - **Delete** — tick rows (or **Select all**) and click **✕ Delete selected** to
+    remove flagged patterns from the history (cleanup of mistaken or test flags).
+    This deletes the **record only**: if a pattern was already **promoted**, its
+    ring may already be in the topology-exposure set and the current checkpoint —
+    deleting the record does **not** un-train the model or remove the exposure
+    cluster (that needs a rebuild/retrain). The confirm dialog warns you when any
+    selected pattern is promoted.
 
 ---
 
@@ -127,6 +172,14 @@ retrain is recommended before the next incremental update.
 
 **Deployment loop** — four numbered steps, top to bottom:
 
+   A blue **"What your CSV needs"** note at the top of Intake lists the required
+   raw columns (incl. the identity fields — `ip_address`, `mobile_no`,
+   `father_name`, `mother_name`, `permanent_pincode` — that build the 3D ring) and
+   reassures that **the system does its own feature engineering** (raw → 44 model
+   features); you supply raw columns only. **Download sample CSV** there gives a
+   ready-to-fill file (`frontend/sample_cohort.csv`) with fresh IDs and a planted
+   shared-IP ring.
+
 1. **Intake** — first pick **what the data is for**:
    - **New cohort to score** (default) — drag a cohort **CSV** onto the drop-zone
      (or *browse*). It's saved server-side and checked against the raw schema; you
@@ -144,6 +197,8 @@ retrain is recommended before the next incremental update.
 2. **Evaluate** — scores the uploaded cohort read-only (no model change) and
    reports a drift p-value. The dataset path is filled in for you from step 1.
    *This rebuilds features + graph synchronously and can take a few minutes.*
+   It also **persists a cohort bundle** so the cohort becomes reviewable in the
+   Review queue's **Dataset** dropdown (with working 3D rings) — see §3.
 3. **Decide** (human-gated) — after reviewing the evaluation, choose:
    **Log "no action"**, **Merge + incremental update**, or **Merge + full
    retrain**. The merge/retrain options permanently add the cohort to the data
@@ -167,6 +222,8 @@ history) and roll the live model back to it.
 | Start everything | `docker compose up --build` |
 | Open the console | `http://localhost:8080/` |
 | Triage a flagged application | Review queue → click a row |
+| Page through all flagged apps | Review queue → **← Prev / Next →** (50 per page) |
+| Flag several apps as one ring | Review queue → tick rows (across pages) → **◈ Flag for LOE (selected)** |
 | See an application's network in 3-D | Review queue → **◎ 3D identity ring** |
 | Export one application (CSV + card + evidence) | Review queue → open a row → **⤓ Export** |
 | Export all flagged applications | Review queue → **⤓ Export all flagged** (zip: `manifest.csv` + cards + evidence) |

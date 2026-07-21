@@ -325,6 +325,72 @@ iframe.card-embed {
   background-repeat: no-repeat; background-position: right 10px center; background-size: 10px 7px;
 }
 
+/* ---- LOE coverage warning (soft, IP-only dedup hint) ---- */
+.coverage-banner {
+  border: 1px solid rgba(244,162,97,.5); border-left-width: 4px;
+  background: rgba(244,162,97,.09); color: var(--fg2);
+  border-radius: 10px; padding: 11px 14px; font-size: 12.5px; line-height: 1.55;
+}
+.coverage-banner b { color: var(--med); }
+.coverage-banner code {
+  font-family: var(--mono); font-size: 11.5px; background: var(--ground);
+  padding: 1px 5px; border-radius: 4px; border: 1px solid var(--border); color: var(--fg2);
+}
+.coverage-banner .cov-pats { color: var(--fg); font-family: var(--mono); font-size: 11.5px; }
+
+/* ---- flagged history directory (all sessions) ---- */
+.flag-hist-item {
+  border: 1px solid var(--border); border-radius: 10px; padding: 10px 13px; margin-bottom: 8px;
+  background: var(--panel2); font-size: 12.5px;
+}
+.flag-hist-item .fh-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.flag-hist-item .fh-id { font-family: var(--mono); color: var(--fg); font-weight: 600; }
+.flag-hist-item .fh-meta { font-size: 11.5px; color: var(--muted); margin-top: 5px; }
+.flag-hist-item .fh-members { font-family: var(--mono); font-size: 11px; color: var(--fg2); margin-top: 5px; word-break: break-all; }
+.flag-hist-item .fh-check { accent-color: var(--cyan); width: 15px; height: 15px; cursor: pointer; }
+.panel-head button.ghost.danger { color: #ff8b8e; }
+.panel-head button.ghost.danger:hover:not(:disabled) { color: #ffb3b5; }
+#fh-select-all { accent-color: var(--cyan); width: 15px; height: 15px; cursor: pointer; }
+.badge.green { background: rgba(74,222,128,.16); color: var(--ok); }
+.badge.grey  { background: rgba(139,148,158,.16); color: var(--muted); }
+.badge.exposure { background: rgba(76,201,240,.16); color: var(--cyan); }
+
+/* ---- cohort picker + preview banner ---- */
+.cohort-picker { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cohort-picker label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); }
+.cohort-picker select {
+  font-family: var(--sans); font-size: 12.5px; padding: 6px 30px 6px 10px; height: 32px;
+  border: 1px solid var(--border2); border-radius: 8px; background-color: var(--ground); color: var(--fg);
+  -webkit-appearance: none; -moz-appearance: none; appearance: none; cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238b949e' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 10px center; background-size: 10px 7px;
+}
+.cohort-picker select:focus { outline: none; border-color: var(--cyan); }
+.cohort-banner {
+  border: 1px solid rgba(76,201,240,.4); border-left-width: 4px;
+  background: rgba(76,201,240,.08); color: var(--fg2);
+  border-radius: 10px; padding: 10px 14px; margin: 12px 18px 0; font-size: 12.5px; line-height: 1.5;
+}
+.cohort-banner b { color: var(--cyan); }
+.cohort-banner code {
+  font-family: var(--mono); font-size: 11.5px; background: var(--ground);
+  padding: 1px 5px; border-radius: 4px; border: 1px solid var(--border); color: var(--fg2);
+}
+
+/* ---- queue pager (prev / next over the flagged set, 50 per page) ---- */
+.queue-pager {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 11px 18px; border-top: 1px solid var(--border); background: var(--panel2);
+}
+.queue-pager .pager-info { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+.queue-pager .pager-info b { color: var(--fg); }
+.queue-pager .spacer { flex: 1; }
+.queue-pager button {
+  padding: 6px 13px; background: var(--raise); border: 1px solid var(--border2); color: var(--fg2);
+}
+.queue-pager button:hover:not(:disabled) { border-color: var(--cyan); color: var(--fg); }
+.queue-pager .pager-page { font-size: 12.5px; color: var(--fg2); font-family: var(--mono); min-width: 96px; text-align: center; }
+
 /* ---- queue row cells: checkbox + risk badge ---- */
 .qcell-chk { width: 34px; text-align: center; }
 .qcell-chk input.row-chk { accent-color: var(--cyan); width: 15px; height: 15px; cursor: pointer; }
@@ -390,6 +456,19 @@ iframe.card-embed {
   font-size: 11.5px; color: var(--muted);
 }
 .drift-verdict .dv-nums .num { color: var(--fg); }
+
+/* ---- intake schema note (what the CSV needs + preprocessing reassurance) ---- */
+.intake-schema-note {
+  background: rgba(76,201,240,.07); border: 1px solid rgba(76,201,240,.3);
+  border-left: 4px solid var(--cyan); border-radius: 10px; padding: 12px 14px;
+  font-size: 12px; line-height: 1.65; color: var(--fg2); margin-bottom: 16px;
+}
+.intake-schema-note b { color: var(--fg); }
+.intake-schema-note code {
+  font-family: var(--mono); font-size: 11px; background: var(--ground);
+  padding: 1px 5px; border-radius: 4px; border: 1px solid var(--border); color: var(--cyan);
+}
+.intake-schema-note .isn-actions { display: inline-block; margin-top: 8px; }
 
 /* ---- intake purpose toggle + pattern-intake actions ---- */
 .seg.intake-purpose { display: inline-flex; }

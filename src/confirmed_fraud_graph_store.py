@@ -158,3 +158,141 @@ def reject(pattern_ids: list[str]) -> None:
             p["state"] = "REJECTED"
             p["updated_at"] = datetime.utcnow().isoformat()
     _save_store(store)
+
+
+def remove_patterns(pattern_ids: list[str]) -> dict:
+    """Hard-delete pattern records from the store (flagged-history cleanup).
+
+    Removes only the store entry. IMPORTANT: it does NOT unwind anything a
+    PROMOTED pattern already did — its ring may already sit in the topology-
+    exposure set (synthetic_exposure_graph_v3.pt) and be baked into the current
+    checkpoint. Deleting the record just stops it showing in the history/queue;
+    reversing its training effect needs a rebuild/retrain. The return value flags
+    which deleted ids were PROMOTED so the caller can warn the reviewer."""
+    store = _load_store()
+    removed, not_found, removed_promoted = [], [], []
+    for pid in pattern_ids:
+        p = store["patterns"].pop(pid, None)
+        if p is None:
+            not_found.append(pid)
+            continue
+        removed.append(pid)
+        if p.get("state") == "PROMOTED":
+            removed_promoted.append(pid)
+    if removed:
+        _save_store(store)
+    return {
+        "removed": removed,
+        "not_found": not_found,
+        "removed_promoted": removed_promoted,
+        "remaining": len(store["patterns"]),
+    }
+
+
+def list_all() -> list[dict]:
+    """Every pattern ever flagged, all states, newest first — the persistent,
+    cross-session 'flagged directory'. This store is written on disk
+    (STORE_PATH) so it survives restarts and sessions; this just surfaces it."""
+    store = _load_store()
+    pats = list(store["patterns"].values())
+    pats.sort(key=lambda p: p.get("updated_at") or p.get("created_at") or "", reverse=True)
+    return pats
+
+
+# ── IP-cluster coverage check (soft, read-only) ─────────────────────────────────
+# Answers "has this application's IP cluster already been flagged for LOE?" so a
+# reviewer doesn't re-add the same ring. HEURISTIC by design: it matches on the
+# shares_ip identity edge only and NEVER mutates anything — the reviewer confirms
+# via the 3D identity ring. Not a rule/threshold (hard stop #1): it's graph-edge
+# membership, no numeric cutoff against a domain concept.
+_GRAPH_PT   = Path("data/processed/identity_graph_v3.pt")
+_NODEG_CSV  = Path("data/processed/engineered_features_v3_nodeg.csv")
+
+
+# Cache the shares_ip adjacency so an interactive coverage check doesn't reload
+# the ~9 MB graph on every card open. Keyed on the (graph, nodeg) file mtimes, so
+# a rebuild (retrain / pattern ingest) transparently invalidates it — advisory
+# data, but this keeps it honest after the graph changes.
+_ip_cache: dict = {"key": None, "ids": None, "id_to_node": None, "adj": None}
+
+
+def _load_ip_adjacency() -> dict | None:
+    if not (_GRAPH_PT.exists() and _NODEG_CSV.exists()):
+        return None
+    key = (_GRAPH_PT.stat().st_mtime, _NODEG_CSV.stat().st_mtime)
+    if _ip_cache["key"] == key:
+        return _ip_cache
+    import pandas as pd
+
+    ids = pd.read_csv(_NODEG_CSV, usecols=["application_id"])["application_id"].astype(str).tolist()
+    id_to_node = {a: i for i, a in enumerate(ids)}
+    data = torch.load(_GRAPH_PT, weights_only=False)
+    ei = data["application", "shares_ip", "application"].edge_index
+    adj: dict[int, set[int]] = {}
+    if ei.numel():
+        src = ei[0].tolist()
+        dst = ei[1].tolist()
+        for u, v in zip(src, dst):      # graph stores both directions
+            if u == v:
+                continue
+            adj.setdefault(u, set()).add(v)
+            adj.setdefault(v, set()).add(u)
+    _ip_cache.update(key=key, ids=ids, id_to_node=id_to_node, adj=adj)
+    return _ip_cache
+
+
+def _shares_ip_neighbors(app_id: str) -> set[str] | None:
+    """Application IDs sharing a shares_ip edge with app_id in the current
+    identity graph (excludes app_id). Returns None when the graph/mapping files
+    are absent (so callers can say 'graph unavailable' rather than 'no match')."""
+    c = _load_ip_adjacency()
+    if c is None:
+        return None
+    node = c["id_to_node"].get(str(app_id))
+    if node is None:
+        return set()  # scored population is known but this id isn't in it
+    ids = c["ids"]
+    return {ids[n] for n in c["adj"].get(node, ())}
+
+
+def ip_coverage_for_app(app_id: str) -> dict:
+    """Soft, IP-only 'is this cluster already flagged?' check across ALL prior
+    sessions (reads the persistent store + the identity graph). Reports every
+    non-REJECTED pattern that either lists app_id as a member OR shares an IP
+    edge with one of its members. Purely informational — the caller surfaces it
+    as a warning the reviewer verifies manually; nothing is mutated."""
+    app_id = str(app_id)
+    store  = _load_store()
+    patterns  = [p for p in store["patterns"].values() if p.get("state") != "REJECTED"]
+    neighbors = _shares_ip_neighbors(app_id)   # None => graph unavailable
+
+    matches = []
+    for p in patterns:
+        sg = p.get("subgraph") or {}
+        members = {str(m) for m in (sg.get("nodes") or sg.get("member_ids") or [])}
+        if not members and p.get("center_app_id"):
+            members = {str(p["center_app_id"])}
+        direct = app_id in members
+        shared = sorted(members & neighbors) if neighbors else []
+        if not (direct or shared):
+            continue
+        exposure = p.get("exposure") or {}
+        matches.append({
+            "pattern_id":    p["pattern_id"],
+            "fraud_type":    p.get("fraud_type"),
+            "state":         p.get("state"),
+            "in_exposure":   bool(exposure.get("appended")),
+            "cluster_id":    exposure.get("cluster_id"),
+            "confirmed_by":  p.get("confirmed_by"),
+            "updated_at":    p.get("updated_at"),
+            "is_member":     direct,
+            "shared_ip_with": shared[:8],
+            "n_shared_ip":   len(shared),
+        })
+
+    return {
+        "application_id":  app_id,
+        "covered":         bool(matches),
+        "graph_available": neighbors is not None,
+        "matches":         matches,
+    }

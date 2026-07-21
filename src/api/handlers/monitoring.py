@@ -209,13 +209,23 @@ def evaluate_dataset(req: EvaluateDatasetRequest):
         staged_features = merged_features[
             merged_features["application_id"].astype(str).isin(new_ids)
         ]
+
+        # Persist a cohort "bundle" so the read-only preview queue can render 3D
+        # identity rings for these apps later. The merged graph (base 15k + this
+        # cohort) is otherwise discarded on restore below; we snapshot it plus the
+        # node-order (= merged FINAL_CSV row order = graph node index) so the ring
+        # builder can map any cohort app_id -> node and draw its real neighbours.
+        name = dataset_path.stem
+        Path("outputs").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dataset_ops.GRAPH_PT, Path(f"outputs/staged_graph_{name}.pt"))
+        merged_features[["application_id"]].to_csv(
+            Path(f"outputs/staged_nodeorder_{name}.csv"), index=False)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     finally:
         dataset_ops.restore_canonical_files(backup_dir)
         shutil.rmtree(backup_dir, ignore_errors=True)
 
-    name = dataset_path.stem
     staged_scores_path   = Path(f"outputs/staged_scores_{name}.csv")
     staged_features_path = Path(f"outputs/staged_features_{name}.csv")
     staged_scores_path.parent.mkdir(parents=True, exist_ok=True)
@@ -300,6 +310,193 @@ def dataset_xai(dataset_path: str, top_n: int = 20):
         })
 
     return {"dataset_path": dataset_path, "n_cards": len(cards), "cards": cards}
+
+
+@router.get("/cohorts")
+def list_cohorts():
+    """Evaluated cohorts available for read-only preview review, newest first.
+    Each was produced by POST /evaluate-dataset (staged, non-destructive). The
+    `ring_available` flag says whether the merged-graph bundle was persisted (so
+    3D rings can render for its apps)."""
+    import glob
+    cohorts = []
+    for meta_path in glob.glob("outputs/staged_scores_meta_*.json"):
+        try:
+            meta = json.loads(Path(meta_path).read_text())
+        except Exception:
+            continue
+        name = Path(meta_path).name[len("staged_scores_meta_"):-len(".json")]
+        scores_path = Path(f"outputs/staged_scores_{name}.csv")
+        if not scores_path.exists():
+            continue
+        cohorts.append({
+            "name": name,
+            "dataset_path": meta.get("dataset_path"),
+            "n_rows": meta.get("n_rows"),
+            "recommendation": meta.get("recommendation"),
+            "p_value": meta.get("p_value"),
+            "drift_detected": meta.get("drift_detected"),
+            "ring_available": Path(f"outputs/staged_graph_{name}.pt").exists()
+                              and Path(f"outputs/staged_nodeorder_{name}.csv").exists(),
+            "mtime": scores_path.stat().st_mtime,
+        })
+    cohorts.sort(key=lambda c: c["mtime"], reverse=True)
+    log.info("monitoring.list_cohorts", n=len(cohorts))
+    return {"count": len(cohorts), "cohorts": cohorts}
+
+
+@router.get("/cohort/{name}/top-suspicious")
+def cohort_top_suspicious(name: str, n: int = 500):
+    """Ranked staged rows for an evaluated cohort — the review queue's data when a
+    cohort is selected. Score is the PRE-FUSION hybrid_anomaly_score (higher = more
+    anomalous), not the committed fused risk. 404 if the cohort wasn't evaluated."""
+    scores_path = Path(f"outputs/staged_scores_{name}.csv")
+    if not scores_path.exists():
+        raise HTTPException(status_code=404, detail=f"No evaluated cohort '{name}' — run Evaluate first")
+    df = (pd.read_csv(scores_path)
+            .sort_values("hybrid_anomaly_score", ascending=False)
+            .head(n))
+    cols = ["application_id", "hybrid_anomaly_score"]
+    return df[[c for c in cols if c in df.columns]].to_dict(orient="records")
+
+
+@router.get("/cohort/{name}/{app_id}/card")
+def cohort_card(name: str, app_id: str):
+    """Lightweight PREVIEW reviewer card (HTML) for one staged cohort application.
+    Pre-fusion — see xai_card_html_v3.build_staged_card_html. 404 if the app isn't
+    in the cohort's staged scores."""
+    from fastapi.responses import HTMLResponse
+    from src.xai_card_html_v3 import build_staged_card_html
+    html = build_staged_card_html(name, app_id)
+    if html is None:
+        raise HTTPException(status_code=404, detail=f"No staged card for '{app_id}' in cohort '{name}'")
+    return HTMLResponse(content=html, status_code=200)
+
+
+@router.get("/cohort/{name}/{app_id}/ring")
+def cohort_ring(name: str, app_id: str):
+    """3D identity ring (HTML) for a staged cohort application, rendered against
+    the persisted merged base+cohort graph so the app's real shared-attribute
+    edges (to the base 15k and other cohort apps) are shown. 404 if the cohort
+    bundle wasn't persisted or the app has no typed edges."""
+    from fastapi.responses import HTMLResponse
+    from src.xai_card_html_v3 import build_ring_html
+    graph_pt   = Path(f"outputs/staged_graph_{name}.pt")
+    nodeorder  = Path(f"outputs/staged_nodeorder_{name}.csv")
+    scores_path = Path(f"outputs/staged_scores_{name}.csv")
+    if not (graph_pt.exists() and nodeorder.exists()):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No ring bundle for cohort '{name}' — re-run Evaluate to persist the merged graph",
+        )
+    # Colour ring nodes by this cohort's pre-fusion scores where known.
+    risk_map = {}
+    if scores_path.exists():
+        sdf = pd.read_csv(scores_path)
+        risk_map = dict(zip(sdf["application_id"], sdf["hybrid_anomaly_score"]))
+    html = build_ring_html(app_id, risk_map=risk_map, graph_pt=graph_pt, nodeorder_csv=nodeorder)
+    if html is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{app_id}' not in the cohort graph, or has no shared IP/mobile/name/pincode edges",
+        )
+    log.info("monitoring.cohort_ring", cohort=name, app_id=app_id)
+    return HTMLResponse(content=html, status_code=200)
+
+
+@router.get("/cohort/{name}/{app_id}/topology")
+def cohort_topology(name: str, app_id: str):
+    """Ego-graph (flat neighbourhood, HTML) for a staged cohort application,
+    rendered against the persisted merged base+cohort graph — read-only parity
+    with the base run's ego-graph. 404 if the bundle is absent or the app has no
+    typed edges."""
+    from fastapi.responses import HTMLResponse
+    from src.topology_view import extract_ego, render_html
+    graph_pt  = Path(f"outputs/staged_graph_{name}.pt")
+    nodeorder = Path(f"outputs/staged_nodeorder_{name}.csv")
+    scores    = Path(f"outputs/staged_scores_{name}.csv")
+    if not (graph_pt.exists() and nodeorder.exists()):
+        raise HTTPException(status_code=404, detail=f"No graph bundle for cohort '{name}' — re-run Evaluate")
+    ego = extract_ego(app_id, hops=1, node_cap=50,
+                      graph_pt=graph_pt, ids_csv=nodeorder, scores_csv=scores)
+    if not ego:
+        raise HTTPException(status_code=404, detail="Application not in the cohort graph, or missing")
+    return HTMLResponse(content=render_html(ego), status_code=200)
+
+
+@router.get("/cohort/{name}/export-bulk")
+def cohort_export_bulk(name: str):
+    """Zip export of ALL staged rows for a cohort (manifest + card/ring/evidence).
+    Pre-fusion preview — see the bundle's README.txt."""
+    from fastapi.responses import Response
+    from src.export_v3 import build_cohort_bulk_export
+    result = build_cohort_bulk_export(name)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"No staged scores for cohort '{name}'")
+    filename, data = result
+    log.info("monitoring.cohort_export_bulk", cohort=name, bytes=len(data))
+    return Response(content=data, media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@router.get("/cohort/{name}/export-selected")
+def cohort_export_selected(name: str, ids: str = ""):
+    """Zip export of a reviewer-chosen subset of a cohort's staged rows."""
+    from fastapi.responses import Response
+    from src.export_v3 import build_cohort_selected_export
+    id_list = [s.strip() for s in ids.split(",") if s.strip()]
+    if not id_list:
+        raise HTTPException(status_code=400, detail="No application IDs supplied (?ids=a,b,c)")
+    if len(id_list) > 200:
+        raise HTTPException(status_code=400, detail=f"Too many IDs ({len(id_list)}); export at most 200 at once")
+    result = build_cohort_selected_export(name, id_list)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"None of the IDs are in cohort '{name}'")
+    filename, data = result
+    log.info("monitoring.cohort_export_selected", cohort=name, n=len(id_list), bytes=len(data))
+    return Response(content=data, media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@router.get("/cohort/{name}/{app_id}/export")
+def cohort_export_single(name: str, app_id: str):
+    """Zip export of one staged cohort application (scorecard + card + ring + evidence)."""
+    from fastapi.responses import Response
+    from src.export_v3 import build_cohort_single_export
+    result = build_cohort_single_export(name, app_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"'{app_id}' not in cohort '{name}'")
+    filename, data = result
+    log.info("monitoring.cohort_export_single", cohort=name, app_id=app_id, bytes=len(data))
+    return Response(content=data, media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@router.post("/cohort/{name}/delete")
+def delete_cohort(name: str, drop_upload: bool = True):
+    """Remove an evaluated cohort's staged bundle so it disappears from the
+    preview Dataset switcher — a clean demo reset. Deletes ONLY that cohort's
+    staged artifacts (and its uploaded CSV when drop_upload), by exact filename;
+    never touches the canonical base data. 404 if the cohort has no staged files."""
+    import re
+    if name != re.sub(r"[^A-Za-z0-9._-]", "", name) or not name:
+        raise HTTPException(status_code=400, detail="Invalid cohort name")
+    targets = [
+        Path(f"outputs/staged_scores_{name}.csv"),
+        Path(f"outputs/staged_features_{name}.csv"),
+        Path(f"outputs/staged_scores_meta_{name}.json"),
+        Path(f"outputs/staged_graph_{name}.pt"),
+        Path(f"outputs/staged_nodeorder_{name}.csv"),
+    ]
+    if drop_upload:
+        targets.append(Path(f"data/uploads/{name}.csv"))
+    removed = [str(t) for t in targets if t.exists()]
+    for t in targets:
+        t.unlink(missing_ok=True)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"No staged files for cohort '{name}'")
+    log.info("monitoring.delete_cohort", cohort=name, n_removed=len(removed))
+    return {"status": "ok", "cohort": name, "removed": removed}
 
 
 @router.post("/upload-dataset")

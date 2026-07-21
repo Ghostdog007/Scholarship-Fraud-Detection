@@ -220,6 +220,120 @@ def build_selected_export(app_ids: list[str]) -> tuple[str, bytes] | None:
     return f"selected_export_{len(found)}apps_{ts}.zip", buf.getvalue()
 
 
+# ── cohort (staged, read-only preview) export ──────────────────────────────────
+# Mirrors the committed builders but sourced from a cohort's staged files
+# (outputs/staged_scores_<name>.csv + the staged graph bundle). Scores are
+# PRE-FUSION — see the README.txt written into every bundle.
+STAGED_SCORECARD_COLUMNS = [
+    "application_id", "hybrid_anomaly_score", "feature_pred_error", "edge_pred_error",
+    "score_type",
+    "top_feat_1", "top_feat_1_error",
+    "top_feat_2", "top_feat_2_error",
+    "top_feat_3", "top_feat_3_error",
+]
+
+
+def _staged_paths(name: str):
+    return (Path(f"outputs/staged_scores_{name}.csv"),
+            Path(f"outputs/staged_graph_{name}.pt"),
+            Path(f"outputs/staged_nodeorder_{name}.csv"))
+
+
+def _staged_scorecard_row(row) -> dict:
+    d = {c: "" for c in STAGED_SCORECARD_COLUMNS}
+    d.update({
+        "application_id":      row["application_id"],
+        "hybrid_anomaly_score": row["hybrid_anomaly_score"],
+        "feature_pred_error":  row.get("feature_pred_error", ""),
+        "edge_pred_error":     row.get("edge_pred_error", ""),
+        "score_type":          "hybrid_anomaly_score (pre-fusion preview)",
+    })
+    per = row.get("per_feature_error_json")
+    if isinstance(per, str):
+        top = sorted(json.loads(per).items(), key=lambda kv: kv[1], reverse=True)[:3]
+        for i, (f, e) in enumerate(top, start=1):
+            d[f"top_feat_{i}"] = f
+            d[f"top_feat_{i}_error"] = round(float(e), 6)
+    return d
+
+
+def _staged_evidence_bytes(row) -> bytes:
+    per = row.get("per_feature_error_json")
+    ev = {
+        "application_id":       str(row["application_id"]),
+        "hybrid_anomaly_score": float(row["hybrid_anomaly_score"]),
+        "feature_pred_error":   float(row.get("feature_pred_error", 0) or 0),
+        "edge_pred_error":      float(row.get("edge_pred_error", 0) or 0),
+        "per_feature_error":    json.loads(per) if isinstance(per, str) else {},
+        "note": "PREVIEW — pre-fusion staged cohort score; NOT the committed risk_score_v3",
+    }
+    return json.dumps(ev, indent=2).encode("utf-8")
+
+
+def _cohort_bundle(name: str, app_ids: list[str] | None,
+                   include_rings: bool = False) -> tuple[str, bytes] | None:
+    """Zip a cohort's staged evidence — manifest + per-app card/evidence (+ rings
+    when include_rings). app_ids=None → all cohort rows (bulk). None if the cohort
+    has no staged scores. Ring inclusion mirrors the committed builders: only the
+    'selected' export embeds the heavy Plotly rings; bulk/single stay light."""
+    import pandas as pd
+    from src.xai_card_html_v3 import build_staged_card_html, build_ring_html
+
+    scores_path, graph_pt, nodeorder = _staged_paths(name)
+    if not scores_path.exists():
+        return None
+    sdf = pd.read_csv(scores_path)
+    if app_ids is not None:
+        wanted = {str(a) for a in app_ids}
+        sdf = sdf[sdf["application_id"].astype(str).isin(wanted)]
+    if sdf.empty:
+        return None
+
+    risk_map = dict(zip(sdf["application_id"], sdf["hybrid_anomaly_score"]))
+    ring_ok  = include_rings and graph_pt.exists() and nodeorder.exists()
+    rows     = [_staged_scorecard_row(r) for _, r in sdf.iterrows()]
+    ts       = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        buf2 = io.StringIO()
+        w = csv.DictWriter(buf2, fieldnames=STAGED_SCORECARD_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+        z.writestr("manifest.csv", buf2.getvalue().encode("utf-8"))
+        z.writestr("README.txt", (
+            f"Cohort preview export — {name}\n\n"
+            "Scores here are the PRE-FUSION hybrid_anomaly_score (higher = more\n"
+            "anomalous), NOT the committed fused risk_score_v3. This is a read-only\n"
+            "preview of an evaluated (not-yet-ingested) cohort.\n").encode("utf-8"))
+        for _, r in sdf.iterrows():
+            aid  = str(r["application_id"])
+            safe = aid.replace("/", "_")
+            card = build_staged_card_html(name, aid)
+            if card:
+                z.writestr(f"cards/{safe}.html", card.encode("utf-8"))
+            z.writestr(f"evidence/{safe}.json", _staged_evidence_bytes(r))
+            if ring_ok:
+                ring = build_ring_html(aid, risk_map=risk_map, graph_pt=graph_pt, nodeorder_csv=nodeorder)
+                if ring:
+                    z.writestr(f"rings/{safe}.html", ring.encode("utf-8"))
+    label = "all" if app_ids is None else f"{len(sdf)}apps"
+    return f"cohort_{name}_{label}_{ts}.zip", buf.getvalue()
+
+
+def build_cohort_single_export(name: str, app_id: str):
+    return _cohort_bundle(name, [app_id], include_rings=False)
+
+
+def build_cohort_bulk_export(name: str):
+    return _cohort_bundle(name, None, include_rings=False)
+
+
+def build_cohort_selected_export(name: str, app_ids: list[str]):
+    return _cohort_bundle(name, app_ids, include_rings=True)
+
+
 def _write(result: tuple[str, bytes] | None, label: str) -> None:
     if result is None:
         print(f"[export] nothing to export for {label} — is outputs/explanation_cards_v3.json present?")

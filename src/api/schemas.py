@@ -38,6 +38,13 @@ class PromotePatternRequest(BaseModel):
     smoke_test: bool = False
 
 
+class DeletePatternRequest(BaseModel):
+    """Hard-delete flagged patterns from the store (flagged-history cleanup).
+    Removes the RECORD only — it does not retrain or unwind any exposure cluster
+    already written to synthetic_exposure_graph_v3.pt."""
+    pattern_ids: list[str]
+
+
 class PatternTestRequest(BaseModel):
     """Read-only detection test for a supervisor-uploaded fraud ring (already
     uploaded via /v3/monitoring/upload-dataset — pass its server-side path)."""

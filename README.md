@@ -548,6 +548,94 @@ admin **Intake** step ("New cohort to score" vs "New fraud pattern"):
   the reviewer-asserted relation) — so the **Pattern queue → Promote** path also
   feeds the RGCN exposure stream, not just the state machine.
 
+### 2026-07-17 — Cohort preview queue (review ingested data + 3D rings, read-only)
+
+The Review queue gained a **Dataset switcher** (`#cohort-select`): **Primary
+dataset · 15k scored applications** vs any **evaluated cohort**. (The primary
+dataset is the population the unsupervised detector is fit on *and* scores — not a
+held-out test set; genuinely unseen data is scored via an evaluated cohort, or the
+synthetic harness in `evaluate_model_v3.py`.) Selecting a cohort re-points the
+whole triage surface — pagination, filters, multi-select, open-card — at that
+cohort's **staged** scores, so you can see how the model behaves on data you
+ingested from the front end *before* committing it.
+
+- **Scores are pre-fusion** (`hybrid_anomaly_score`, higher = more anomalous),
+  bucketed by **within-cohort percentile** (80th=high / 50th=med) so badges + the
+  risk filter stay meaningful on an arbitrary-scale score. A cyan banner states
+  this plainly. This is **not** the committed fused `risk_score_v3`.
+- **3D identity rings work for cohort apps.** `evaluate-dataset` now persists a
+  cohort bundle — `outputs/staged_graph_<name>.pt` + `staged_nodeorder_<name>.csv`
+  (the merged base+cohort graph + node order it would otherwise discard on
+  restore). The ring builder (`build_ring_html`) takes an optional graph source,
+  so a cohort app's ring shows its real edges into the base 15k **and** other
+  cohort apps. `build_staged_card_html` renders a lightweight pre-fusion preview
+  card.
+- **Full read-only parity**: card, **3D ring**, **ego-graph**, and **export**
+  (single / bulk / selected) all work on cohort apps — rendered/bundled from the
+  staged graph + scores, same as the base run. Ring inclusion mirrors the
+  committed exporters (only *selected* embeds the heavy Plotly rings; bulk/single
+  stay light). Only the **training-feeding** actions (Flag-for-LOE, label/retrain)
+  stay gated with an "ingest to enable" hint — those write to the live graph/stores
+  and only make sense once the cohort is committed.
+- New read-only endpoints: `GET /v3/monitoring/cohorts`,
+  `/cohort/{name}/top-suspicious`, `/cohort/{name}/{app_id}/card|ring|topology|export`,
+  `/cohort/{name}/export-bulk`, `/cohort/{name}/export-selected`. `extract_ego`
+  and `build_ring_html` gained optional staged-graph-source params;
+  `build_cohort_{single,bulk,selected}_export` in `export_v3.py`.
+- **Remove cohort** (demo reset): a `✕ Remove cohort` button by the Dataset
+  dropdown (cohort mode only) drops that cohort from the console via
+  `POST /v3/monitoring/cohort/{name}/delete` — deletes only its staged files
+  (+ its uploaded CSV) by exact filename; base data and the downloadable sample
+  CSV are untouched. Re-evaluate the CSV to bring it back.
+- **Intake help + sample CSV.** The admin Intake step now spells out what a CSV
+  needs (raw schema incl. the identity fields that build the ring) and reassures
+  that **the system does its own feature engineering** — you supply raw columns
+  only. A **Download sample CSV** button serves `frontend/sample_cohort.csv`
+  (full raw schema, fresh application_ids, two planted shared-IP rings).
+
+### 2026-07-17 — Paginated queue + bulk Flag-for-LOE
+
+Frontend-only (no endpoint changes; reuses `top-suspicious` and
+`patterns/confirm`):
+
+- **Paginated review queue** — the queue now pulls the full flagged set (top
+  `QUEUE_FETCH_N=500`, all of which have reviewer cards) and pages through it
+  **50 rows per page** with ← Prev / Next → controls, instead of hard-capping at
+  the top 50. The ID/risk filters reset to page 1; the pager shows
+  "Showing a–b of N flagged · Page x / y". To widen to the whole 15k scored
+  population, raise `QUEUE_FETCH_N` in `frontend/app.js` — but rows past the ~500
+  carded apps have no card, so their "Open" 404s.
+- **Bulk Flag-for-LOE** — a new **◈ Flag for LOE (selected)** toolbar button
+  takes every checkbox-selected application (selection **persists across pages**)
+  and opens the same Flag-for-LOE modal pre-filled with all of them as one
+  candidate ring; the per-card single-app "⚑ Flag for LOE" button is unchanged.
+  On record, the console clears the selection and jumps to the **Pattern queue**,
+  where the new candidate is visibly "pending" — closing the "flagged patterns
+  don't appear" gap (the modal always posted correctly; the UI just never
+  surfaced the result). The LOE modal is now driven by `loeCenterId` rather than
+  `selectedAppId`, so it serves both entry points.
+- **Soft IP-cluster coverage guard** — when a reviewer opens a card or the
+  Flag-for-LOE modal, the console cross-checks the application against every
+  previously-flagged pattern (all sessions) on the **`shares_ip`** edge and, if a
+  match is found, shows a **soft, non-blocking** banner: *"Looks like this cluster
+  may already be flagged … verify via the 3D identity ring before re-adding."* It
+  distinguishes patterns **already in LOE exposure** from merely pending/promoted.
+  Deliberately advisory (not a hard block) and IP-only — the reviewer confirms the
+  ring. New read-only endpoint `GET /v3/supervisor/patterns/coverage/{app_id}`
+  backed by `confirmed_fraud_graph_store.ip_coverage_for_app()` (mtime-cached
+  `shares_ip` adjacency, so only the first check per graph pays the load).
+- **Flagged history directory** — a new panel on the Pattern queue lists **every**
+  pattern flagged across all sessions (all states, newest first) with state badges,
+  the "in LOE exposure" tag + exposure cluster id, members, and who/when. Backed by
+  `GET /v3/supervisor/patterns/all` → `confirmed_fraud_graph_store.list_all()`.
+  This is the persistent store the coverage guard matches against. Rows are
+  **selectable with a hard-delete** (`✕ Delete selected` → `POST
+  /v3/supervisor/patterns/delete` → `remove_patterns()`) for cleaning up mistaken
+  or test flags; delete removes the **record only** — a promoted pattern's ring
+  may already be in the exposure set / checkpoint, so the confirm dialog warns
+  that deleting it does not un-train the model (needs a rebuild). `removed_promoted`
+  in the response names any promoted ids that were deleted.
+
 ### 2026-07-15 — Triage-first console: multi-select batch label/retrain, export selected, drift explanation
 
 Reworked the review queue into a triage surface and added three supervisor

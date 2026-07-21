@@ -82,7 +82,7 @@ document.querySelectorAll("nav.tabs button").forEach((btn) => {
     document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
     btn.classList.add("active");
     document.getElementById(`view-${btn.dataset.view}`).classList.add("active");
-    if (btn.dataset.view === "patterns") loadPatterns();
+    if (btn.dataset.view === "patterns") { loadPatterns(); loadFlaggedHistory(); }
     if (btn.dataset.view === "admin") loadAdminConsole();
   });
 });
@@ -129,8 +129,39 @@ let queueScoreCol = "risk_score_v3";
 const dismissedIds = new Set();
 const selectedIds = new Set();
 
+// Pagination. The queue pulls the full flagged set (every one of these has a
+// reviewer card) and pages through it client-side, 50 rows per page, rather than
+// hard-capping at the top 50. selectedIds persists across pages, so a reviewer
+// can gather a ring that spans several pages before flagging it for LOE.
+// To widen this to the entire scored population (15k), raise QUEUE_FETCH_N —
+// but rows past the ~500 carded apps have no card, so "Open" will 404 for them.
+let queuePage = 0;
+const QUEUE_PAGE_SIZE = 50;
+const QUEUE_FETCH_N = 500;
+
+// Cohort mode: null = the committed base run; else the name of an evaluated
+// cohort (read-only preview). Cohort scores are the PRE-FUSION hybrid score on an
+// arbitrary positive scale, so we bucket badges by within-cohort percentile
+// (computed in loadQueue) instead of the base run's 0-1 risk cutoffs.
+let currentCohort = null;
+let cohortScoreHi = null, cohortScoreMd = null;
+
+function queueEndpoint() {
+  return currentCohort
+    ? `/v3/monitoring/cohort/${encodeURIComponent(currentCohort)}/top-suspicious?n=${QUEUE_FETCH_N}`
+    : `/v3/monitoring/top-suspicious?n=${QUEUE_FETCH_N}`;
+}
+function cardEndpoint(id) {
+  return currentCohort
+    ? `/v3/monitoring/cohort/${encodeURIComponent(currentCohort)}/${encodeURIComponent(id)}/card`
+    : `/v3/monitoring/${encodeURIComponent(id)}/card`;
+}
+
 function riskBucket(v) {
   const n = Number(v);
+  if (currentCohort && cohortScoreHi !== null) {
+    return n >= cohortScoreHi ? "high" : n >= cohortScoreMd ? "med" : "low";
+  }
   return n >= 0.66 ? "high" : n >= 0.33 ? "med" : "low";
 }
 function riskLabel(b) { return b === "high" ? "High" : b === "med" ? "Medium" : "Low"; }
@@ -139,18 +170,31 @@ async function loadQueue() {
   const body = document.getElementById("queue-body");
   body.innerHTML = `<div class="empty-state">Loading...</div>`;
   try {
-    const rows = await apiGet("/v3/monitoring/top-suspicious?n=50");
+    const rows = await apiGet(queueEndpoint());
     if (!rows.length) {
-      body.innerHTML = `<div class="empty-state">No suspicious applications in the last run.</div>`;
+      const what = currentCohort ? `cohort "${escapeHtml(currentCohort)}"` : "the last run";
+      body.innerHTML = `<div class="empty-state">No scored applications in ${what}.</div>`;
       document.getElementById("queue-toolbar").style.display = "none";
+      document.getElementById("queue-pager").style.display = "none";
       return;
     }
     const cols = Object.keys(rows[0]);
     queueIdCol = cols.includes("application_id") ? "application_id" : cols[0];
     queueScoreCol = cols.find((c) => c.toLowerCase().includes("score")) || cols[1];
     queueRows = rows;
+    // Within-cohort percentile buckets (80th=high, 50th=med) so pre-fusion badges
+    // and the risk filter stay meaningful; the base run keeps its 0-1 cutoffs.
+    if (currentCohort) {
+      const vals = rows.map((r) => Number(r[queueScoreCol])).filter(Number.isFinite).sort((a, b) => a - b);
+      const q = (p) => (vals.length ? vals[Math.min(vals.length - 1, Math.floor(p * vals.length))] : 0);
+      cohortScoreHi = q(0.80); cohortScoreMd = q(0.50);
+    } else {
+      cohortScoreHi = cohortScoreMd = null;
+    }
     selectedIds.clear();
+    queuePage = 0;
     document.getElementById("queue-toolbar").style.display = "flex";
+    applyCohortModeUI();
     renderQueue();
   } catch (e) {
     body.innerHTML = `<div class="empty-state">Could not load queue: ${escapeHtml(e.message)}</div>`;
@@ -162,7 +206,7 @@ function renderQueue() {
   const q = (document.getElementById("queue-search").value || "").trim().toLowerCase();
   const rf = document.getElementById("queue-risk-filter").value;
 
-  const visible = queueRows.filter((row) => {
+  const filtered = queueRows.filter((row) => {
     const id = String(row[queueIdCol]);
     if (dismissedIds.has(id)) return false;
     if (q && !id.toLowerCase().includes(q)) return false;
@@ -172,11 +216,18 @@ function renderQueue() {
     return true;
   });
 
-  if (!visible.length) {
+  if (!filtered.length) {
     body.innerHTML = `<div class="empty-state">No applications match the current filter${dismissedIds.size ? " (some removed)" : ""}.</div>`;
+    renderPager(0, 0);
     updateSelectionUI();
     return;
   }
+
+  // Clamp the current page in case a filter/removal shrank the list.
+  const totalPages = Math.max(1, Math.ceil(filtered.length / QUEUE_PAGE_SIZE));
+  if (queuePage > totalPages - 1) queuePage = totalPages - 1;
+  const start = queuePage * QUEUE_PAGE_SIZE;
+  const visible = filtered.slice(start, start + QUEUE_PAGE_SIZE);
 
   let html = "<table><thead><tr><th style='width:34px'></th><th>Risk</th><th>Application ID</th><th>Score</th><th></th></tr></thead><tbody>";
   for (const row of visible) {
@@ -209,19 +260,81 @@ function renderQueue() {
       selectApp(id, tr);
     });
   });
+  renderPager(filtered.length, totalPages);
   updateSelectionUI();
+}
+
+// Prev / Next pager under the queue table. Shows the current page, page count,
+// and how many flagged rows matched the active filter. Buttons re-render the
+// same page slice — selection persists via selectedIds across page changes.
+function renderPager(nFiltered, totalPages) {
+  const pager = document.getElementById("queue-pager");
+  if (nFiltered <= QUEUE_PAGE_SIZE) { pager.style.display = "none"; return; }
+  const from = queuePage * QUEUE_PAGE_SIZE + 1;
+  const to = Math.min(nFiltered, from + QUEUE_PAGE_SIZE - 1);
+  pager.style.display = "flex";
+  pager.innerHTML = `
+    <span class="pager-info">Showing <b>${from}–${to}</b> of <b>${nFiltered}</b> flagged</span>
+    <div class="spacer"></div>
+    <button id="pager-prev" ${queuePage === 0 ? "disabled" : ""}>← Prev</button>
+    <span class="pager-page">Page ${queuePage + 1} / ${totalPages}</span>
+    <button id="pager-next" ${queuePage >= totalPages - 1 ? "disabled" : ""}>Next →</button>`;
+  pager.querySelector("#pager-prev").addEventListener("click", () => {
+    if (queuePage > 0) { queuePage -= 1; renderQueue(); document.getElementById("queue-body").scrollIntoView({ behavior: "smooth", block: "start" }); }
+  });
+  pager.querySelector("#pager-next").addEventListener("click", () => {
+    if (queuePage < totalPages - 1) { queuePage += 1; renderQueue(); document.getElementById("queue-body").scrollIntoView({ behavior: "smooth", block: "start" }); }
+  });
 }
 
 function updateSelectionUI() {
   const n = selectedIds.size;
   document.getElementById("qt-count").textContent = `${n} selected`;
+  const cohort = !!currentCohort;  // cohort: export works; only training actions gated
   document.getElementById("btn-remove-selected").disabled = n === 0;
   document.getElementById("btn-export-selected").disabled = n === 0;
-  document.getElementById("btn-label-selected").disabled = n === 0;
+  document.getElementById("btn-label-selected").disabled = n === 0 || cohort;
+  document.getElementById("btn-flag-loe-selected").disabled = n === 0 || cohort;
   document.getElementById("btn-restore-removed").style.display = dismissedIds.size ? "" : "none";
   const all = document.getElementById("chk-select-all");
   const chks = document.querySelectorAll("#queue-body .row-chk");
   all.checked = chks.length > 0 && [...chks].every((c) => c.checked);
+}
+
+// ---------- LOE coverage (soft, IP-only dedup hint) ----------
+// Cross-checks an application against the persistent flagged-pattern store on the
+// shares_ip edge; if its cluster may already be flagged, shows a soft warning
+// (never a block) telling the reviewer to verify via the 3D ring. Heuristic by
+// design — backed by src/confirmed_fraud_graph_store.ip_coverage_for_app.
+function renderCoverageInto(el, cov) {
+  if (!el) return;
+  if (!cov || !cov.covered || !cov.matches.length) { el.style.display = "none"; el.innerHTML = ""; return; }
+  const parts = cov.matches.map((m) => {
+    const where = m.is_member
+      ? "this app is listed in it"
+      : `shares an IP with ${m.n_shared_ip} of its member${m.n_shared_ip === 1 ? "" : "s"}`;
+    const tag = m.in_exposure ? "already in LOE exposure"
+      : m.state === "CONFIRMED" ? "pending confirmation"
+      : String(m.state || "").toLowerCase();
+    return `<span class="cov-pats">${escapeHtml(m.pattern_id)}</span> (${escapeHtml(m.fraud_type || "?")}, ${escapeHtml(tag)}) — ${where}`;
+  });
+  el.style.display = "block";
+  el.innerHTML =
+    `⚠ <b>Looks like this cluster may already be flagged.</b> ` +
+    parts.join("; ") + `. ` +
+    `This is a heuristic match on <code>shares_ip</code>, not a confirmation — ` +
+    `open the <b>◎ 3D identity ring</b> to check it is the same ring before flagging. ` +
+    `If it is, there is no need to re-add it. Cross-check under ` +
+    `<b>Pattern queue → Flagged history</b>.`;
+}
+
+async function loadCoverage(appId, el) {
+  if (!el) return;
+  el.style.display = "none"; el.innerHTML = "";
+  try {
+    const cov = await apiGet(`/v3/supervisor/patterns/coverage/${encodeURIComponent(appId)}`);
+    renderCoverageInto(el, cov);
+  } catch (e) { /* coverage is advisory — never block the card/modal on its failure */ }
 }
 
 // Open one application's reviewer card in the detail panel below the queue.
@@ -236,12 +349,23 @@ async function selectApp(appId, rowEl) {
   document.getElementById("detail-app-id").textContent = appId;
   document.getElementById("detail-section").scrollIntoView({ behavior: "smooth", block: "start" });
 
+  // Cohort preview: the read-only views/export have full parity (card, 3D ring,
+  // ego-graph, export). Only Flag-for-LOE stays gated — it feeds training and
+  // needs the cohort ingested. Coverage (a committed-graph check) is meaningless
+  // for staged apps, so skip it.
+  const cohort = !!currentCohort;
+  document.getElementById("btn-open-topology").disabled = false;
+  document.getElementById("btn-export-app").disabled = false;
+  document.getElementById("btn-flag-loe").disabled = cohort;
+  const covEl = document.getElementById("coverage-banner");
+  if (cohort) { covEl.style.display = "none"; } else { loadCoverage(appId, covEl); }
+
   const frame = document.getElementById("card-frame");
   frame.style.height = "420px";
   frame.onload = () => autosizeFrame(frame);
   frame.srcdoc = "<p style='font-family:sans-serif;padding:14px;color:#c9d1d9;background:#0d1117;margin:0;'>Loading card…</p>";
   try {
-    const html = await apiGetText(`/v3/monitoring/${encodeURIComponent(appId)}/card`);
+    const html = await apiGetText(cardEndpoint(appId));
     frame.srcdoc = html ?? "<p style='font-family:sans-serif;padding:14px;color:#c9d1d9;background:#0d1117;margin:0;'>No card for this application.</p>";
   } catch (e) {
     frame.srcdoc = `<p style='font-family:sans-serif;padding:14px;color:#ffb3b5;background:#0d1117;margin:0;'>Failed to load card: ${escapeHtml(e.message)}</p>`;
@@ -249,8 +373,80 @@ async function selectApp(appId, rowEl) {
 }
 
 document.getElementById("btn-refresh-queue").addEventListener("click", loadQueue);
-document.getElementById("queue-search").addEventListener("input", renderQueue);
-document.getElementById("queue-risk-filter").addEventListener("change", renderQueue);
+// Filtering changes which rows exist, so snap back to page 1 to avoid landing on
+// an out-of-range page.
+document.getElementById("queue-search").addEventListener("input", () => { queuePage = 0; renderQueue(); });
+document.getElementById("queue-risk-filter").addEventListener("change", () => { queuePage = 0; renderQueue(); });
+
+// ---------- cohort switcher (base run vs read-only evaluated cohorts) ----------
+function applyCohortModeUI() {
+  const cohort = !!currentCohort;
+  const banner = document.getElementById("cohort-banner");
+  if (cohort) {
+    banner.style.display = "block";
+    banner.innerHTML =
+      `<b>Cohort preview — ${escapeHtml(currentCohort)}.</b> Read-only scoring of an ingested dataset. ` +
+      `Scores are the <b>pre-fusion</b> <code>hybrid_anomaly_score</code> (higher = more anomalous), ` +
+      `bucketed by within-cohort percentile — not the committed fused risk. The <b>3D identity ring</b> ` +
+      `works; export, ego-graph and Flag-for-LOE need the cohort ingested (committed) first.`;
+  } else {
+    banner.style.display = "none";
+  }
+  // Export works in cohort mode (staged bundle), so keep "Export all flagged"
+  // visible; relabel it for clarity.
+  document.getElementById("btn-export-bulk").textContent = cohort ? "⤓ Export all (cohort)" : "⤓ Export all flagged";
+  // "Remove cohort" only applies to an evaluated cohort (never the base run).
+  document.getElementById("btn-remove-cohort").style.display = cohort ? "" : "none";
+  // Only the training-feeding actions need the cohort committed.
+  const hint = cohort ? "Ingest (commit) this cohort to enable — it feeds training" : "";
+  ["btn-label-selected", "btn-flag-loe-selected"].forEach((id) => {
+    document.getElementById(id).title = hint;
+  });
+  updateSelectionUI();
+}
+
+async function loadCohorts() {
+  const sel = document.getElementById("cohort-select");
+  const base = '<option value="">Primary dataset · 15k scored applications</option>';
+  try {
+    const data = await apiGet("/v3/monitoring/cohorts");
+    const opts = data.cohorts.map((c) => {
+      const extra = c.ring_available ? "" : ", no rings — re-evaluate";
+      return `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)} · ${c.n_rows ?? "?"} rows${extra}</option>`;
+    }).join("");
+    sel.innerHTML = base + opts;
+  } catch (e) {
+    sel.innerHTML = base;
+  }
+  sel.value = currentCohort || "";
+}
+
+document.getElementById("cohort-select").addEventListener("change", (e) => {
+  currentCohort = e.target.value || null;
+  document.getElementById("detail-section").style.display = "none";
+  selectedAppId = null;
+  loadQueue();
+});
+
+// Remove an evaluated cohort (demo reset): drops its staged preview files so it
+// leaves the dropdown, then falls back to the base run. Base data + the
+// downloadable sample CSV are untouched.
+document.getElementById("btn-remove-cohort").addEventListener("click", async () => {
+  if (!currentCohort) return;
+  const name = currentCohort;
+  if (!confirm(`Remove the evaluated cohort "${name}" from the console?\n\nThis deletes its read-only preview files only — the base data and the downloadable sample CSV are NOT touched. Re-evaluate the CSV to bring it back.`)) return;
+  try {
+    const res = await apiPost(`/v3/monitoring/cohort/${encodeURIComponent(name)}/delete`, {});
+    toast(`Removed cohort "${name}" (${res.removed.length} file(s)).`, "success");
+    currentCohort = null;
+    document.getElementById("detail-section").style.display = "none";
+    selectedAppId = null;
+    await loadCohorts();
+    loadQueue();
+  } catch (e) {
+    toast(`Remove failed: ${e.message}`, "error");
+  }
+});
 
 document.getElementById("chk-select-all").addEventListener("change", (e) => {
   const on = e.target.checked;
@@ -295,21 +491,34 @@ function downloadUrl(path) {
   a.remove();
 }
 
+// Export endpoints switch with the active dataset: cohort mode bundles the
+// staged (pre-fusion) evidence for the cohort apps.
+const cohortSeg = () => `/v3/monitoring/cohort/${encodeURIComponent(currentCohort)}`;
+
 document.getElementById("btn-export-app").addEventListener("click", () => {
   if (!selectedAppId) { toast("Select an application first.", "error"); return; }
-  downloadUrl(`/v3/monitoring/${encodeURIComponent(selectedAppId)}/export`);
+  downloadUrl(currentCohort
+    ? `${cohortSeg()}/${encodeURIComponent(selectedAppId)}/export`
+    : `/v3/monitoring/${encodeURIComponent(selectedAppId)}/export`);
   toast(`Preparing export for ${selectedAppId}…`);
 });
 
 document.getElementById("btn-export-bulk").addEventListener("click", () => {
-  toast("Bundling all flagged applications — this can take a moment…");
-  downloadUrl(`/v3/monitoring/export/bulk`);
+  if (currentCohort) {
+    toast(`Bundling all of cohort "${currentCohort}" — this can take a moment…`);
+    downloadUrl(`${cohortSeg()}/export-bulk`);
+  } else {
+    toast("Bundling all flagged applications — this can take a moment…");
+    downloadUrl(`/v3/monitoring/export/bulk`);
+  }
 });
 
 document.getElementById("btn-export-selected").addEventListener("click", () => {
   if (!selectedIds.size) { toast("Select one or more applications first.", "error"); return; }
   const ids = [...selectedIds].map(encodeURIComponent).join(",");
-  downloadUrl(`/v3/monitoring/export/selected?ids=${ids}`);
+  downloadUrl(currentCohort
+    ? `${cohortSeg()}/export-selected?ids=${ids}`
+    : `/v3/monitoring/export/selected?ids=${ids}`);
   toast(`Bundling ${selectedIds.size} selected application(s) — card, ring, evidence…`);
 });
 
@@ -433,12 +642,22 @@ function setSeg(kind) {
     kind === "ring" ? "3D identity ring · " : "Ego-graph topology · ";
 }
 
+// The topology endpoint for the active dataset. Both the 3D ring and the flat
+// ego-graph render against the persisted staged graph in cohort mode, so both
+// segments work there just like the base run.
+function topoEndpoint(kind) {
+  const k = kind === "ring" ? "ring" : "topology";
+  return currentCohort
+    ? `/v3/monitoring/cohort/${encodeURIComponent(currentCohort)}/${encodeURIComponent(selectedAppId)}/${k}`
+    : `/v3/monitoring/${encodeURIComponent(selectedAppId)}/${k}`;
+}
+
 async function loadTopoFrame() {
   if (!selectedAppId) return;
   const frame = document.getElementById("topo-frame");
   frame.srcdoc = "<p style='font-family:sans-serif;padding:16px;color:#c9d1d9;background:#0d1117;margin:0;'>Rendering…</p>";
   try {
-    const html = await apiGetText(`/v3/monitoring/${encodeURIComponent(selectedAppId)}/${topoKind}`);
+    const html = await apiGetText(topoEndpoint(topoKind));
     frame.srcdoc = html ?? "<p style='font-family:sans-serif;padding:16px;color:#c9d1d9;background:#0d1117;margin:0;'>No typed edges for this application — nothing to draw.</p>";
   } catch (e) {
     frame.srcdoc = `<p style='font-family:sans-serif;padding:16px;color:#ffb3b5;background:#0d1117;margin:0;'>Failed: ${escapeHtml(e.message)}</p>`;
@@ -448,6 +667,7 @@ async function loadTopoFrame() {
 function openTopo(kind) {
   if (!selectedAppId) return;
   document.getElementById("topo-app-id").textContent = selectedAppId;
+  document.getElementById("seg-ego").disabled = false;   // ego works in cohort mode too
   setSeg(kind);
   topoModal.classList.add("open");
   loadTopoFrame();
@@ -462,7 +682,7 @@ topoModal.addEventListener("click", (e) => { if (e.target === topoModal) topoMod
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") topoModal.classList.remove("open"); });
 document.getElementById("btn-topo-popout").addEventListener("click", () => {
   if (!selectedAppId) return;
-  window.open(`${API_BASE}/v3/monitoring/${encodeURIComponent(selectedAppId)}/${topoKind}`, "_blank");
+  window.open(`${API_BASE}${topoEndpoint(topoKind)}`, "_blank");
 });
 
 // ---------- supervisor actions ----------
@@ -477,6 +697,19 @@ document.getElementById("btn-topo-popout").addEventListener("click", () => {
 // pattern store rejects anything else with a 422.
 const VALID_FRAUD_TYPES = ["IP_CLUSTER", "FEE_INFLATION", "INCOME_VIOLATION", "NAME_COLLISION", "CROSS_CHANNEL", "OTHER"];
 let loeType = "IP_CLUSTER";
+// The "center" application_id posted with the pattern. For a single-card flag
+// it's that app; for a bulk flag it's the first selected id (the rest ride along
+// as the ring's other nodes). Decouples the LOE modal from selectedAppId so the
+// same form serves both the per-card button and the toolbar's bulk button.
+let loeCenterId = null;
+
+// Programmatically switch tabs by re-using the nav button's own click handler
+// (which also lazy-loads that view). Used after a bulk LOE flag to drop the
+// reviewer straight into the Pattern queue where the new candidate now shows.
+function activateView(name) {
+  const btn = document.querySelector(`nav.tabs button[data-view="${name}"]`);
+  if (btn) btn.click();
+}
 
 const loeModal = document.getElementById("loe-modal");
 
@@ -496,10 +729,17 @@ const loeModal = document.getElementById("loe-modal");
   });
 })();
 
-function openLoe() {
-  if (!selectedAppId) return;
-  document.getElementById("loe-app-id").textContent = selectedAppId;
-  document.getElementById("loe-nodes").value = selectedAppId;
+// ids: array of application IDs to flag as one candidate ring. Single-card flag
+// passes [selectedAppId]; the toolbar's bulk flag passes every checkbox-selected
+// id. The reviewer can still edit the ID list, fraud type, and shared-edge in the
+// modal before recording.
+function openLoe(ids) {
+  const list = (ids || []).map(String).filter(Boolean);
+  if (!list.length) return;
+  loeCenterId = list[0];
+  const bulk = list.length > 1;
+  document.getElementById("loe-app-id").textContent = bulk ? `${list.length} applications` : list[0];
+  document.getElementById("loe-nodes").value = list.join(", ");
   document.getElementById("loe-notes").value = "";
   document.getElementById("loe-by").value = "";
   document.getElementById("loe-edge").value = "shares_ip";
@@ -507,17 +747,25 @@ function openLoe() {
   document.querySelectorAll("#loe-type-chips .chip").forEach((c) =>
     c.classList.toggle("on", c.dataset.type === "IP_CLUSTER"));
   loeModal.classList.add("open");
+  // Check the center id against already-flagged clusters (soft, IP-only).
+  loadCoverage(loeCenterId, document.getElementById("loe-coverage"));
 }
 
 function closeLoe() { loeModal.classList.remove("open"); }
 
-document.getElementById("btn-flag-loe").addEventListener("click", openLoe);
+document.getElementById("btn-flag-loe").addEventListener("click", () => {
+  if (selectedAppId) openLoe([selectedAppId]);
+});
+document.getElementById("btn-flag-loe-selected").addEventListener("click", () => {
+  if (!selectedIds.size) { toast("Select one or more applications first.", "error"); return; }
+  openLoe([...selectedIds]);
+});
 document.getElementById("btn-loe-close").addEventListener("click", closeLoe);
 document.getElementById("btn-loe-cancel").addEventListener("click", closeLoe);
 loeModal.addEventListener("click", (e) => { if (e.target === loeModal) closeLoe(); });
 
 document.getElementById("btn-loe-submit").addEventListener("click", async () => {
-  if (!selectedAppId) return;
+  if (!loeCenterId) return;
   const notes = document.getElementById("loe-notes").value.trim();
   const nodesRaw = document.getElementById("loe-nodes").value.trim();
   const edgeType = document.getElementById("loe-edge").value;
@@ -527,17 +775,21 @@ document.getElementById("btn-loe-submit").addEventListener("click", async () => 
   if (!nodesRaw) { toast("List at least this application's ID.", "error"); return; }
   if (loeType === "OTHER" && !notes) { toast("Describe the pattern when the type is OTHER.", "error"); return; }
 
-  const subgraph = {
-    nodes: nodesRaw.split(",").map((s) => s.trim()).filter(Boolean),
-    edges: [{ type: edgeType }],
-  };
+  const nodes = nodesRaw.split(",").map((s) => s.trim()).filter(Boolean);
+  const subgraph = { nodes, edges: [{ type: edgeType }] };
 
   try {
     const res = await apiPost("/v3/supervisor/patterns/confirm", {
-      application_id: selectedAppId, fraud_type: loeType, subgraph, confirmed_by, notes,
+      application_id: loeCenterId, fraud_type: loeType, subgraph, confirmed_by, notes,
     });
-    toast(`Pattern recorded: ${res.pattern_id}. See "Pattern queue" to promote it.`, "success");
+    toast(`Pattern ${res.pattern_id} recorded (${nodes.length} member${nodes.length === 1 ? "" : "s"}) — now awaiting confirmation.`, "success");
     closeLoe();
+    // Drop the reviewer into the Pattern queue so the new candidate is visibly
+    // there (activateView reloads the list); clear the queue selection since
+    // those rows are now flagged.
+    selectedIds.clear();
+    updateSelectionUI();
+    activateView("patterns");
   } catch (e) {
     toast(`Failed: ${e.message}`, "error");
   }
@@ -571,6 +823,111 @@ async function loadPatterns() {
 }
 
 document.getElementById("btn-refresh-patterns").addEventListener("click", loadPatterns);
+
+// ---------- flagged history (persistent all-sessions directory) ----------
+function flagStateBadge(state, inExposure) {
+  const s = String(state || "").toUpperCase();
+  const cls = s === "PROMOTED" ? "green" : s === "REJECTED" ? "grey" : "amber";
+  const label = s === "CONFIRMED" ? "pending" : s.toLowerCase();
+  let html = `<span class="badge ${cls}">${escapeHtml(label)}</span>`;
+  if (inExposure) html += ` <span class="badge exposure">in LOE exposure</span>`;
+  return html;
+}
+
+async function loadFlaggedHistory() {
+  const body = document.getElementById("flagged-history-body");
+  body.innerHTML = `<div class="empty-state">Loading…</div>`;
+  try {
+    const data = await apiGet("/v3/supervisor/patterns/all");
+    if (!data.patterns.length) {
+      body.innerHTML = `<div class="empty-state">Nothing flagged yet — flag a ring from the Review queue.</div>`;
+      return;
+    }
+    body.innerHTML = data.patterns.map((p) => {
+      const sg = p.subgraph || {};
+      const members = sg.nodes || sg.member_ids || [];
+      const inExp = !!(p.exposure && p.exposure.appended);
+      const when = p.updated_at || p.created_at || "";
+      const whenTxt = when ? new Date(when).toLocaleString() : "—";
+      const clusterTxt = (p.exposure && p.exposure.cluster_id != null)
+        ? ` · exposure cluster #${p.exposure.cluster_id}` : "";
+      return `<div class="flag-hist-item" data-pattern-id="${escapeHtml(p.pattern_id)}" data-state="${escapeHtml(String(p.state || ""))}">
+        <div class="fh-head">
+          <input type="checkbox" class="fh-check" value="${escapeHtml(p.pattern_id)}">
+          <span class="fh-id">${escapeHtml(p.pattern_id)}</span>
+          <span>${escapeHtml(p.fraud_type || "?")}</span>
+          ${flagStateBadge(p.state, inExp)}
+        </div>
+        <div class="fh-meta">by ${escapeHtml(p.confirmed_by || "?")} · ${escapeHtml(whenTxt)} · ${members.length} member${members.length === 1 ? "" : "s"}${clusterTxt}${p.notes ? " · " + escapeHtml(p.notes) : ""}</div>
+        <div class="fh-members">${members.map(escapeHtml).join(", ")}</div>
+      </div>`;
+    }).join("");
+    body.querySelectorAll(".fh-check").forEach((chk) => {
+      chk.addEventListener("change", () => {
+        if (chk.checked) flaggedSelected.add(chk.value); else flaggedSelected.delete(chk.value);
+        updateFlaggedSelectionUI();
+      });
+    });
+    flaggedSelected.clear();
+    updateFlaggedSelectionUI();
+  } catch (e) {
+    body.innerHTML = `<div class="empty-state">Could not load flagged history: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+// Selection + hard-delete for the flagged-history directory. Delete removes the
+// store RECORD only — the backend reports which deleted ids were PROMOTED so we
+// can warn that their exposure/training effect persists until a rebuild.
+const flaggedSelected = new Set();
+
+function updateFlaggedSelectionUI() {
+  const n = flaggedSelected.size;
+  document.getElementById("fh-count").textContent = `${n} selected`;
+  document.getElementById("btn-delete-flagged").disabled = n === 0;
+  const all = document.getElementById("fh-select-all");
+  const chks = document.querySelectorAll("#flagged-history-body .fh-check");
+  all.checked = chks.length > 0 && [...chks].every((c) => c.checked);
+}
+
+document.getElementById("fh-select-all").addEventListener("change", (e) => {
+  const on = e.target.checked;
+  document.querySelectorAll("#flagged-history-body .fh-check").forEach((chk) => {
+    chk.checked = on;
+    if (on) flaggedSelected.add(chk.value); else flaggedSelected.delete(chk.value);
+  });
+  updateFlaggedSelectionUI();
+});
+
+document.getElementById("btn-delete-flagged").addEventListener("click", async () => {
+  const ids = [...flaggedSelected];
+  if (!ids.length) return;
+  // Warn harder when any selected pattern is PROMOTED (already in exposure).
+  const promoted = ids.filter((id) => {
+    const el = document.querySelector(`.flag-hist-item[data-pattern-id="${id}"]`);
+    return el && el.dataset.state === "PROMOTED";
+  });
+  let msg = `Delete ${ids.length} flagged pattern(s) from the history? This removes the record only.`;
+  if (promoted.length) {
+    msg += `\n\n⚠ ${promoted.length} of these are PROMOTED — their ring may already be in the ` +
+           `topology-exposure set and the current checkpoint. Deleting the record does NOT ` +
+           `un-train the model or remove the exposure cluster (that needs a rebuild/retrain).`;
+  }
+  if (!confirm(msg)) return;
+  try {
+    const res = await apiPost("/v3/supervisor/patterns/delete", { pattern_ids: ids });
+    let t = `Deleted ${res.removed.length} pattern(s).`;
+    if (res.removed_promoted.length) t += ` ${res.removed_promoted.length} were promoted (exposure effect persists until rebuild).`;
+    if (res.not_found.length) t += ` ${res.not_found.length} not found.`;
+    toast(t, "success");
+    flaggedSelected.clear();
+    loadFlaggedHistory();
+    loadPatterns();  // a deleted CONFIRMED pattern also leaves the candidates list
+  } catch (e) {
+    toast(`Delete failed: ${e.message}`, "error");
+  }
+});
+
+document.getElementById("btn-refresh-flagged-history").addEventListener("click", loadFlaggedHistory);
 
 document.getElementById("btn-promote").addEventListener("click", async () => {
   const ids = Array.from(document.querySelectorAll(".pattern-check:checked")).map((c) => c.value);
@@ -741,6 +1098,16 @@ dropzone.addEventListener("drop", (e) => {
 });
 fileInput.addEventListener("change", () => { if (fileInput.files.length) uploadDataset(fileInput.files[0]); });
 
+// Sample CSV is served statically by nginx from the frontend/ dir. It carries the
+// full raw schema with fresh application_ids and a planted shared-IP ring, so the
+// reviewer can upload → evaluate → see the cohort preview + rings immediately.
+document.getElementById("btn-download-template").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const a = document.createElement("a");
+  a.href = "sample_cohort.csv"; a.download = "sample_cohort.csv";
+  document.body.appendChild(a); a.click(); a.remove();
+});
+
 async function uploadDataset(file) {
   const out = document.getElementById("intake-report");
   out.style.display = "block";
@@ -873,6 +1240,9 @@ document.getElementById("btn-evaluate").addEventListener("click", async () => {
   try {
     const res = await apiPost("/v3/monitoring/evaluate-dataset", { dataset_path });
     out.textContent = JSON.stringify(res, null, 2);
+    // The cohort is now previewable — refresh the Review-queue dataset dropdown.
+    loadCohorts();
+    toast("Cohort evaluated — pick it in the Review queue's Dataset dropdown to review it.", "success");
   } catch (e) {
     out.textContent = `Failed: ${e.message}`;
   }
@@ -963,4 +1333,5 @@ document.getElementById("btn-rollback").addEventListener("click", async () => {
 // ---------- init ----------
 
 loadStats();
+loadCohorts();
 loadQueue();

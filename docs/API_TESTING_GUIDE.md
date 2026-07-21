@@ -427,6 +427,32 @@ List pending confirmed patterns:
 curl.exe -s http://localhost:8000/v3/supervisor/patterns
 ```
 
+List EVERY flagged pattern across all sessions (the persistent "flagged history"
+directory — all states, newest first):
+```powershell
+curl.exe -s http://localhost:8000/v3/supervisor/patterns/all
+```
+
+Soft IP-cluster coverage check — "has this application's cluster already been
+flagged for LOE?" (read-only heuristic on the `shares_ip` edge; the console shows
+it as a non-blocking warning banner the reviewer verifies via the 3D ring):
+```powershell
+curl.exe -s http://localhost:8000/v3/supervisor/patterns/coverage/APP_2024_00123
+```
+`covered` is true when the app is listed in, or shares an IP with a member of, any
+non-rejected pattern; each match carries `in_exposure` (already in the LOE
+topology-exposure set) and `n_shared_ip`. First call after a graph rebuild loads
+the graph (~4 s); subsequent calls are cached until the graph mtime changes.
+
+Delete flagged patterns from the store (flagged-history cleanup). Removes the
+RECORD only — `removed_promoted` lists deleted ids that were promoted, whose
+exposure/training effect persists until a rebuild. 404 only if none matched:
+```powershell
+Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/patterns/delete" `
+  -ContentType "application/json" `
+  -Body '{"pattern_ids": ["pat_xxxxxxxx"]}'
+```
+
 Confirm a pattern (saves subgraph):
 ```powershell
 Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/patterns/confirm" `
@@ -758,6 +784,35 @@ Returns the top-20 staged rows by `hybrid_anomaly_score` with per-feature
 errors and a narrative — same shape as `explanation_cards_v3.json`, but
 marked `[PREVIEW — pre-fusion, not yet in production scores]` since these
 rows haven't been through EVT/self-training/fusion yet.
+
+### 9.2b Cohort preview queue (review the evaluated cohort in the console)
+
+After `evaluate-dataset`, the cohort is browsable read-only in the Review queue's
+**Dataset** dropdown. The same data via API:
+
+```powershell
+# List evaluated cohorts (ring_available = merged-graph bundle persisted)
+curl.exe -s http://localhost:8000/v3/monitoring/cohorts
+
+# Ranked staged rows (pre-fusion hybrid_anomaly_score, higher = more anomalous)
+curl.exe -s "http://localhost:8000/v3/monitoring/cohort/<name>/top-suspicious?n=50"
+
+# Lightweight PREVIEW reviewer card (HTML) for one staged app
+curl.exe -s http://localhost:8000/v3/monitoring/cohort/<name>/<app_id>/card
+
+# 3D identity ring (HTML) rendered against the persisted merged base+cohort graph
+curl.exe -s http://localhost:8000/v3/monitoring/cohort/<name>/<app_id>/ring
+
+# Remove a cohort (demo reset) — deletes ONLY its staged files (+ uploaded CSV);
+# base data and the downloadable sample CSV are untouched. 404 if none exist.
+Invoke-RestMethod -Method POST "http://localhost:8000/v3/monitoring/cohort/<name>/delete"
+```
+
+`<name>` is the uploaded CSV's stem (e.g. `sample_cohort`). Rings need the bundle
+`outputs/staged_graph_<name>.pt` + `staged_nodeorder_<name>.csv`, which
+`evaluate-dataset` writes — cohorts evaluated before this feature show
+`ring_available:false` and must be re-evaluated. Export / Flag-for-LOE stay
+commit-gated (the apps aren't in the live graph until ingest).
 
 ### 9.3 Human decides — three ways to call the same endpoint
 

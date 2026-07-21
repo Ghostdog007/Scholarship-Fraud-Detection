@@ -22,23 +22,41 @@ EDGE_TYPE_COLORS = {
     "shares_pincode": "#ff7f00",
 }
 
-def extract_ego(app_id: str, hops: int = 1, node_cap: int = 50) -> dict:
+def extract_ego(app_id: str, hops: int = 1, node_cap: int = 50,
+                graph_pt: "Path | None" = None,
+                ids_csv: "Path | None" = None,
+                scores_csv: "Path | None" = None) -> dict:
     """
     Extract a BFS ego-graph around the center app_id.
+
+    Defaults to the committed graph + hybrid scores. Pass graph_pt + ids_csv (the
+    node-order application_id list the graph was built from) + scores_csv (staged
+    cohort scores) to build the ego-graph against a STAGED cohort graph — the
+    read-only cohort preview reuses this exactly like the 3D ring does.
     """
-    if not HYBRID_CSV.exists() or not GRAPH_PT.exists():
+    import numpy as np
+
+    gpt        = Path(graph_pt) if graph_pt else GRAPH_PT
+    ids_source = Path(ids_csv) if ids_csv else HYBRID_CSV
+    if not ids_source.exists() or not gpt.exists():
         return {}
 
-    df = pd.read_csv(HYBRID_CSV)
+    df = pd.read_csv(ids_source)
     if app_id not in df["application_id"].values:
         return {}
-    
+
     app_ids = df["application_id"].values
-    scores = df["hybrid_anomaly_score"].values
-    # fallback to risk score if available
-    if "risk_score_v3" in df.columns:
+    if scores_csv is not None and Path(scores_csv).exists():
+        # Cohort: scores live in a separate staged file, only for cohort rows —
+        # base neighbours default to 0 (same convention as the ring).
+        sdf = pd.read_csv(scores_csv)
+        smap = dict(zip(sdf["application_id"].astype(str), sdf["hybrid_anomaly_score"]))
+        scores = np.array([float(smap.get(str(a), 0.0)) for a in app_ids])
+    elif "risk_score_v3" in df.columns:
         scores = df["risk_score_v3"].values
-        
+    else:
+        scores = df["hybrid_anomaly_score"].values
+
     id_to_idx = {str(aid): i for i, aid in enumerate(app_ids)}
     idx_to_id = {i: str(aid) for i, aid in enumerate(app_ids)}
     
@@ -46,8 +64,8 @@ def extract_ego(app_id: str, hops: int = 1, node_cap: int = 50) -> dict:
     if app_id not in id_to_idx:
         return {}
     center_idx = id_to_idx[app_id]
-    
-    data = torch.load(GRAPH_PT, weights_only=False)
+
+    data = torch.load(gpt, weights_only=False)
     
     # build adj list
     adj = {}

@@ -759,28 +759,38 @@ def _ego_figure(app_id: str, app_ids, id_to_idx: dict, nidx: dict, rel_id: dict,
     return fig
 
 
-def _graph_ctx():
-    """Load the graph neighbour index + id mapping once (shared by batch + API)."""
+def _graph_ctx(graph_pt: "Path | None" = None, nodeorder_csv: "Path | None" = None):
+    """Load the graph neighbour index + id mapping once (shared by batch + API).
+
+    Defaults to the committed graph + features. Pass graph_pt + nodeorder_csv to
+    render against a STAGED cohort graph instead (the merged base+cohort graph
+    snapshotted by evaluate-dataset), so a read-only cohort preview can draw rings
+    for apps that aren't in the committed graph. nodeorder_csv must carry the
+    application_id column in the SAME row order the staged graph was built from."""
     from src.config_v3 import EDGE_TYPES
     from src.graph_viz_v3 import FINAL_CSV
     from src.xai_layer_v3 import _build_neighbor_index
 
-    graph_pt = Path("data/processed/identity_graph_v3.pt")
-    if not graph_pt.exists() or not FINAL_CSV.exists():
+    graph_pt = Path(graph_pt) if graph_pt else Path("data/processed/identity_graph_v3.pt")
+    ids_csv  = Path(nodeorder_csv) if nodeorder_csv else FINAL_CSV
+    if not graph_pt.exists() or not ids_csv.exists():
         return None
-    app_ids = pd.read_csv(FINAL_CSV)["application_id"].values
+    app_ids = pd.read_csv(ids_csv)["application_id"].values
     id_to_idx = {a: i for i, a in enumerate(app_ids)}
     nidx = _build_neighbor_index(graph_pt)
     rel_id = {name: i for i, name in enumerate(EDGE_TYPES)}
     return app_ids, id_to_idx, nidx, rel_id
 
 
-def build_ring_html(app_id: str, risk_map: dict | None = None) -> str | None:
+def build_ring_html(app_id: str, risk_map: dict | None = None,
+                    graph_pt: "Path | None" = None,
+                    nodeorder_csv: "Path | None" = None) -> str | None:
     """LAZY: render one Plotly 3D ego-ring as a standalone HTML string, computed
     on demand (this is what the API's /ring endpoint calls when a link is
     clicked). plotly.js is embedded inline so the response is self-contained.
-    Returns None if the application is not in the graph."""
-    ctx = _graph_ctx()
+    Returns None if the application is not in the graph. Pass graph_pt +
+    nodeorder_csv to render against a staged cohort graph (see _graph_ctx)."""
+    ctx = _graph_ctx(graph_pt, nodeorder_csv)
     if ctx is None:
         return None
     app_ids, id_to_idx, nidx, rel_id = ctx
@@ -793,6 +803,84 @@ def build_ring_html(app_id: str, risk_map: dict | None = None) -> str | None:
     if fig is None:
         return None
     return fig.to_html(include_plotlyjs=True, full_html=True)
+
+
+def build_staged_card_html(name: str, app_id: str) -> str | None:
+    """Lightweight PREVIEW reviewer card for a staged cohort application (scored
+    read-only by evaluate-dataset). Pre-fusion: shows the hybrid_anomaly_score and
+    the top interpretable feature drivers (declared-vs-model-expected where
+    available) plus the narrative — NOT the committed fused risk_score_v3 or EVT
+    triggers (those need a committed pipeline run). Returns None if the app isn't
+    in the cohort's staged scores."""
+    import json as _json
+    from src.xai_layer_v3 import _top_features, _narrative
+
+    scores_path = Path(f"outputs/staged_scores_{name}.csv")
+    feats_path  = Path(f"outputs/staged_features_{name}.csv")
+    if not scores_path.exists():
+        return None
+    sdf = pd.read_csv(scores_path)
+    match = sdf[sdf["application_id"].astype(str) == str(app_id)]
+    if match.empty:
+        return None
+    row = match.iloc[0]
+
+    per_feat  = _json.loads(row["per_feature_error_json"])
+    predicted = (_json.loads(row["per_feature_predicted_json"])
+                 if "per_feature_predicted_json" in sdf.columns else None)
+    actual_vals: dict = {}
+    if feats_path.exists():
+        fdf = pd.read_csv(feats_path)
+        fm  = fdf[fdf["application_id"].astype(str) == str(app_id)]
+        if not fm.empty:
+            actual_vals = fm.iloc[0].to_dict()
+
+    top_feats = _top_features(per_feat, actual_vals, k=6, predicted=predicted)
+    score  = float(row["hybrid_anomaly_score"])
+    pseudo = {"risk_score_v3": score, "triggers": [],
+              "top_graph_neighbors": [], "top_feature_errors": top_feats}
+    narrative = _narrative(pseudo)
+
+    rows_html = ""
+    for f in top_feats:
+        label = _esc(f.get("feature_label") or f.get("feature"))
+        err   = f.get("error")
+        val   = f.get("value")
+        exp   = f.get("expected")
+        cmp   = ""
+        if val is not None and exp is not None:
+            cmp = f"scaled {val:.3f} · model-expected {exp:.3f}"
+        elif val is not None:
+            cmp = f"scaled {val:.3f}"
+        rows_html += (f"<tr><td>{label}</td><td class='num'>{_esc(err)}</td>"
+                      f"<td class='muted'>{_esc(cmp)}</td></tr>")
+
+    return f"""<!DOCTYPE html><html><head><meta charset='utf-8'><style>
+    body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:16px;font-size:13px;}}
+    .hdr{{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px;}}
+    .aid{{font-family:ui-monospace,Consolas,monospace;color:#4cc9f0;font-weight:600;font-size:14px;}}
+    .badge{{padding:2px 10px;border-radius:999px;font-size:11px;font-weight:700;background:rgba(244,162,97,.16);color:#f4a261;border:1px solid rgba(244,162,97,.4);}}
+    .score{{font-family:ui-monospace,monospace;font-size:20px;font-weight:700;margin-left:auto;}}
+    .note{{font-size:11.5px;color:#8b949e;margin:2px 0 14px;line-height:1.5;}}
+    .narr{{background:#161b22;border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:12px 14px;line-height:1.55;margin-bottom:14px;}}
+    table{{width:100%;border-collapse:collapse;}}
+    th,td{{text-align:left;padding:7px 10px;border-bottom:1px solid rgba(255,255,255,.09);}}
+    th{{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:#6b7280;}}
+    td{{font-family:ui-monospace,Consolas,monospace;color:#c9d1d9;}}
+    .num{{color:#e6edf3;}} .muted{{color:#8b949e;font-family:'Segoe UI',sans-serif;}}
+    </style></head><body>
+    <div class='hdr'>
+      <span class='aid'>{_esc(app_id)}</span>
+      <span class='badge'>PREVIEW · pre-fusion</span>
+      <span class='score'>{score:.4f}</span>
+    </div>
+    <div class='note'>Read-only cohort score (hybrid anomaly score, higher = more anomalous).
+    This is <b>not</b> the committed fused risk_score_v3 — that needs a committed pipeline run.
+    Use the 3D identity ring above to inspect this application's relationships.</div>
+    <div class='narr'>{_esc(narrative)}</div>
+    <table><thead><tr><th>Signal driver</th><th>Error</th><th>Declared vs model-expected</th></tr></thead>
+    <tbody>{rows_html}</tbody></table>
+    </body></html>"""
 
 
 def generate_ego_rings(cards: list[dict], risk_map: dict) -> dict[str, str]:

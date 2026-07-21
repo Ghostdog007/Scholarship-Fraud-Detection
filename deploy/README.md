@@ -45,7 +45,14 @@ docker compose up --build
 
 `docker-compose.override.yml` is auto-merged and bind-mounts `./frontend` into
 nginx, so editing `index.html` / `app.js` / `style.css` shows up on refresh with
-no rebuild.
+no rebuild. **Python (`src/`) changes are NOT bind-mounted** — they're baked into
+the image, so after editing backend code run
+`docker compose up -d --build nic-api nic-worker`.
+
+> **502 after rebuilding `nic-api`?** `up --build` gives the API container a new
+> IP, but the already-running nginx has the old one cached (it resolves the
+> upstream at config-load). Fix: `docker compose restart nginx`. (Health via
+> `:8000` stays green while `:8080` 502s — that's the tell.)
 
 Prod-equivalent run (no override, frontend baked into the image — this is what
 the server runs):

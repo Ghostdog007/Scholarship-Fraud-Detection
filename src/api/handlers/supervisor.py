@@ -19,6 +19,7 @@ from src.api.schemas import (
     ConfirmBatchRequest,
     PatternTestRequest,
     PatternIngestRequest,
+    DeletePatternRequest,
 )
 
 log    = structlog.get_logger()
@@ -235,6 +236,47 @@ def list_patterns():
         "pending_count": len(pending),
         "patterns": pending
     }
+
+
+@router.get("/patterns/all")
+def list_all_patterns():
+    """Every pattern flagged across ALL sessions (all states), newest first —
+    the persistent 'flagged directory' the console surfaces so a reviewer can
+    verify whether a cluster was handled before. Read-only."""
+    from src.confirmed_fraud_graph_store import list_all
+    patterns = list_all()
+    return {"count": len(patterns), "patterns": patterns}
+
+
+@router.post("/patterns/delete")
+def delete_patterns(req: DeletePatternRequest):
+    """Hard-delete flagged patterns from the store (flagged-history cleanup).
+    Removes the RECORD only — it does NOT retrain or remove any exposure cluster
+    a PROMOTED pattern already wrote. `removed_promoted` lists deleted ids that
+    were promoted, so the UI can warn that their training effect persists until a
+    rebuild. 404 only if NONE of the ids existed."""
+    from src.confirmed_fraud_graph_store import remove_patterns
+    if not req.pattern_ids:
+        raise HTTPException(status_code=400, detail="pattern_ids is empty — nothing to delete")
+    result = remove_patterns(req.pattern_ids)
+    if not result["removed"]:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No matching patterns to delete (not found: {result['not_found']})",
+        )
+    log.info("supervisor.delete_patterns", n_removed=len(result["removed"]),
+             n_promoted=len(result["removed_promoted"]), n_not_found=len(result["not_found"]))
+    return {"status": "ok", **result}
+
+
+@router.get("/patterns/coverage/{app_id}")
+def pattern_coverage(app_id: str):
+    """Soft, IP-only 'has this cluster already been flagged for LOE?' check.
+    Matches app_id against the shares_ip neighbourhood of every non-rejected
+    pattern's members (all sessions). A heuristic the UI shows as a warning — the
+    reviewer confirms via the 3D identity ring. Never mutates anything."""
+    from src.confirmed_fraud_graph_store import ip_coverage_for_app
+    return ip_coverage_for_app(app_id)
 
 
 @router.post("/patterns/confirm")
