@@ -606,14 +606,16 @@ AGENTS.md Appendix F, now made concrete.)
 - IF: `fit` on a uniform sample (e.g. 500k rows is statistically ample for
   iForest), `score_samples` over the population in chunks. Minutes on 16 vCPU.
 - EVT: operates on score vectors (3.5M floats ≈ 14 MB) — logic unchanged, and
-  **reliability improves at this scale**. GPD shape estimation is known to be
-  unstable at low exceedance counts: Hosking & Wallis (1987) show measurably
-  worse bias/RMSE for probability-weighted-moment GPD estimators below ~500
-  exceedances, with empirical stabilization reported above ~150–500. The tail
-  sample at a 99.9th-percentile threshold grows from **~15 points (15k rows) to
-  ~3,500 (3.5M rows)** — moving shape estimation from a known-unstable regime
-  into an established-stable one, which should reduce how often the
-  `EVT_SHAPE_MIN/MAX` rejection fires and falls back to empirical quantiles.
+  **reliability improves at this scale**. GPD parameter estimation is
+  sample-size sensitive: Hosking & Wallis (1987, Technometrics 29:339–349)
+  showed via simulation that below n ≈ 500 exceedances, maximum-likelihood
+  estimation is unreliable and method-of-moments / probability-weighted-moment
+  estimators should be preferred — i.e., ~15 tail points (15k rows @ 99.9th
+  pctile) sits deep in the small-sample regime where *any* GPD fit is fragile.
+  At 3.5M rows the same threshold yields **~3,500 exceedances**, comfortably
+  past the n ≈ 500 line where even MLE becomes well-behaved. Expect the
+  `EVT_SHAPE_MIN/MAX` rejection (and its empirical-quantile fallback) to fire
+  less often, not more.
 - Fusion: three-vector weighted sum — unchanged. Writes `scores` instead of CSV.
 
 ### 13.2 Hybrid GraphMCM: neighbor-sampled mini-batch training
@@ -629,11 +631,14 @@ for a full retrain at 3.5M** on the 16 vCPU server (vs the current 8–16 h at
 15k), acceptable for a once-or-twice-yearly cycle. However, **no published
 CPU-only benchmark validates this at our node count and architecture.** The
 closest primary source, DistGNN-MB (arXiv:2211.06385), benchmarks minibatch
-GraphSAGE/GAT on x86 CPU at OGBN-Products/Papers100M scale but reports
-relative speedups, not single-node wall-clock hours. Most other NeighborLoader
-benchmarks are CPU-sample + GPU-train hybrids where host-to-device copy
-consumes 60–80 % of per-batch time (arXiv:2106.06150) — that bottleneck does
-not exist on a pure-CPU worker, so their throughput numbers do not transfer.
+GraphSAGE/GAT on x86 CPU at OGBN-Papers100M scale — but on **32-node
+distributed clusters**, reporting epoch times and relative speedups, not
+single-node wall-clock hours. Most other NeighborLoader benchmarks are
+CPU-sample + GPU-train hybrids where host-to-device data copy is identified as
+the dominant per-batch bottleneck (arXiv:2106.06150 — the paper quantifies no
+percentage; an earlier-circulated "60–80 %" figure is not in it) — that
+bottleneck does not exist on a pure-CPU worker, so hybrid throughput numbers
+do not transfer.
 **Acceptance gate:** the migration-step-5 synthetic-1M test must record
 epochs/hour; extrapolate linearly from that measurement before scheduling the
 first real 3.5M retrain. Incremental fine-tune (MLP-only, RGCN frozen) stays
@@ -711,10 +716,12 @@ untouched until step 5):**
    fan-out touches up to 150 nodes per seed, and per-edge-type sampling on
    heterogeneous graphs multiplies the same way — PyG NeighborLoader
    semantics), which practically caps depth at 2–3 layers (neighborhood
-   explosion). Published evidence favors **front-loaded / adaptive fan-out**
-   over flat: DistGNN (arXiv:2104.06700) and DAFOS (arXiv:2507.08845) both use
-   uneven, degree-aware per-layer allocation — DAFOS reports a 12.6× speedup
-   on Reddit and ogbn-products F1 73.78 % → 76.88 % vs flat fan-out. Ablate
+   explosion). Published evidence favors **adaptive / degree-aware fan-out**
+   over flat: DAFOS (arXiv:2507.08845) dynamically adjusts fan-out and
+   prioritises high-degree nodes, reporting a 12.6× speedup on Reddit and
+   ogbn-products F1 73.78 % → 76.88 % vs flat fan-out (verified against the
+   abstract). (DistGNN arXiv:2104.06700 is *full-batch* distributed CPU
+   training — it has no fan-out and is not evidence here.) Ablate
    symmetric ([15, 15]) vs front-loaded ([25, 10]) on the 15k set against
    full-graph scores before trusting either at scale.
 3. **`pg_trgm` vs `difflib`** for name similarity — equivalence check required;
@@ -727,22 +734,24 @@ untouched until step 5):**
 
 ---
 
-## 16. External references (verified 2026-07-21, external-review pass)
+## 16. External references (re-verified in-session 2026-07-21)
 
-Citations below were located and link-verified during the external evidence
-review of this document. Claims that could **not** be sourced are marked as
+Citations were first proposed by an external evidence review, then
+**independently re-verified in-session on 2026-07-21** (abstracts/pages
+fetched directly). Three of the reviewer's attributions required correction —
+see the ✗→fixed rows. Claims that could **not** be sourced are marked as
 unvalidated projections at their point of use (notably the §13.2 retrain
 wall-clock estimate).
 
-| Claim (section) | Source |
-|---|---|
-| Shared-attribute fraud graphs produce power-law fan-out / dense components; hub-capping is the standard mitigation (§12.4) | 2026 shared-infrastructure fraud-graph benchmark (arXiv) |
-| CPU minibatch GNN training at scale — closest available benchmark; reports relative speedups only (§13.2) | DistGNN-MB, arXiv:2211.06385 |
-| CPU→GPU copy = 60–80 % of per-batch time in hybrid setups; does not transfer to pure-CPU (§13.2) | Global Neighbor Sampling, arXiv:2106.06150 |
-| Multiplicative fan-out / neighborhood explosion; per-edge-type sampling on hetero graphs (§15 #2) | PyG NeighborLoader docs; Kumo.ai PyG production guide |
-| Front-loaded / adaptive fan-out beats flat (12.6× speedup; F1 73.78→76.88 on ogbn-products) (§15 #2) | DistGNN arXiv:2104.06700; DAFOS arXiv:2507.08845 |
-| GPD shape-estimator instability below ~500 exceedances; stabilization above ~150–500 (§13.1) | Hosking & Wallis 1987 (via ScienceDirect S0167947303000872); US8175830 |
-| Near-linear greedy peeling, validated at 1.47B edges (§13.3) | FRAUDAR, Hooi et al., KDD 2016, DOI 10.1145/2939672.2939747 |
-| k-core decomposition is O(V+E) (§13.3) | Batagelj & Zaveršnik |
-| COPY: 10M rows in ~14 s vs ~9,000 s row-by-row; ~100k rows/s sustained (§12.1) | pganalyze benchmark; Tiger Data benchmark; CYBERTEC PostgreSQL 16 benchmark |
-| Single-primary Postgres limits are write-side, not read-side (Part II scale note, §12.1) | OpenAI Postgres-scaling engineering account |
+| Claim (section) | Source | Re-verified |
+|---|---|---|
+| Shared-attribute fraud graphs produce power-law fan-out / dense components; hub-capping is the standard mitigation (§12.4) | 2026 shared-infrastructure fraud-graph benchmark (arXiv, per external review) | not re-fetched |
+| CPU minibatch GNN benchmark closest to ours — **32-node distributed** x86, Papers100M, epoch times / relative speedups only (§13.2) | DistGNN-MB, [arXiv:2211.06385](https://arxiv.org/abs/2211.06385) | ✅ (corrected: distributed cluster, not single-node; Products not confirmed) |
+| CPU→GPU data copy identified as dominant hybrid-training bottleneck — **no percentage published**; the circulated "60–80 %" figure is not in the paper (§13.2) | Global Neighbor Sampling, [arXiv:2106.06150](https://arxiv.org/abs/2106.06150) | ✗→fixed |
+| Multiplicative fan-out / neighborhood explosion; per-edge-type sampling on hetero graphs (§15 #2) | PyG NeighborLoader docs; Kumo.ai PyG production guide | not re-fetched |
+| Adaptive / degree-aware fan-out beats flat: 12.6× Reddit speedup; F1 73.78→76.88 ogbn-products (§15 #2) | DAFOS, [arXiv:2507.08845](https://arxiv.org/abs/2507.08845) **only** | ✅ exact; ✗→fixed (DistGNN arXiv:2104.06700 removed — it is *full-batch*, has no fan-out) |
+| GPD small-sample estimation: below n≈500 exceedances **MLE** is unreliable and MOM/PWM are preferred; large tails are well-behaved (§13.1) | Hosking & Wallis 1987, [Technometrics 29:339–349](https://www.tandfonline.com/doi/abs/10.1080/00401706.1987.10488243) | ✗→fixed (reviewer's phrasing inverted the finding — PWM is the *small-sample recommendation*, not the unstable estimator) |
+| Near-linear greedy peeling, validated on a 1.47B-edge Twitter graph; 4031×4313 dense subgraph found (§13.3) | FRAUDAR, Hooi et al., KDD 2016, [DOI 10.1145/2939672.2939747](https://dl.acm.org/doi/10.1145/2939672.2939747), [CMU PDF](https://www.cs.cmu.edu/~christos/PUBLICATIONS/kdd16-fraudar.pdf) | ✅ exact |
+| k-core decomposition is O(V+E) (§13.3) | Batagelj & Zaveršnik, arXiv:cs/0310049 | established result, not re-fetched |
+| COPY: 10M rows in ~14 s vs ~9,000 s single-row inserts (~643×); COPY ~4× faster than bulk INSERT; ~100k rows/s sustained (§12.1) | [pganalyze](https://pganalyze.com/blog/5mins-postgres-optimizing-bulk-loads-copy-vs-insert); [Tiger Data](https://www.tigerdata.com/blog/benchmarking-postgresql-batch-ingest); CYBERTEC PostgreSQL 16 benchmark | ✅ exact (pganalyze + Tiger Data URLs verified) |
+| Single-primary Postgres limits are write-side, not read-side (Part II scale note, §12.1) | OpenAI Postgres-scaling engineering account (per external review) | not re-fetched |
