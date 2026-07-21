@@ -1,5 +1,5 @@
 # NIC Fraud Detection V3 — Operations Runbook
-<!-- VERSION: 2.0 | OWNER: Project Lead | DATE: 2026-07-10 -->
+<!-- VERSION: 2.1 | OWNER: Project Lead | DATE: 2026-07-21 -->
 <!-- Audience: Supervisor / reviewer operating the console -->
 <!-- Companion: deploy/README.md (full local+k8s deploy), docs/AGENTS.md (architecture) -->
 
@@ -18,20 +18,35 @@ From the project root:
 docker compose up --build
 ```
 
-This starts four services: `redis` (broker), `nic-api` (FastAPI), `nic-worker`
-(Celery, does the training), and `nginx` (the front door). Wait until the logs
-settle — `nic-api` is ready when you see the health check passing.
+This starts six services: `postgres` (system of record, V4-Scale), `db-init`
+(one-shot — applies the schema and ingests the primary dataset + confirmed-fraud/
+pattern/run-history stores into Postgres, then exits), `redis` (broker), `nic-api`
+(FastAPI), `nic-worker` (Celery, does the training), and `nginx` (the front door).
+`nic-api`/`nic-worker` wait for `db-init` to finish successfully before starting, so
+Postgres is schema-current and populated the moment the API accepts a request — not
+just an optional fallback. `db-init` re-runs (idempotently) on every `docker compose
+up`, so Postgres stays in sync with whatever is currently in `data/`/`outputs/`. Wait
+until the logs settle — `nic-api` is ready when you see the health check passing.
+
+Postgres is reachable from the host at `localhost:5433` (not 5432 — chosen to avoid
+colliding with a locally-installed PostgreSQL); connection settings come from a
+git-ignored `.env` at the project root (`NIC_DB_HOST/PORT/NAME/USER/PASSWORD`).
 
 To stop:
 
 ```bash
-docker compose down          # stop; keep data
+docker compose down          # stop; keep data (including the Postgres volume)
 ```
 
-Data lives in the mounted `./data`, `./models`, `./outputs` folders, so it
-survives restarts. The console only shows content once a pipeline run has
-produced scores and cards in `outputs/` (a fresh checkout with empty `outputs/`
-shows empty queues — that's expected, not an error).
+**Gotcha:** if you rebuild just `nic-api`/`nic-worker` (e.g. `docker compose up
+--build nic-api nic-worker`) without recreating `nginx`, nginx keeps the old
+container's cached IP and every request 502s. Restart it: `docker compose restart
+nginx`.
+
+Data lives in the mounted `./data`, `./models`, `./outputs` folders (files) and the
+`postgres-data` volume (Postgres), so it survives restarts. The console only shows
+content once a pipeline run has produced scores and cards in `outputs/` (a fresh
+checkout with empty `outputs/` shows empty queues — that's expected, not an error).
 
 ---
 
@@ -63,11 +78,18 @@ This is the reviewer's main screen.
   via an evaluated cohort). Pick a cohort to review how the model scored that
   ingested data *read-only*, before committing it. In cohort mode a cyan banner
   reminds you the scores are **pre-fusion** (`hybrid_anomaly_score`, bucketed by
-  within-cohort percentile). The review tools have **full parity** — reviewer
-  card, **3D ring**, **ego-graph**, and **export** (single / all / selected) all
-  work on cohort apps. Only the training-feeding actions (**Flag-for-LOE**,
-  **label/retrain**) stay gated: they need the cohort ingested (committed) first.
-  Switch back to the **Primary dataset** for those.
+  within-cohort percentile). The review tools have **full visual parity** —
+  the reviewer card uses the same identity-network tab, ranked reason codes,
+  and expandable declared-vs-expected fields as the primary card, with a real
+  network preview drawn from the cohort's own graph. **3D ring**, **ego-graph**,
+  and **export** (single / all / selected) all work on cohort apps too. What's
+  genuinely different pre-commit (labeled "PREVIEW · pre-fusion" on the card,
+  never silently hidden): no EVT-threshold reason codes or fusion-composition
+  breakdown (subspace IF / dense-block only exist after a committed run), and
+  no Confirm-fraud / Mark-false-positive buttons (that write to the committed
+  features file, which doesn't have this app yet). Flag-for-LOE and
+  label/retrain stay gated the same way — commit the cohort first (Decide →
+  Merge). Switch back to the **Primary dataset** for those.
   A **✕ Remove cohort** button (cohort mode only) drops that cohort from the
   console. It first shows a warning that **all of the cohort's outputs are
   discarded on the server** — its explanation/reviewer cards, 3D rings,
