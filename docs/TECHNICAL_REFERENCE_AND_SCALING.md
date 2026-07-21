@@ -1052,9 +1052,28 @@ code untouched until step 4; full evidence in `IMPLEMENTATION.md`):
 
 ## 15. Open decisions — lead-owned, not resolved autonomously
 
-1. **K_CAP and the group-size frequency ceiling** (§12.4) — derive from the
-   real 3.5M group-size distribution; needs one profiling query after first
-   ingest.
+1. **K_CAP and the group-size frequency ceiling** (§12.4) — still open;
+   **the profiling query itself is built and dry-run tested**
+   (`scripts/profile_group_sizes.py`, rerunnable in one line against the real
+   3.5M ingest). Dry run on the current 15k population (2026-07-21):
+
+   | Relation | Groups (size≥2) | Max size | p99.9 | Raw clique edges | @k_cap=50 |
+   |---|---|---|---|---|---|
+   | shares_mobile | 63 | 6 | 6 | 83 | 68 (−18%) |
+   | shares_ip | 1,534 | 39 | 27 | 7,202 | 6,083 (−16%) |
+   | shares_father_name | 1,116 | 36 | 32 | 9,151 | 7,993 (−13%) |
+   | shares_mother_name | 1,170 | 110 | 61 | 38,146 | 28,668 (−25%) |
+   | shares_pincode | 2,026 | 152 | 73 | 104,081 | 72,852 (−30%) |
+
+   **Not the production value** — at 15k the largest group is 152 members;
+   at 3.5M (233×) group sizes will be materially larger (more people can
+   plausibly share one pincode, one common surname, one NAT-gateway IP), so
+   both the percentile-derived ceiling and the edge-reduction curve above
+   must be re-run on the real ingest before a K_CAP is chosen. What this run
+   validates: the query is correct, fast (single-digit seconds at 15k), and
+   the star-capping tradeoff is visible and inspectable per relation — the
+   `pincode`/`mother_name` relations are the ones with the heaviest tail and
+   will need the ceiling most.
 2. ~~NeighborLoader fan-out~~ — **CLOSED.** Exact-neighborhood batching
    adopted (§13.2).
 3. **`pg_trgm` vs `difflib`** for name similarity — equivalence check
