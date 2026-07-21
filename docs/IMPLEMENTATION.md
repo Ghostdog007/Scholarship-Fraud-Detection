@@ -1,122 +1,112 @@
-# IMPLEMENTATION.md — V4 Final Detection Architecture (LOCKED)
+# IMPLEMENTATION.md — V4-Scale Migration Plan
 
-**Status:** Locked and implemented (2026-07-05). Every component choice below is
-backed by measured results in `docs/AGENTS.md` Appendix H. Sits under
-`.claude/CLAUDE.md` and `docs/AGENTS.md`.
+<!-- VERSION: 2.0 (V4-Scale rewrite, 2026-07-21). Supersedes the V4 locked-detection
+     architecture plan, which is complete and summarised in HISTORY.md; pre-rewrite
+     text in git history (`git show 9b772de:docs/IMPLEMENTATION.md` on main). -->
 
-**Design principle:** several *specialised raw detectors*, each catching what the
-others structurally cannot, combined by a **weighted score-level fusion** — NOT a
-learned tree. The 14-positive LightGBM fusion was dropped because it *destroyed* the
-raw signals (subspace INCOME 0.966→0.315, RGCN IP 0.51→0.169; AGENTS.md H.8).
+Five steps, strictly ordered. Each step is independently shippable, has an
+acceptance gate on the 15k dataset, and leaves `main`-equivalent behavior
+intact until its cut-over. **`src/` model modules are untouched until step 4.**
+Design rationale for everything here: `TECHNICAL_REFERENCE_AND_SCALING.md`
+Part II. Contract and hard stops: `AGENTS.md`.
 
----
-
-## The locked architecture
-
-### Layer 1 — Two backbones (raw scores)
-- **RGCN Hybrid GraphMCM + topology exposure** → `hybrid_anomaly_score`. The
-  relational backbone: raw IP **0.51**, MOTHER **0.45**, and the best generalisation
-  to novel topology. Its topology-exposure layer is validated (LOE +0.148, H.9).
-- **Subspace Isolation Forest** → `subspace_if_score`. The tabular backbone and the
-  single strongest component (raw mean **0.727**; INCOME 0.966, FEE 0.916).
-
-### Layer 2 — IP specialist: dense-block, gated to `shares_ip`
-FRAUDAR-style camouflage-resistant greedy peeling, run on **`shares_ip` only**
-(`DENSE_BLOCK_RELATIONS=[1]`). Raw IP **0.713** — fills subspace's one blind spot.
-Not run on `shares_mother_name`/`shares_pincode` (legitimately dense → false
-positives). Deterministic, self-terminating, unthresholded.
-`src/dense_block_detector_v3.py` → `outputs/dense_block_scores_v3.csv`.
-
-### Layer 3 — Deviation layer (wired, DORMANT)
-DevNet/PReNet weak-supervision. Cold-start synthetic-only today → dormant. Exposure
-layer validated (LOE +0.092, H.9). Activates per-category once confirmed labels
-cross `DEV_MIN_CONFIRMED_PER_CATEGORY`. `src/deviation_layer_v3.py`.
-
-### Layer 4 — Weighted SCORE-LEVEL fusion (LOCKED)
-```
-risk = minmax( 1.0*minmax(subspace_if_score)
-             + 0.5*minmax(dense_block_score_ip)
-             + 0.3*minmax(hybrid_anomaly_score) )
-```
-Weights in `config_v3.py` (`FUSION_W_SUBSPACE/DENSE_IP/HYBRID`). Label-independent —
-no learned gate to bury a strong signal. Subspace dominant (wins 4/5 categories),
-dense-block-IP boosts the IP blind spot, RGCN adds relational/topology signal.
-`src/fusion_classifier_v3.py`.
-
-### Layer 5 — EVT/SPOT thresholding (unchanged)
-The single authoritative threshold on the fused score. `src/evt_scorer_v3.py`.
-
-### Layer 6 — AAD feedback loop (unchanged)
-Supervisor confirms/rejects top flags → feeds Layer 3's labels and, if novel,
-topology exposure via `confirmed_fraud_graph_store` (FLAGGED→CONFIRMED→SELECTED→
-PROMOTED). Batched, human-gated (hard stop #5).
-
-### Standing, not fused: ring classifier
-Independent audit signal, not a fusion input. Most stable, best held-out MOTHER.
-`src/ring_*.py`.
-
-### Presentation: interactive reviewer cards (`src/xai_card_html_v3.py`)
-Renders the evidence-first cards (`explanation_cards_v3.json`) as self-contained,
-offline, interactive HTML — **suspicious (flagged) applications only** (crossed an
-EVT threshold, carries a trigger, or a non-negative label). Each card has a
-two-pane layout: an interactive identity ego-graph + per-detector signal bars +
-the **closed-form fusion split** on the left; risk placement, ranked reason codes,
-and per-field declared-vs-model-expected breakdown (progressive disclosure) on the
-right. The heavy Plotly 3D ring is **lazy** — computed only when a reviewer clicks
-the card's link, never pre-rendered in batch. Presentation only; computes no new
-scores and quotes only EVT-derived gates. Replaced the dead LightGBM/TreeSHAP path
-in `xai_layer_v3.py` with the exact closed-form fusion attribution.
-
-Served by the API (`GET /v3/monitoring/{app_id}/card` and `/ring`, both HTML) and
-embedded in the review console (lazy 3D links resolve against the live API).
-`main_v3.py` renders the suspicious cards after `run_xai`. (MLflow artifact
-logging was retired — run history now lives in `outputs/model_registry.json`;
-see README "Model Audit".)
+Status legend: ☐ not started · ◐ in progress · ✅ gate passed
 
 ---
 
-## Measured performance (locked fusion, frozen detector, GPU, one run)
+## Step 0 — Postgres stands up ☐
 
-| | AGE | INCOME | IP | MOTHER | FEE | MEAN |
-|---|---|---|---|---|---|---|
-| Connected | 0.576 | 0.700 | **0.538** | 0.737 | 0.643 | **0.639** |
-| Held-out | 0.603 | 0.744 | 0.409 | 0.752 | 0.689 | 0.640 |
+- `deploy/postgres/schema.sql`: the system-of-record schema
+  (`applications`, `identity_keys` (5 indexed identity columns), `features`,
+  `scores`, `confirmed_fraud`, `loe_patterns`, `batches`, `evt_thresholds`,
+  `training_runs`, `feature_scaling`). Column definitions:
+  `TECHNICAL_REFERENCE_AND_SCALING.md` §11.1.
+- `src/db/` package: connection pool (`psycopg`), typed query functions,
+  versioned migration runner. **All SQL lives here** (hard stop 14).
+- docker-compose service + k8s manifest addition (`postgres` pod, local-path
+  PV; sizing in §14 of the technical reference).
+- Local dev: connect to the lead's local PostgreSQL install (connection
+  parameters via env / `.env`, never hardcoded).
 
-vs the old LightGBM fusion baseline (~0.22 mean) and vs subspace-only (0.727 mean but
-IP stuck at 0.327). The locked fusion trades a little tabular for a real **+0.21 on
-IP** — the relational capability the architecture exists to provide.
+**Gate 0:** schema applies cleanly to an empty database twice (idempotent
+migrations); `src/db/` round-trips one synthetic row per table.
+
+## Step 1 — Dual-write the JSON stores ☐
+
+- `confirmed_fraud_store.py`, `confirmed_fraud_graph_store.py`,
+  `model_registry.py` gain a Postgres backend behind their **existing public
+  interfaces**; writes go to both JSON and Postgres, reads stay on JSON.
+- No handler or model-module changes.
+
+**Gate 1:** replay the current JSON stores into Postgres; a comparison script
+shows field-level parity (every record, every field). JSON remains
+authoritative (hard stop 13).
+
+## Step 2 — Serve reads from Postgres ☐
+
+- Ingest the 15k scored outputs into `scores`; the review-queue,
+  card-metadata, drift, and stats endpoints read from `src/db/` instead of
+  CSV parses. Ego-graph/ring endpoints query `identity_keys` (indexed 1–2 hop
+  lookup, technical reference §12.5) instead of loading the `.pt` graph.
+- Console untouched; endpoint responses byte-comparable where deterministic.
+
+**Gate 2:** for the full 15k population, every read endpoint returns
+identical payloads from the Postgres path and the file path (automated diff
+over the queue pages, N sampled cards, topology responses). Then flip reads
+to Postgres; files still written.
+
+## Step 3 — Ingestion lands in Postgres ☐
+
+- Console CSV upload → `COPY` into a staging `batches` row
+  (`status='staged'`); Evaluate scores it read-only; Decide's Merge flips
+  `status='merged'`. **Frontend and endpoint signatures unchanged.**
+- Pattern-CSV intake writes `applications` + `loe_patterns` the same way.
+- Add the bulk/portal ingestion entry point (same staging path, no console).
+
+**Gate 3:** upload → evaluate → decide flow produces the same console
+behavior as on `main` for `frontend/sample_cohort.csv`, with rows landing in
+Postgres instead of files.
+
+## Step 4 — Feature engineering + graph at scale ☐
+
+First model-module edits; one module at a time.
+
+- `tabular_feature_engine_v3.py`: cross-row aggregates become SQL
+  (window/group queries via `src/db/`), per-row scalars run chunked;
+  **scaler params fit once and persisted** to `feature_scaling`
+  (hard stop 11), applied — never refit — on scoring batches.
+- `graph_builder_v3.py`: edges from SQL self-joins on `identity_keys`,
+  **hub-capped** (clique ≤ K_CAP, star above, statistical group-size ceiling
+  derived from the observed distribution — hard stop 1).
+
+**Gate 4 (the big parity gate):** on the 15k dataset, the new path reproduces
+`engineered_features_v3.csv` bit-for-bit where deterministic (tolerance only
+where floating-point summation order differs), and graph degree/count
+features match. Any discrepancy halts the step (quantitative claims protocol
+#6).
+
+## Step 5 — NeighborLoader training + scale test ☐
+
+- `hybrid_graphmcm_v3.py`: training and scoring loops move to PyG
+  `NeighborLoader` mini-batching. Model classes, losses, hyperparameters, and
+  score exports unchanged. Fan-out per open decision #2 (ablate magnitude
+  *and* shape — symmetric vs front-loaded — on 15k first).
+- **Scale test on synthetic ~1M rows before any real 3.5M run:** record
+  epochs/hour (this replaces the unvalidated 24–48 h projection), peak RSS,
+  and edge counts under the chosen K_CAP.
+
+**Gate 5:** (a) 15k scores from the sampled path match full-graph scores
+within the ±0.03–0.04 noise floor (deterministic CPU comparison for anything
+tighter); (b) the 1M synthetic run completes within the worker's memory
+limit, with measured epochs/hour extrapolating to an acceptable 3.5M retrain
+window. Measurements are recorded in `training_runs` (raw stdout preserved),
+not restated from memory.
 
 ---
 
-## DROPPED (measured out)
+## After step 5
 
-- **Tier-1 attention read-out** — modest; redundant once the raw RGCN score is used.
-- **HAN encoder** — regressed −0.091 (3-seed).
-- **`max_fusion` / equal-weight score fusion** — dilutes strong per-category signal.
-- **LightGBM as the primary combiner** — destroyed the raw signals on 14 labels.
-  Parked; revisit (with monotonic constraints) only once labels grow.
-- **RGCN retirement (`dense_block_only`)** — disproven; RGCN raw is the best
-  relational detector.
-
----
-
-## Config (locked in `src/config_v3.py`)
-
-`ENCODER_ARCH="rgcn"`, `DENSE_BLOCK_ENABLED=1` (default ON), `DENSE_BLOCK_RELATIONS=[1]`,
-`FUSION_W_SUBSPACE=1.0`, `FUSION_W_DENSE_IP=0.5`, `FUSION_W_HYBRID=0.3`,
-`DEVIATION_LAYER_ENABLED=0` (dormant). `TIER1_ATTN_FEATURES`/`RING_CLASSIFIER_ENABLED`
-remain OFF (deprecated as fusion inputs).
-
-Pipeline order (`main_v3.py`): … subspace_if → **dense_block** → evt → self_training →
-**fusion (score-level)** → xai → evaluate.
-
-## Frozen boundaries
-
-`checkpoint_manager.py`, deployment spec, hard stops #1–16, and the detection
-pipeline contract remain frozen. **Extended (2026-07-06, lead-approved on this
-branch):** two read-only HTML endpoints added to `monitoring.py`
-(`/{app_id}/card`, `/{app_id}/ring`) — presentation-only, no change to the
-scoring/schema contract. (The card was formerly also logged as an MLflow
-artifact; MLflow has since been retired — see README "Model Audit".) Also fixed a
-pre-existing committed syntax error in `src/api/handlers/supervisor.py` (module
-docstring never closed) that had kept the whole API unimportable.
+Cut-over review with the lead: retire dual-writes (JSON stores become
+read-only archives), update `OPERATIONS_RUNBOOK.md` and `deploy/README.md`
+for the Postgres-backed stack, and schedule the first real 3.5M ingest plus
+the K_CAP profiling query (open decision #1).
