@@ -160,15 +160,17 @@ def drift_explain(top: int = 12):
 
 @router.get("/fraud-store-summary", response_model=FraudStoreSummaryResponse)
 def fraud_store_summary():
-    # Step 2 (Gate 2 passed): Postgres first, JSON store as fallback.
-    from src.db import reads as db_reads
-    if db_reads.reads_from_pg():
-        try:
+    # Step 2 (Gate 2 passed): Postgres first, JSON store as fallback. Import
+    # is INSIDE the try — a missing/broken db layer (e.g. psycopg not
+    # installed) must degrade to the file path, never 500 the endpoint.
+    try:
+        from src.db import reads as db_reads
+        if db_reads.reads_from_pg():
             s = db_reads.fraud_store_summary()
             log.info("monitoring.fraud_store_summary", source="pg", **{k: v for k, v in s.items() if k != "by_fraud_type"})
             return FraudStoreSummaryResponse(**s)
-        except Exception as e:  # noqa: BLE001
-            log.warning("monitoring.fraud_store_summary.pg_failed_falling_back", error=str(e))
+    except Exception as e:  # noqa: BLE001
+        log.warning("monitoring.fraud_store_summary.pg_failed_falling_back", error=str(e))
 
     from src.confirmed_fraud_store import load_confirmed, load_false_positive_ids
     confirmed = load_confirmed()
@@ -611,17 +613,19 @@ def top_suspicious(n: int = 20):
     Non-finite floats are sanitized to null globally by SafeJSONResponse.
 
     Step 2 (Gate 2 passed): reads from Postgres by default; the file path is
-    the escape hatch (NIC_READS_FROM_PG=0) and the fallback on query failure.
+    the escape hatch (NIC_READS_FROM_PG=0) and the fallback on query failure
+    (including a missing/broken db layer — the import itself is inside the
+    try, so e.g. psycopg not being installed degrades gracefully too).
     """
-    from src.db import reads as db_reads
-    if db_reads.reads_from_pg():
-        try:
+    try:
+        from src.db import reads as db_reads
+        if db_reads.reads_from_pg():
             recs = db_reads.top_suspicious(n=n)
             if recs:
                 return recs
             log.warning("monitoring.top_suspicious.pg_empty_falling_back")
-        except Exception as e:  # noqa: BLE001 — PG outage must not kill the queue
-            log.warning("monitoring.top_suspicious.pg_failed_falling_back", error=str(e))
+    except Exception as e:  # noqa: BLE001 — PG outage must not kill the queue
+        log.warning("monitoring.top_suspicious.pg_failed_falling_back", error=str(e))
 
     risk_path = Path("outputs/risk_scores_v3.csv")
     if risk_path.exists():

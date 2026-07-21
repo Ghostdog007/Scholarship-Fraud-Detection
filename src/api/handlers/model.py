@@ -38,14 +38,16 @@ def model_stats():
     from src.model_registry import latest_run, list_runs
     from src.confirmed_fraud_store import load_confirmed, load_false_positive_ids
 
-    # Step 2 (Gate 2 passed): scored-population count from Postgres, file fallback.
+    # Step 2 (Gate 2 passed): scored-population count from Postgres, file
+    # fallback. Import inside the try — a missing/broken db layer degrades
+    # gracefully instead of 500ing.
     n_scored = 0
-    from src.db import reads as db_reads
-    if db_reads.reads_from_pg():
-        try:
+    try:
+        from src.db import reads as db_reads
+        if db_reads.reads_from_pg():
             n_scored = db_reads.n_scored()
-        except Exception as e:  # noqa: BLE001
-            log.warning("model.stats.pg_failed_falling_back", error=str(e))
+    except Exception as e:  # noqa: BLE001
+        log.warning("model.stats.pg_failed_falling_back", error=str(e))
     if n_scored == 0:
         scores = Path("outputs/risk_scores_v3.csv")
         n_scored = int(pd.read_csv(scores, usecols=["application_id"]).shape[0]) if scores.exists() else 0
