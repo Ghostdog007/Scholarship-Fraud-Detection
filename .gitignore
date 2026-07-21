@@ -45,3 +45,6 @@ mlflow.db
 # Local reversibility backup of the 68-feature artifacts (large .pth/.csv)
 backup_68feat/
 
+
+# Local environment (DB credentials) — never commit
+.env

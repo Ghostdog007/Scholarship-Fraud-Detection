@@ -16,6 +16,23 @@
 
 services:
 
+  postgres:
+    # System of record (V4-Scale step 0). Schema applied by `python -m src.db.migrate`.
+    image: postgres:18
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=${NIC_DB_NAME:-nic_fraud}
+      - POSTGRES_USER=${NIC_DB_USER:-nic_app}
+      - POSTGRES_PASSWORD=${NIC_DB_PASSWORD:?set in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${NIC_DB_USER:-nic_app} -d ${NIC_DB_NAME:-nic_fraud}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   redis:
     image: redis:7-alpine
     ports:
@@ -37,8 +54,15 @@ services:
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - NIC_DB_HOST=postgres
+      - NIC_DB_PORT=5432
+      - NIC_DB_NAME=${NIC_DB_NAME:-nic_fraud}
+      - NIC_DB_USER=${NIC_DB_USER:-nic_app}
+      - NIC_DB_PASSWORD=${NIC_DB_PASSWORD:?set in .env}
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -62,8 +86,15 @@ services:
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - NIC_DB_HOST=postgres
+      - NIC_DB_PORT=5432
+      - NIC_DB_NAME=${NIC_DB_NAME:-nic_fraud}
+      - NIC_DB_USER=${NIC_DB_USER:-nic_app}
+      - NIC_DB_PASSWORD=${NIC_DB_PASSWORD:?set in .env}
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     deploy:
       replicas: 1   # NEVER increase — concurrent training corrupts fixed-path outputs
@@ -80,3 +111,6 @@ services:
     depends_on:
       nic-api:
         condition: service_healthy
+
+volumes:
+  postgres-data:

@@ -165,3 +165,22 @@ curl -s http://localhost:8080/v3/training/jobs/<that job_id>
 kubectl -n nic-fraud get pods            # all Running; nic-worker exactly 1
 curl -s http://<server-ip>:30080/health  # via the nginx NodePort
 ```
+
+---
+
+## PostgreSQL (V4-Scale step 0)
+
+The system of record. Local dev: install PostgreSQL, create the `nic_fraud`
+database + `nic_app` role, put credentials in a git-ignored `.env` at the
+project root (`NIC_DB_HOST/PORT/NAME/USER/PASSWORD`), then apply the schema:
+
+```bash
+python -m src.db.migrate     # idempotent; applies deploy/postgres/schema.sql + migrations/
+```
+
+Compose: a `postgres` service (postgres:18, named volume `postgres-data`) is
+in `docker-compose.yml`; `nic-api`/`nic-worker` receive `NIC_DB_*` env vars
+and depend on its healthcheck. K8s: PVC + Deployment + Service appended to
+`deploy/k8s/nic-fraud.yaml`; create the `nic-db` Secret first (command in the
+manifest comment). All SQL access goes through `src/db/` — see
+`docs/AGENTS.md` hard stop 14.

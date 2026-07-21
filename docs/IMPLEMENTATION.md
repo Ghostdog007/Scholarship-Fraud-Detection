@@ -14,7 +14,12 @@ Status legend: ☐ not started · ◐ in progress · ✅ gate passed
 
 ---
 
-## Step 0 — Postgres stands up ☐
+## Step 0 — Postgres stands up ✅ (gate passed 2026-07-21)
+
+> Gate evidence: `deploy/postgres/schema.sql` applied twice cleanly
+> (idempotent) against local PostgreSQL 18.4; round-trip script passed 11/11
+> checks (one row per table + 43-dim feature-vector rejection). Local dev DB:
+> `nic_fraud` / role `nic_app`, credentials in git-ignored `.env`.
 
 - `deploy/postgres/schema.sql`: the system-of-record schema
   (`applications`, `identity_keys` (5 indexed identity columns), `features`,
