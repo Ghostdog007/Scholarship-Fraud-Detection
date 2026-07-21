@@ -527,6 +527,16 @@ handler internals behind the same endpoints.
 
 ### 12.1 Ingest
 
+**Ingestion contract (lead-set, 2026-07-21):** every sender — console CSV
+upload, portal sync, bulk COPY — delivers rows in the **raw schema** (the
+shape of `data_for_ml_model.csv`), nothing more. Senders never pre-engineer
+features or normalise identities. Raw rows land in `applications` under a
+staged batch; **all preprocessing is this system's job**, and the derived
+tables are populated per-batch only when the admin triggers it through the
+console (Evaluate → read-only scoring; Merge/retrain → permanent):
+`identity_keys` extraction, then feature engineering into `features`, then
+scoring into `scores`. Data is never model-visible before the human gate.
+
 `COPY` (or `psycopg` `copy_expert`) loads ~3.5M rows in single-digit minutes.
 Benchmarks: pganalyze measured **14 s via COPY vs ~9,000 s via single-row
 INSERTs for 10M rows**; Tiger Data's benchmark establishes a ~100,000 rows/s

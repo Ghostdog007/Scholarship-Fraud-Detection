@@ -74,11 +74,18 @@ neighbourhoods. Then flip reads to Postgres; files still written.
 
 ## Step 3 — Ingestion lands in Postgres ☐
 
+- **Ingestion contract (lead-set):** senders deliver **raw-schema rows only**
+  (the `data_for_ml_model.csv` shape) — no upstream preprocessing, ever. Raw
+  lands in `applications` under a staged batch; `identity_keys` / `features` /
+  `scores` are populated **per batch, only on admin-triggered actions**
+  (Evaluate = read-only, Merge/retrain = permanent). Staged raw data is
+  invisible to the model until the human gate fires.
 - Console CSV upload → `COPY` into a staging `batches` row
   (`status='staged'`); Evaluate scores it read-only; Decide's Merge flips
   `status='merged'`. **Frontend and endpoint signatures unchanged.**
 - Pattern-CSV intake writes `applications` + `loe_patterns` the same way.
-- Add the bulk/portal ingestion entry point (same staging path, no console).
+- Add the bulk/portal ingestion entry point (same staging path, no console —
+  same contract: raw rows in, nothing derived until the admin acts).
 
 - **Cohort delete must clean Postgres too:** `POST /cohort/{name}/delete`
   today removes the staged files (which is where the on-the-fly cards/rings
