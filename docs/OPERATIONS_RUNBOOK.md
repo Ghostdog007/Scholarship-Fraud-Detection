@@ -69,9 +69,12 @@ This is the reviewer's main screen.
   **label/retrain**) stay gated: they need the cohort ingested (committed) first.
   Switch back to the **Primary dataset** for those.
   A **✕ Remove cohort** button (cohort mode only) drops that cohort from the
-  console — it deletes only the cohort's read-only preview files (and its uploaded
-  CSV); the base data and the downloadable sample CSV are untouched. Re-evaluate
-  the CSV to bring it back. (Good for a demo: add a dataset, show it, remove it.)
+  console. It first shows a warning that **all of the cohort's outputs are
+  discarded on the server** — its explanation/reviewer cards, 3D rings,
+  ego-graphs, pre-fusion scores, evidence, and the uploaded CSV — and deletes
+  them only after you accept. The base data and the downloadable sample CSV are
+  untouched. Re-upload + re-evaluate the CSV to bring the cohort back. (Good
+  for a demo: add a dataset, show it, remove it.)
 - **Status tiles** (top): confirmed-fraud count, false-positive count, live
   checkpoint size, and the current drift recommendation.
 - **Top suspicious applications**: the ranked queue from the last pipeline run,
@@ -210,8 +213,17 @@ retrain is recommended before the next incremental update.
 **Run history**: every training run and checkpoint swap (newest first) — when,
 type, cycle, metrics, checkpoint size. This is the audit trail.
 
+**Install pretrained checkpoint (.pth)**: trained the model elsewhere (e.g. a
+full GPU retrain on the laptop)? Upload the `.pth` here with a cycle label and
+a source note. The server validates it **before anything changes** — the file
+must contain `{model_state_dict, centroid, config}` with this deployment's
+exact feature/edge dimensions, or it is rejected and the live model stays as
+it was. On success the server backs up the current checkpoint, keeps a
+versioned copy, and hot-swaps atomically; the job status shows in the panel.
+(Same mechanism scripted: `POST /v3/training/upload-checkpoint`.)
+
 **Rollback checkpoint**: paste a versioned checkpoint path (shown in run
-history) and roll the live model back to it.
+history) and roll the live model back to it — the undo for a bad install.
 
 ---
 
@@ -232,5 +244,6 @@ history) and roll the live model back to it.
 | Score a new cohort | Admin → Intake → Evaluate |
 | Retrain the model | Admin → Decide |
 | See model metrics / history | Admin → status strip + Run history |
+| Install a GPU-laptop-trained model | Admin → Install pretrained checkpoint |
 | Undo a bad checkpoint | Admin → Rollback |
 | Stop everything | `docker compose down` |

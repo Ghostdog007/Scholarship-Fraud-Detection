@@ -31,6 +31,17 @@ VALID_FRAUD_TYPES = {
 }
 
 
+def _mirror(fn_name: str, *args) -> None:
+    """Best-effort Postgres dual-write (migration step 1). JSON stays
+    authoritative (hard stop 13); a PG failure never breaks the caller but is
+    printed loudly so it can't go unnoticed."""
+    try:
+        from src.db import stores as db_stores
+        getattr(db_stores, fn_name)(*args)
+    except Exception as e:  # noqa: BLE001 — dual-write must not break the console
+        print(f"[confirmed_fraud] WARNING: Postgres dual-write {fn_name} FAILED: {e}")
+
+
 def _load_store() -> dict:
     if STORE_PATH.exists():
         return json.loads(STORE_PATH.read_text())
@@ -78,7 +89,7 @@ def add_confirmed(
         print(f"[confirmed_fraud] '{app_id}' already confirmed — skipping.")
         return
 
-    store["confirmed"].append({
+    record = {
         "application_id": app_id,
         "cycle":          cycle,
         "fraud_type":     fraud_type,
@@ -86,9 +97,11 @@ def add_confirmed(
         "confirmed_by":   confirmed_by,
         "confirmed_at":   str(date.today()),
         "notes":          notes,
-    })
+    }
+    store["confirmed"].append(record)
 
     _save_store(store)
+    _mirror("upsert_confirmed", record)
     total = len(store["confirmed"])
     print(f"[confirmed_fraud] Added '{app_id}' ({fraud_type}). Total confirmed: {total}")
 
@@ -101,13 +114,15 @@ def add_false_positive(app_id: str, confirmed_by: str, notes: str = "") -> None:
         print(f"[confirmed_fraud] '{app_id}' already marked false positive — skipping.")
         return
 
-    store["false_positives"].append({
+    record = {
         "application_id": app_id,
         "confirmed_by":   confirmed_by,
         "confirmed_at":   str(date.today()),
         "notes":          notes,
-    })
+    }
+    store["false_positives"].append(record)
     _save_store(store)
+    _mirror("upsert_false_positive", record)
     print(f"[confirmed_fraud] Marked '{app_id}' as false positive. Total FP: {len(store['false_positives'])}")
 
 
@@ -125,6 +140,7 @@ def remove_label(app_id: str) -> dict:
     removed_f = len(store["false_positives"]) < before_f
     if removed_c or removed_f:
         _save_store(store)
+        _mirror("delete_label", app_id)
         print(f"[confirmed_fraud] Cleared label for '{app_id}' "
               f"(confirmed={removed_c}, false_positive={removed_f}).")
     return {

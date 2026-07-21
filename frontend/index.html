@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>NIC Fraud Review Console</title>
-<link rel="stylesheet" href="style.css?v=20260717g">
+<link rel="stylesheet" href="style.css?v=20260721a">
 </head>
 <body>
 
@@ -287,6 +287,35 @@
       <div class="panel-body" id="history-body"><div class="empty-state">Loading…</div></div>
     </div>
 
+    <!-- ---- INSTALL PRETRAINED CHECKPOINT ---- -->
+    <div class="panel">
+      <div class="panel-head"><span>Install pretrained checkpoint (.pth)</span></div>
+      <div class="panel-body">
+        <p class="hint">
+          Trained on the GPU laptop? Upload the checkpoint here. It is validated
+          before anything changes — the file must contain
+          <code>{model_state_dict, centroid, config}</code> with the exact
+          feature/edge dimensions of this deployment, or it is rejected and the
+          live model is untouched. On success the server takes a backup, keeps a
+          versioned copy (rollback-able below), and hot-swaps atomically.
+        </p>
+        <div class="field">
+          <label>Checkpoint file</label>
+          <input id="ckpt-file" type="file" accept=".pth">
+        </div>
+        <div class="field">
+          <label>Cycle label (e.g. 2026-27)</label>
+          <input id="ckpt-cycle" type="text" placeholder="2026-27">
+        </div>
+        <div class="field">
+          <label>Source note (who/where it was trained)</label>
+          <input id="ckpt-source" type="text" placeholder="gpu-laptop full retrain, seed 42">
+        </div>
+        <button id="btn-upload-ckpt">⬆ Upload &amp; validate</button>
+        <pre id="ckpt-upload-status" class="job-status" style="display:none"></pre>
+      </div>
+    </div>
+
     <!-- ---- ROLLBACK ---- -->
     <div class="panel">
       <div class="panel-head"><span>Rollback checkpoint</span></div>
@@ -401,7 +430,7 @@
 
 <div class="toast-stack" id="toast-stack"></div>
 
-<script src="config.js?v=20260717g"></script>
-<script src="app.js?v=20260717g"></script>
+<script src="config.js?v=20260721a"></script>
+<script src="app.js?v=20260721a"></script>
 </body>
 </html>

@@ -36,7 +36,7 @@ Status legend: ☐ not started · ◐ in progress · ✅ gate passed
 **Gate 0:** schema applies cleanly to an empty database twice (idempotent
 migrations); `src/db/` round-trips one synthetic row per table.
 
-## Step 1 — Dual-write the JSON stores ☐
+## Step 1 — Dual-write the JSON stores ✅ (gate passed 2026-07-21)
 
 - `confirmed_fraud_store.py`, `confirmed_fraud_graph_store.py`,
   `model_registry.py` gain a Postgres backend behind their **existing public
@@ -46,6 +46,15 @@ migrations); `src/db/` round-trips one synthetic row per table.
 **Gate 1:** replay the current JSON stores into Postgres; a comparison script
 shows field-level parity (every record, every field). JSON remains
 authoritative (hard stop 13).
+
+> Gate evidence: replay mirrored 49 confirmed + 1 false-positive + 1 pattern
+> + 4 registry runs; field-level comparison passed with zero mismatches
+> (feature_vec at float32 precision). Live add→PG-row→remove→PG-delete
+> round-trip verified through the store's public API. Schema correction made
+> during this step: `application_id` is **TEXT** (real IDs are alphanumeric,
+> e.g. `AS202526000000139`); the three mirror tables track the JSON shapes
+> verbatim — `deploy/postgres/schema.sql` is the authoritative DDL, and the
+> §11.1 draft in TECHNICAL_REFERENCE (BIGINT) is superseded on these points.
 
 ## Step 2 — Serve reads from Postgres ☐
 
@@ -57,8 +66,11 @@ authoritative (hard stop 13).
 
 **Gate 2:** for the full 15k population, every read endpoint returns
 identical payloads from the Postgres path and the file path (automated diff
-over the queue pages, N sampled cards, topology responses). Then flip reads
-to Postgres; files still written.
+over the queue pages, N sampled cards, topology responses). **Explicitly in
+scope: reviewer/explanation cards, 3D identity rings, and ego-graphs must
+render identically** — the ego-graph query change (indexed `identity_keys`
+lookup replacing the in-memory `.pt` graph) must produce the same
+neighbourhoods. Then flip reads to Postgres; files still written.
 
 ## Step 3 — Ingestion lands in Postgres ☐
 
@@ -68,9 +80,19 @@ to Postgres; files still written.
 - Pattern-CSV intake writes `applications` + `loe_patterns` the same way.
 - Add the bulk/portal ingestion entry point (same staging path, no console).
 
+- **Cohort delete must clean Postgres too:** `POST /cohort/{name}/delete`
+  today removes the staged files (which is where the on-the-fly cards/rings
+  come from) plus the uploaded CSV, after an explicit console warning that
+  all cohort outputs are discarded. Once cohort rows land in Postgres, the
+  same endpoint must also delete that cohort's `applications` / `features` /
+  `scores` rows (staged batches only — merged batches are permanent).
+
 **Gate 3:** upload → evaluate → decide flow produces the same console
 behavior as on `main` for `frontend/sample_cohort.csv`, with rows landing in
-Postgres instead of files.
+Postgres instead of files. **Full frontend parity is part of this gate:** the
+evaluated cohort must render exactly as today — beautified reviewer cards,
+3D identity rings, ego-graphs, exports — for cohort applications as well as
+the base population (the user-visible console loses nothing).
 
 ## Step 4 — Feature engineering + graph at scale ☐
 

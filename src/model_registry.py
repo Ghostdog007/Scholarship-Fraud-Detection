@@ -90,6 +90,13 @@ def log_run(
     }
     data["runs"].append(record)
     _atomic_write(data)
+    # Postgres dual-write (migration step 1). JSON stays authoritative (hard
+    # stop 13); failure is loud, never fatal.
+    try:
+        from src.db.stores import upsert_run
+        upsert_run(record)
+    except Exception as e:  # noqa: BLE001 — dual-write must not break callers
+        print(f"[model_registry] WARNING: Postgres dual-write upsert_run FAILED: {e}")
     return record
 
 

@@ -434,7 +434,16 @@ document.getElementById("cohort-select").addEventListener("change", (e) => {
 document.getElementById("btn-remove-cohort").addEventListener("click", async () => {
   if (!currentCohort) return;
   const name = currentCohort;
-  if (!confirm(`Remove the evaluated cohort "${name}" from the console?\n\nThis deletes its read-only preview files only — the base data and the downloadable sample CSV are NOT touched. Re-evaluate the CSV to bring it back.`)) return;
+  if (!confirm(
+    `Remove the evaluated cohort "${name}"?\n\n` +
+    `⚠ This DISCARDS all of the cohort's outputs on the server:\n` +
+    `   • its explanation / reviewer cards\n` +
+    `   • its 3D identity rings and ego-graphs\n` +
+    `   • its pre-fusion scores and evidence\n` +
+    `   • its uploaded CSV\n\n` +
+    `The base 15k data and the downloadable sample CSV are NOT touched.\n` +
+    `To see this cohort again you must re-upload and re-evaluate the CSV.`
+  )) return;
   try {
     const res = await apiPost(`/v3/monitoring/cohort/${encodeURIComponent(name)}/delete`, {});
     toast(`Removed cohort "${name}" (${res.removed.length} file(s)).`, "success");
@@ -1314,6 +1323,41 @@ document.getElementById("btn-poll-job").addEventListener("click", () => {
   if (!jobId) return;
   out.style.display = "block";
   pollJob(jobId, out);
+});
+
+document.getElementById("btn-upload-ckpt").addEventListener("click", async () => {
+  const fileInput = document.getElementById("ckpt-file");
+  const out = document.getElementById("ckpt-upload-status");
+  const file = fileInput.files[0];
+  if (!file) { toast("Choose a .pth checkpoint file first.", "error"); return; }
+  if (!file.name.endsWith(".pth")) { toast("File must be a .pth checkpoint.", "error"); return; }
+  if (!confirm(`Upload ${file.name} (${(file.size / 1048576).toFixed(1)} MB)? ` +
+      `If validation passes, it becomes the live model.`)) return;
+
+  const form = new FormData();
+  form.append("file", file);
+  form.append("cycle", document.getElementById("ckpt-cycle").value.trim() || "unknown");
+  form.append("source_ref", document.getElementById("ckpt-source").value.trim() || "console-upload");
+
+  out.style.display = "block";
+  out.textContent = `Uploading ${file.name}…`;
+  try {
+    const res = await fetch(API_BASE + "/v3/training/upload-checkpoint", {
+      method: "POST",
+      body: form,   // multipart — browser sets the boundary header itself
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(payload.detail || `HTTP ${res.status}`);
+    out.textContent = JSON.stringify(payload, null, 2);
+    toast("Checkpoint uploaded — validating.", "success");
+    if (payload.job_id) {
+      document.getElementById("poll-job-id").value = payload.job_id;
+      pollJob(payload.job_id, out);
+    }
+  } catch (e) {
+    out.textContent = `Failed: ${e.message}`;
+    toast(`Upload failed: ${e.message}`, "error");
+  }
 });
 
 document.getElementById("btn-rollback").addEventListener("click", async () => {

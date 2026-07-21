@@ -400,7 +400,17 @@ EVT (fits on score vectors), fusion (vector arithmetic), XAI card generation
 
 ## 11. PostgreSQL as the system of record
 
-### 11.1 Schema (proposed)
+### 11.1 Schema (draft — superseded by the implemented DDL)
+
+> **Correction (2026-07-21, migration step 1):** the DDL below was the design
+> draft; the **authoritative schema is `deploy/postgres/schema.sql`**. Two
+> corrections were made during implementation: (1) `application_id` is
+> **TEXT**, not BIGINT — real portal IDs are alphanumeric (e.g.
+> `AS202526000000139`); (2) the `confirmed_fraud` / `loe_patterns` /
+> `training_runs` tables mirror the existing JSON store shapes field-for-field
+> (string cycles, the graph store's CONFIRMED/SELECTED/PROMOTED/REJECTED
+> lifecycle, 12-hex run ids) so the Gate 1 dual-write parity check is exact.
+> Typed refinements can come at cut-over, not before.
 
 ```sql
 -- Raw ingested applications: every ingestion path lands here.

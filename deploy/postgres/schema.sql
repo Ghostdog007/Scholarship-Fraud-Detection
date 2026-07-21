@@ -16,10 +16,13 @@ CREATE TABLE IF NOT EXISTS batches (
 );
 
 -- ── Raw ingested applications ─────────────────────────────────────────────────
+-- application_id is TEXT: real portal IDs are alphanumeric (e.g.
+-- 'AS202526000000139'). Corrected 2026-07-21 from the BIGINT in the original
+-- TECHNICAL_REFERENCE §11.1 draft.
 -- Typed raw columns are added at step 3 (ingestion) when the CSV schema is
 -- bound; until then `raw` JSONB is the lossless record.
 CREATE TABLE IF NOT EXISTS applications (
-    application_id  BIGINT PRIMARY KEY,
+    application_id  TEXT PRIMARY KEY,
     batch_id        INT NOT NULL REFERENCES batches(batch_id),
     raw             JSONB NOT NULL,
     source          TEXT NOT NULL DEFAULT 'csv_upload'
@@ -31,7 +34,7 @@ CREATE INDEX IF NOT EXISTS idx_applications_batch ON applications (batch_id);
 -- ── Identity keys: the 5 relations, normalised at ingest, indexed ─────────────
 -- An "edge" is a shared value here; ego-graphs are indexed lookups (§12.5).
 CREATE TABLE IF NOT EXISTS identity_keys (
-    application_id    BIGINT PRIMARY KEY REFERENCES applications(application_id),
+    application_id    TEXT PRIMARY KEY REFERENCES applications(application_id),
     mobile_no         TEXT,
     ip_address        TEXT,
     father_name_norm  TEXT,
@@ -46,7 +49,7 @@ CREATE INDEX IF NOT EXISTS idx_ik_pincode ON identity_keys (pincode);
 
 -- ── Engineered features (the 44-dim model vector) ─────────────────────────────
 CREATE TABLE IF NOT EXISTS features (
-    application_id  BIGINT PRIMARY KEY REFERENCES applications(application_id),
+    application_id  TEXT PRIMARY KEY REFERENCES applications(application_id),
     batch_id        INT NOT NULL REFERENCES batches(batch_id),
     schema_version  TEXT NOT NULL,
     vec             REAL[] NOT NULL CHECK (cardinality(vec) = 44)
@@ -66,7 +69,7 @@ CREATE TABLE IF NOT EXISTS feature_scaling (
 
 -- ── Scores (all components + fusion; higher = more anomalous, hard stop 3) ────
 CREATE TABLE IF NOT EXISTS scores (
-    application_id      BIGINT NOT NULL REFERENCES applications(application_id),
+    application_id      TEXT NOT NULL REFERENCES applications(application_id),
     batch_id            INT NOT NULL REFERENCES batches(batch_id),
     model_version       TEXT NOT NULL,
     hybrid_anomaly_score REAL,
@@ -88,31 +91,36 @@ CREATE INDEX IF NOT EXISTS idx_scores_queue
     ON scores (batch_id, final_risk_score DESC);
 
 -- ── Confirmed fraud / false positives (supervisor hard labels) ────────────────
+-- Mirrors data/processed/confirmed_fraud.json field-for-field (Gate 1 parity).
+-- No FK to applications: labels exist for apps not yet ingested (until step 2).
+-- cycle is TEXT (e.g. '2026H2'); confirmed_at is the store's date string.
 CREATE TABLE IF NOT EXISTS confirmed_fraud (
-    application_id  BIGINT PRIMARY KEY,
+    application_id  TEXT PRIMARY KEY,
     label           TEXT NOT NULL CHECK (label IN ('confirmed', 'false_positive')),
     fraud_type      TEXT,
     confirmed_by    TEXT,
-    cycle           INT,
+    cycle           TEXT,
     feature_vec     REAL[] CHECK (feature_vec IS NULL OR cardinality(feature_vec) = 44),
-    confirmed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    confirmed_at    TEXT,
     notes           TEXT
 );
 
 -- ── LOE fraud patterns (flagged rings; promoted -> topology exposure) ─────────
+-- Mirrors data/processed/confirmed_fraud_graph_store.json field-for-field
+-- (Gate 1 parity): pattern_id 'pat_<hex>', states are the store's lifecycle
+-- (CONFIRMED -> SELECTED -> PROMOTED / REJECTED), subgraph + exposure JSONB.
 CREATE TABLE IF NOT EXISTS loe_patterns (
-    pattern_id          SERIAL PRIMARY KEY,
-    state               TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (state IN ('pending', 'promoted', 'rejected')),
-    fraud_type          TEXT,
-    relation_asserted   TEXT,
-    member_ids          BIGINT[] NOT NULL,
-    edges               JSONB,   -- extracted real subgraph (structure only, no embeddings)
-    in_loe_exposure     BOOLEAN NOT NULL DEFAULT FALSE,
-    exposure_cluster_id INT,
-    flagged_by          TEXT,
-    flagged_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    promoted_at         TIMESTAMPTZ
+    pattern_id      TEXT PRIMARY KEY,
+    center_app_id   TEXT,
+    fraud_type      TEXT,
+    state           TEXT NOT NULL
+                    CHECK (state IN ('CONFIRMED', 'SELECTED', 'PROMOTED', 'REJECTED')),
+    subgraph        JSONB,   -- {"nodes": [...], "edges": [...]} — structure only, no embeddings
+    exposure        JSONB,   -- promote() outcome: {"appended": bool, ...}
+    confirmed_by    TEXT,
+    notes           TEXT,
+    created_at      TEXT,    -- store's ISO string, mirrored verbatim
+    updated_at      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_loe_state ON loe_patterns (state);
 
@@ -129,18 +137,19 @@ CREATE TABLE IF NOT EXISTS evt_thresholds (
 );
 
 -- ── Training runs (audit trail; replaces model_registry.json at cut-over) ─────
+-- Mirrors outputs/model_registry.json run records field-for-field (Gate 1
+-- parity): run_id is the registry's 12-char hex, run_type/cycle are free TEXT,
+-- params/metrics/checkpoint are JSONB.
 CREATE TABLE IF NOT EXISTS training_runs (
-    run_id          UUID PRIMARY KEY,
-    kind            TEXT NOT NULL
-                    CHECK (kind IN ('full', 'incremental', 'smoke', 'scale_test')),
-    cycle           INT,
-    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    finished_at     TIMESTAMPTZ,
-    status          TEXT NOT NULL DEFAULT 'running'
-                    CHECK (status IN ('running', 'succeeded', 'failed')),
-    metrics         JSONB,
-    checkpoint_path TEXT,
-    config          JSONB
+    run_id      TEXT PRIMARY KEY,
+    ts          TEXT NOT NULL,      -- registry's ISO timestamp, mirrored verbatim
+    run_type    TEXT NOT NULL,
+    cycle       TEXT,
+    smoke_test  BOOLEAN NOT NULL DEFAULT FALSE,
+    status      TEXT NOT NULL,
+    params      JSONB,
+    metrics     JSONB,
+    checkpoint  JSONB
 );
 
 -- ── Schema migrations ledger (versioned migrations, hard stop 14) ─────────────
