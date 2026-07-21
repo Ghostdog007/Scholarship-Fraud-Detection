@@ -257,6 +257,16 @@ def evaluate_dataset(req: EvaluateDatasetRequest):
     }
     Path(f"outputs/staged_scores_meta_{name}.json").write_text(json.dumps(meta, indent=2))
 
+    # Step 3: admin ran Evaluate — populate the batch's derived Postgres rows
+    # (identity_keys + features + pre-fusion preview scores). Best-effort.
+    try:
+        from src.db.ingest import batch_exists, evaluate_batch, stage_raw_csv
+        if not batch_exists(name):
+            stage_raw_csv(dataset_path, name=name)  # uploaded before step 3 existed
+        evaluate_batch(name, staged_scores_path, staged_features_path, float(p))
+    except Exception as e:  # noqa: BLE001
+        log.warning("monitoring.evaluate_dataset.pg_failed", error=str(e))
+
     log.info("monitoring.evaluate_dataset", **meta)
 
     return EvaluateDatasetResponse(
@@ -505,8 +515,18 @@ def delete_cohort(name: str, drop_upload: bool = True):
         t.unlink(missing_ok=True)
     if not removed:
         raise HTTPException(status_code=404, detail=f"No staged files for cohort '{name}'")
-    log.info("monitoring.delete_cohort", cohort=name, n_removed=len(removed))
-    return {"status": "ok", "cohort": name, "removed": removed}
+
+    # Step 3: also drop the cohort's staged Postgres rows (merged batches are
+    # permanent and refused by delete_staged_batch). Best-effort.
+    pg_result: dict = {}
+    try:
+        from src.db.ingest import delete_staged_batch
+        pg_result = delete_staged_batch(name)
+    except Exception as e:  # noqa: BLE001
+        log.warning("monitoring.delete_cohort.pg_failed", error=str(e))
+
+    log.info("monitoring.delete_cohort", cohort=name, n_removed=len(removed), pg=pg_result)
+    return {"status": "ok", "cohort": name, "removed": removed, "postgres": pg_result}
 
 
 @router.post("/upload-dataset")
@@ -562,6 +582,16 @@ async def upload_dataset(file: UploadFile = File(...)):
         "extra_columns":    extra,
         "duplicate_ids":    duplicate_ids,
     }
+    # Step 3: land the raw rows in Postgres as a STAGED batch (admin-gated
+    # contract — nothing derived until Evaluate/Merge). Best-effort dual-write;
+    # files stay authoritative (hard stop 13).
+    if report["schema_ok"]:
+        try:
+            from src.db.ingest import stage_raw_csv
+            report["staged_batch"] = stage_raw_csv(dest, name=dest.stem)
+        except Exception as e:  # noqa: BLE001 — PG outage must not break intake
+            log.warning("monitoring.upload_dataset.pg_stage_failed", error=str(e))
+
     log.info("monitoring.upload_dataset", filename=safe_name, n_rows=report["n_rows"],
              schema_ok=report["schema_ok"], n_missing=len(missing))
     return report

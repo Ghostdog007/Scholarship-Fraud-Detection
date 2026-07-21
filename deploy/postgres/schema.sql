@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS batches (
     row_count   INT,
     status      TEXT NOT NULL DEFAULT 'staged'
                 CHECK (status IN ('staged', 'evaluated', 'merged')),
-    drift_p     REAL,
+    drift_p     DOUBLE PRECISION,   -- KS p-values reach 1e-85+ — REAL underflows
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

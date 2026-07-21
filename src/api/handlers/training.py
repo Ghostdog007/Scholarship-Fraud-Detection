@@ -168,6 +168,17 @@ def training_decision(req: DecisionRequest):
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    # Step 3: the human gate fired — mark the batch merged (permanent) in
+    # Postgres. Best-effort; the file merge above is what's authoritative.
+    if req.action in ("incremental", "full_retrain"):
+        try:
+            from src.db.ingest import batch_exists, merge_batch, stage_raw_csv
+            if not batch_exists(dataset_path.stem):
+                stage_raw_csv(dataset_path, name=dataset_path.stem)
+            merge_batch(dataset_path.stem)
+        except Exception as e:  # noqa: BLE001
+            log.warning("training.decision.pg_merge_failed", error=str(e))
+
     record = audit.append_audit_record({
         "dataset_path":   str(dataset_path),
         "p_value":        prior_eval.get("p_value"),

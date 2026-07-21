@@ -87,7 +87,21 @@ render identically** — the ego-graph query change (indexed `identity_keys`
 lookup replacing the in-memory `.pt` graph) must produce the same
 neighbourhoods. Then flip reads to Postgres; files still written.
 
-## Step 3 — Ingestion lands in Postgres ☐
+## Step 3 — Ingestion lands in Postgres ✅ (gate passed 2026-07-21)
+
+> Gate evidence: full lifecycle through the real FastAPI app (TestClient)
+> with `frontend/sample_cohort.csv` — 21/21 checks. Upload → staged batch in
+> PG with **derived tables empty** (contract holds); Evaluate → identity_keys
+> + features + preview scores populated (50/50/50) + drift_p recorded;
+> console render parity — cohort queue, beautified reviewer card, 3D ring,
+> ego-graph, and zip export all render; merge → status flips permanent and
+> **refuses deletion**; remove-cohort endpoint deletes files AND the staged
+> PG rows (50 apps + derived). Bulk/portal path = `src.db.ingest.
+> stage_raw_csv()` (same staging, no console). Fixed en route:
+> `batches.drift_p` REAL→DOUBLE PRECISION (KS p-values reach 1e-85 and
+> underflow float32). Caveat: the Decide endpoint's Celery dispatch was not
+> exercised in-process (no broker in the test harness); its PG merge logic
+> was tested directly (`merge_batch`) and the file-merge code is unchanged.
 
 - **Ingestion contract (lead-set):** senders deliver **raw-schema rows only**
   (the `data_for_ml_model.csv` shape) — no upstream preprocessing, ever. Raw

@@ -7,6 +7,8 @@ GET  /v3/supervisor/patterns
 POST /v3/supervisor/patterns/confirm
 POST /v3/supervisor/patterns/promote
 """
+from pathlib import Path
+
 import structlog
 from fastapi import APIRouter, HTTPException
 
@@ -211,6 +213,17 @@ def pattern_ingest(req: PatternIngestRequest):
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+
+    # Step 3: a pattern ingest is a permanent merge — land the ring's raw rows
+    # in Postgres as a merged 'pattern' batch. (loe_patterns + confirmed_fraud
+    # rows are already dual-written by the stores.) Best-effort.
+    try:
+        from src.db.ingest import merge_batch, stage_raw_csv
+        _name = Path(req.dataset_path).stem
+        stage_raw_csv(req.dataset_path, name=_name, kind="pattern", source="pattern_csv")
+        merge_batch(_name)
+    except Exception as e:  # noqa: BLE001
+        log.warning("supervisor.pattern_ingest.pg_failed", error=str(e))
 
     job_id = None
     if req.dispatch_retrain:
