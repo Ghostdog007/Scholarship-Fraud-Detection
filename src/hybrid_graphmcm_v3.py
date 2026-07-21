@@ -731,6 +731,199 @@ def train(smoke_test: bool = False) -> None:
     print(f"[hybrid] Checkpoint saved -> {MODEL_PTH}")
 
 
+# ---------------------------------------------------------------------------
+# V4-Scale step 5: NeighborLoader mini-batch paths
+#
+# Model classes, losses, and hyperparameters are UNCHANGED — these are
+# alternative training/scoring loops that bound memory per batch regardless
+# of graph size. Full-graph paths above remain the default until cut-over.
+# Edge-prediction TARGETS always come from the node's GLOBAL relation
+# presence (not the sampled subgraph), so sampling noise affects only the
+# neighbourhood embedding, never the target.
+# ---------------------------------------------------------------------------
+
+def _global_edge_target(data, n_nodes: int) -> torch.Tensor:
+    """(N, N_EDGE_TYPES) 1.0 where the node has >=1 edge of that relation in
+    the FULL graph — the same target _edge_pred_loss builds, precomputed."""
+    target = torch.zeros(n_nodes, N_EDGE_TYPES)
+    for rel_id, edge_type in enumerate(data.edge_types):
+        ei = data[edge_type].edge_index
+        if ei.shape[1] > 0:
+            target[ei[0], rel_id] = 1.0
+            target[ei[1], rel_id] = 1.0
+    return target
+
+
+def _make_neighbor_loader(data, fanout: tuple[int, int], batch_size: int,
+                          shuffle: bool, seed: int = RANDOM_SEED):
+    from torch_geometric.loader import NeighborLoader
+    torch.manual_seed(seed)
+    num_neighbors = {et: list(fanout) for et in data.edge_types}
+    return NeighborLoader(
+        data,
+        num_neighbors=num_neighbors,
+        input_nodes="application",
+        batch_size=batch_size,
+        shuffle=shuffle,
+    )
+
+
+def _batch_inputs(batch, data, device: torch.device, iso_global: torch.Tensor):
+    """Per-batch tensors in the exact shape the model's forward expects.
+    Relation ids follow enumerate(data.edge_types) — the same ordering
+    _build_edge_index_and_types uses, so β_r indices stay consistent."""
+    x = batch["application"].x.to(device)
+    n_id = batch["application"].n_id
+    edge_index_list, type_ids = [], []
+    for rel_id, edge_type in enumerate(data.edge_types):
+        ei = batch[edge_type].edge_index.to(device)
+        if ei.shape[1] > 0:
+            edge_index_list.append(ei)
+            type_ids.append(torch.full((ei.shape[1],), rel_id, dtype=torch.long, device=device))
+    edge_type_tensor = (torch.cat(type_ids) if type_ids
+                        else torch.zeros(0, dtype=torch.long, device=device))
+    iso = iso_global[n_id].to(device)
+    n_seed = batch["application"].batch_size
+    return x, edge_index_list, edge_type_tensor, iso, n_id, n_seed
+
+
+@torch.no_grad()
+def score_sampled(fanout: tuple[int, int] = (25, 10), batch_size: int = 1024,
+                  device: torch.device = DEVICE, seed: int = RANDOM_SEED,
+                  data=None, x_override=None, model=None) -> pd.DataFrame:
+    """hybrid_scores frame via NeighborLoader — same schema/normalisation as
+    compute_score_frame. Deterministic for a fixed seed on CPU."""
+    if model is None:
+        model, _, _, _, _, app_ids, features = load_model_and_inputs(device)
+        data = torch.load(GRAPH_PT, weights_only=False)
+    else:
+        schema = json.loads(SCHEMA_JSON.read_text())
+        features = schema["features"]
+        df = pd.read_csv(FINAL_CSV)
+        app_ids = df["application_id"].values
+    model.eval()
+
+    # The stored graph carries the 63-dim pre-drop node features; the model
+    # takes the 44-dim FINAL_CSV matrix (same override the full-graph path
+    # does in load_model_and_inputs).
+    if x_override is None:
+        _df = pd.read_csv(FINAL_CSV)
+        _cols = [c for c in _df.columns if c != "application_id"]
+        x_override = torch.tensor(_df[_cols].values, dtype=torch.float32)
+    data["application"].x = x_override
+    n_nodes = data["application"].x.shape[0]
+    full_eil, _ = _build_edge_index_and_types(data, torch.device("cpu"))
+    iso_global = _compute_isolated_mask(full_eil, n_nodes, torch.device("cpu"))
+    target_global = _global_edge_target(data, n_nodes)
+
+    pred_all = torch.zeros(n_nodes, N_FEATURES)
+    prob_all = torch.zeros(n_nodes, N_EDGE_TYPES)
+    x_seed_all = torch.zeros(n_nodes, N_FEATURES)
+
+    loader = _make_neighbor_loader(data, fanout, batch_size, shuffle=False, seed=seed)
+    for batch in loader:
+        x, eil, ett, iso, n_id, n_seed = _batch_inputs(batch, data, device, iso_global)
+        pred_x, edge_prob, _, _ = model(x, eil, ett, iso)
+        seed_ids = n_id[:n_seed]
+        pred_all[seed_ids] = pred_x[:n_seed].cpu()
+        prob_all[seed_ids] = edge_prob[:n_seed].cpu()
+        x_seed_all[seed_ids] = x[:n_seed].cpu()
+
+    per_feat_err = (pred_all - x_seed_all).abs()
+    feature_pred_error = per_feat_err.mean(dim=1)
+    edge_pred_error = F.binary_cross_entropy(
+        prob_all, target_global, reduction="none").mean(dim=1)
+    hybrid = feature_pred_error + LAMBDA_EDGE * edge_pred_error
+
+    def _norm(t: torch.Tensor) -> np.ndarray:
+        v = t.numpy()
+        lo, hi = v.min(), v.max()
+        return ((v - lo) / (hi - lo + 1e-8)).astype(np.float32)
+
+    return pd.DataFrame({
+        "application_id": app_ids,
+        "hybrid_anomaly_score": _norm(hybrid),
+        "feature_pred_error": _norm(feature_pred_error),
+        "edge_pred_error": _norm(edge_pred_error),
+    })
+
+
+def train_sampled(data, x_synth, topo_pack, fanout: tuple[int, int] = (25, 10),
+                  batch_size: int = 1024, epochs_s1: int = EPOCHS_STAGE1,
+                  epochs_s2: int = EPOCHS_STAGE2, device: torch.device = DEVICE,
+                  seed: int = RANDOM_SEED, log_every: int = 1) -> "HybridGraphMCM":
+    """Two-stage training via NeighborLoader. Same objectives as train():
+    Stage 1 = SVDD compactness + LOE margin (exposure forward is full-batch —
+    the exposure set is small by construction); Stage 2 = feature MSE +
+    λ_edge·edge BCE, computed on SEED nodes only with global targets.
+    Returns the trained model; the CALLER decides where the checkpoint goes
+    (scale tests must never touch the live path — hard stop 9)."""
+    import time as _time
+    torch.manual_seed(seed)
+    n_nodes = data["application"].x.shape[0]
+    full_eil, _ = _build_edge_index_and_types(data, torch.device("cpu"))
+    iso_global = _compute_isolated_mask(full_eil, n_nodes, torch.device("cpu"))
+    target_global = _global_edge_target(data, n_nodes)
+
+    model = HybridGraphMCM().to(device)
+
+    # Centroid init from sampled embeddings (batched, no full-graph pass).
+    loader = _make_neighbor_loader(data, fanout, batch_size, shuffle=False, seed=seed)
+    hs = []
+    with torch.no_grad():
+        for batch in loader:
+            x, eil, ett, iso, n_id, n_seed = _batch_inputs(batch, data, device, iso_global)
+            h = model.encode_graph(x, eil, ett, iso)[:n_seed]
+            hs.append(h.cpu())
+    h_all = torch.cat(hs)
+    norms = h_all.norm(dim=1)
+    cutoff = torch.quantile(norms, CENTROID_CLEAN_PERCENTILE / 100.0)
+    model.centroid = h_all[norms <= cutoff].mean(dim=0).to(device)
+    model.centroid_initialized = True
+    print(f"[hybrid] sampled centroid init: norm={model.centroid.norm():.4f}")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    x_synth = x_synth.to(device) if x_synth is not None else None
+
+    epoch_times: list[float] = []
+    model.train()
+    for stage, n_epochs in (("S1", epochs_s1), ("S2", epochs_s2)):
+        for epoch in range(n_epochs):
+            t0 = _time.time()
+            lam_t = LAMBDA_EXPOSURE * (1.0 - epoch / max(n_epochs, 1))
+            loader = _make_neighbor_loader(data, fanout, batch_size,
+                                           shuffle=True, seed=seed + epoch)
+            agg = {"loss": 0.0, "n": 0}
+            for batch in loader:
+                x, eil, ett, iso, n_id, n_seed = _batch_inputs(batch, data, device, iso_global)
+                optimizer.zero_grad()
+                if stage == "S1":
+                    h_n = model.encode_graph(x, eil, ett, iso)[:n_seed]
+                    svdd = torch.norm(h_n - model.centroid.unsqueeze(0), dim=1).mean()
+                    if TOPO_EXPOSURE_ENABLED and topo_pack is not None:
+                        h_synth = _get_synth_h_topology(model, topo_pack, device)
+                    else:
+                        h_synth = _get_synth_h(model, x_synth, eil, ett, device)
+                    loss = svdd + _loe_loss(h_synth, model.centroid, lam_t)
+                else:
+                    pred_x, edge_prob, _, _ = model(x, eil, ett, iso)
+                    tgt = target_global[n_id[:n_seed]].to(device)
+                    feat_loss = F.mse_loss(pred_x[:n_seed], x[:n_seed])
+                    edge_loss = F.binary_cross_entropy(edge_prob[:n_seed], tgt)
+                    loss = feat_loss + LAMBDA_EDGE * edge_loss
+                loss.backward()
+                optimizer.step()
+                agg["loss"] += float(loss.item())
+                agg["n"] += 1
+            dt = _time.time() - t0
+            epoch_times.append(dt)
+            if (epoch + 1) % log_every == 0:
+                print(f"  {stage} epoch {epoch+1}/{n_epochs} | "
+                      f"mean_loss={agg['loss']/max(agg['n'],1):.4f} | {dt:.1f}s")
+    model._sampled_epoch_times = epoch_times  # scale-test telemetry
+    return model
+
+
 def train_incremental(
     exposure_tensor: torch.Tensor | None = None,
     epochs: int = INCREMENTAL_EPOCHS,
