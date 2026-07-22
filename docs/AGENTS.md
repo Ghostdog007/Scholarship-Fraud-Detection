@@ -212,7 +212,18 @@ loop) happen only in their designated steps, one module at a time.
 
 Tracked in `TECHNICAL_REFERENCE_AND_SCALING.md` §15:
 1. K_CAP and the group-size ceiling — needs a profiling query on real 3.5M
-   ingest.
+   ingest. **Concrete supporting evidence (2026-07-22):** a `stress_testing_1`
+   artifact (382-node shares_ip structure, from sampling 50k rows with
+   replacement out of only 15k real applicants — see the generator's own
+   docstring) demonstrated the exact failure mode this decision guards
+   against: one oversized structure sets the max-anchor for
+   `dense_block_detector_v3`'s per-relation min-max normalization, compressing
+   every genuine IP-fraud ring's score (true rings topped out at 0.52, not
+   1.0) and materially hurting fused IP-cluster detection (PR-AUC 0.095→0.055
+   in that ablation). Confirmed absent from real 15k production data today
+   (max shares_ip degree 38, vs the artifact's 382) — not an active bug — but
+   directly motivates capping the normalization anchor (not just raw edge
+   count) once hub-capping is designed, not just capping edge fan-out.
 2. ~~NeighborLoader fan-out magnitude and shape~~ — **CLOSED (lead,
    2026-07-21): exact-neighborhood batching adopted** (fanout (-1,-1); ablation
    in IMPLEMENTATION.md step 5 — truncating fan-outs deviate up to 0.44,

@@ -1168,6 +1168,24 @@ code untouched until step 4; full evidence in `IMPLEMENTATION.md`):
    the star-capping tradeoff is visible and inspectable per relation — the
    `pincode`/`mother_name` relations are the ones with the heaviest tail and
    will need the ceiling most.
+
+   **Concrete downstream evidence for why this matters beyond edge count/compute
+   (2026-07-22):** a `stress_testing_1` artifact (a 382-node shares_ip
+   structure, produced by that dataset's 50k-from-15k with-replacement
+   sampling — see `scripts/generate_stress_test_dataset.py`'s own docstring,
+   which flags this as an intentional stress case for the not-yet-hub-capped
+   file-based graph builder) demonstrated a *second* consequence of oversized
+   groups beyond edge-count blowup: `dense_block_detector_v3.py`'s per-relation
+   min-max normalization uses the single densest structure in the population as
+   its scaling anchor. One 382-node structure compressed every genuine
+   IP-fraud ring's score into 0.3–0.5 (true rings never reached 1.0), which
+   measurably hurt fused IP-cluster detection (PR-AUC 0.095→0.055 in that
+   ablation) since max-fusion favors whichever detector gets closest to 1.0.
+   Confirmed absent from real 15k production data today (max shares_ip degree
+   38 — consistent with the p99.9=27 / max=39 profiling row above) — this is
+   not an active production bug. It means the eventual K_CAP design should
+   also cap what a single structure is allowed to set as the density-score
+   normalization anchor, not only the raw edge/fan-out count.
 2. ~~NeighborLoader fan-out~~ — **CLOSED.** Exact-neighborhood batching
    adopted (§13.2).
 3. **`pg_trgm` vs `difflib`** for name similarity — equivalence check
