@@ -48,3 +48,10 @@ backup_68feat/
 
 # Local environment (DB credentials) — never commit
 .env
+
+# Uploaded/generated test datasets (large, reproducible via scripts/)
+/data/uploads/
+
+# Playwright MCP session artifacts (browser test screenshots/traces)
+.playwright-mcp/
+/card_*.png

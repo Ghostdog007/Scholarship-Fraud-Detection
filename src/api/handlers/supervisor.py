@@ -22,10 +22,32 @@ from src.api.schemas import (
     PatternTestRequest,
     PatternIngestRequest,
     DeletePatternRequest,
+    RetrainPatternsRequest,
 )
 
 log    = structlog.get_logger()
 router = APIRouter()
+
+_VALID_RETRAIN_MODES = {"incremental", "full_retrain"}
+
+
+def _dispatch_retrain(mode: str, cycle: str, smoke_test: bool) -> str:
+    """Queue the chosen retrain job and return its job_id. 'incremental' fine-
+    tunes the existing checkpoint (RGCN frozen unless >=50 confirmed fraud) —
+    it does NOT read synthetic_exposure_graph_v3.pt, so a promoted pattern's
+    real topology sits unused until a full retrain runs. 'full_retrain' reruns
+    main_v3.py end-to-end, which trains hybrid_graphmcm_v3 Stage 1 LOE against
+    that topology-exposure file directly — the only path that actually teaches
+    the RGCN the ring's structure rather than just its feature values."""
+    import uuid
+    job_id = f"job_retrain_{uuid.uuid4().hex[:8]}"
+    if mode == "full_retrain":
+        from src.api.tasks import run_full_pipeline_task
+        run_full_pipeline_task.apply_async(kwargs=dict(smoke_test=smoke_test), task_id=job_id)
+    else:
+        from src.api.tasks import run_incremental_task
+        run_incremental_task.apply_async(kwargs=dict(cycle=cycle, smoke_test=smoke_test), task_id=job_id)
+    return job_id
 
 
 @router.post("/confirm-fraud")
@@ -282,6 +304,42 @@ def delete_patterns(req: DeletePatternRequest):
     return {"status": "ok", **result}
 
 
+@router.get("/patterns/export/bulk")
+def export_patterns_bulk():
+    """Zip export of every pattern in the flagged-history store (all states,
+    all sessions): manifest.csv + patterns/<pattern_id>.json."""
+    from fastapi.responses import Response
+    from src.export_v3 import build_pattern_bulk_export
+    result = build_pattern_bulk_export()
+    if result is None:
+        raise HTTPException(status_code=404, detail="No flagged patterns to export")
+    filename, data = result
+    log.info("supervisor.export_patterns_bulk", bytes=len(data))
+    return Response(content=data, media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@router.get("/patterns/export/selected")
+def export_patterns_selected(ids: str = ""):
+    """Zip export of a reviewer-chosen subset of the flagged-history store.
+    `ids` is a comma-separated list of pattern_ids (from the console's
+    multi-select)."""
+    from fastapi.responses import Response
+    from src.export_v3 import build_pattern_selected_export
+    id_list = [s.strip() for s in ids.split(",") if s.strip()]
+    if not id_list:
+        raise HTTPException(status_code=400, detail="No pattern IDs supplied (?ids=a,b,c)")
+    if len(id_list) > 200:
+        raise HTTPException(status_code=400, detail=f"Too many IDs ({len(id_list)}); export at most 200 at once")
+    result = build_pattern_selected_export(id_list)
+    if result is None:
+        raise HTTPException(status_code=404, detail="None of the requested pattern IDs were found")
+    filename, data = result
+    log.info("supervisor.export_patterns_selected", n=len(id_list), bytes=len(data))
+    return Response(content=data, media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
 @router.get("/patterns/coverage/{app_id}")
 def pattern_coverage(app_id: str):
     """Soft, IP-only 'has this cluster already been flagged for LOE?' check.
@@ -311,40 +369,80 @@ def confirm_pattern(req: ConfirmPatternRequest):
 
 @router.post("/patterns/promote")
 def promote_patterns(req: PromotePatternRequest):
+    """Promote CONFIRMED/SELECTED patterns (appends their real topology to
+    synthetic_exposure_graph_v3.pt) then dispatch the chosen retrain job.
+    mode="incremental" (default) fine-tunes the existing checkpoint; mode=
+    "full_retrain" reruns the full pipeline so the RGCN actually trains
+    against the newly-appended topology (see _dispatch_retrain)."""
+    if req.mode not in _VALID_RETRAIN_MODES:
+        raise HTTPException(status_code=422, detail=f"mode must be one of {sorted(_VALID_RETRAIN_MODES)}, got '{req.mode}'")
+
     from src.confirmed_fraud_graph_store import select, promote
     try:
         select(req.pattern_ids)
         promoted = promote(req.pattern_ids)
-        log.info("supervisor.promote_patterns", n_promoted=len(promoted), pattern_ids=req.pattern_ids)
-        
-        # Trigger retrain. Two bugs fixed here:
-        #   1. The old code imported `run_incremental_finetune`, which does not
-        #      exist in src/api/tasks.py — the real task is `run_incremental_task`
-        #      (name="tasks.run_incremental"), taking (cycle, smoke_test). The old
-        #      import would have raised ImportError on the first promote call.
-        #   2. The old code manufactured a `job_id` string but dispatched with
-        #      `.delay()`, so Celery assigned a DIFFERENT id. GET
-        #      /v3/training/jobs/{job_id} polls by Celery task id via
-        #      AsyncResult(job_id), so the returned job_id could never be found.
-        #
-        # Fix: pin the Celery task_id to our job_id via apply_async(task_id=...),
-        # so the id returned to the client IS the id Celery tracks. Promotion
-        # retrains on the existing (now pattern-augmented) data, so this uses the
-        # incremental orchestrator — no dataset_path needed.
-        import uuid
-        job_id = f"job_retrain_{uuid.uuid4().hex[:8]}"
+        log.info("supervisor.promote_patterns", n_promoted=len(promoted), pattern_ids=req.pattern_ids, mode=req.mode)
 
-        from src.api.tasks import run_incremental_task
-        run_incremental_task.apply_async(
-            kwargs=dict(cycle="pattern_promotion", smoke_test=req.smoke_test),
-            task_id=job_id,
-        )
+        job_id = _dispatch_retrain(req.mode, cycle="pattern_promotion", smoke_test=req.smoke_test)
 
         return {
             "status": "ok",
-            "message": f"Promoted {len(promoted)} patterns. Retrain dispatched.",
+            "message": f"Promoted {len(promoted)} patterns. {req.mode} retrain dispatched.",
+            "mode": req.mode,
             "job_id": job_id,
             "promoted_pattern_ids": [p["pattern_id"] for p in promoted]
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/patterns/retrain")
+def retrain_patterns(req: RetrainPatternsRequest):
+    """Dispatch a retrain over the flagged-history store directly — covers
+    patterns already PROMOTED (topology already appended; this just (re)runs
+    training) as well as any still CONFIRMED/SELECTED (promoted first). Empty
+    pattern_ids = every non-REJECTED pattern currently in the store (the
+    console's 'select all' action). This is the general-purpose retrain
+    trigger for the flagged-history panel, independent of the pending-queue
+    promote button."""
+    if req.mode not in _VALID_RETRAIN_MODES:
+        raise HTTPException(status_code=422, detail=f"mode must be one of {sorted(_VALID_RETRAIN_MODES)}, got '{req.mode}'")
+
+    from src.confirmed_fraud_graph_store import list_all, select, promote
+
+    all_patterns = list_all()
+    if req.pattern_ids:
+        wanted = set(req.pattern_ids)
+        target = [p for p in all_patterns if p["pattern_id"] in wanted]
+        not_found = sorted(wanted - {p["pattern_id"] for p in target})
+    else:
+        target = [p for p in all_patterns if p.get("state") != "REJECTED"]
+        not_found = []
+
+    if not target:
+        raise HTTPException(status_code=404, detail=f"No matching non-rejected patterns to retrain on (not found: {not_found})")
+
+    to_promote = [p["pattern_id"] for p in target if p.get("state") in ("CONFIRMED", "SELECTED")]
+    newly_promoted: list[dict] = []
+    if to_promote:
+        select(to_promote)
+        newly_promoted = promote(to_promote)
+
+    job_id = _dispatch_retrain(req.mode, cycle="pattern_retrain", smoke_test=req.smoke_test)
+
+    log.info("supervisor.retrain_patterns", mode=req.mode, n_target=len(target),
+             n_newly_promoted=len(newly_promoted), job_id=job_id)
+
+    return {
+        "status": "ok",
+        "message": f"{req.mode} retrain dispatched over {len(target)} pattern(s) "
+                   f"({len(newly_promoted)} newly promoted).",
+        "mode": req.mode,
+        "job_id": job_id,
+        "n_target": len(target),
+        "target_pattern_ids": [p["pattern_id"] for p in target],
+        "newly_promoted_pattern_ids": [p["pattern_id"] for p in newly_promoted],
+        "not_found": not_found,
+    }

@@ -39,9 +39,9 @@ OUT_DIR    = Path("outputs/cards")
 # risk → colour bucket (semantic, separate from any brand accent)
 RISK_LOW, RISK_MED, RISK_HIGH = "#2c7da0", "#f4a261", "#e5383b"
 DETECTOR_ORDER = [
-    ("subspace", "Tabular subspace", "#e5383b"),
-    ("dense_ip", "Shared-IP dense-block", "#f72585"),
-    ("hybrid",   "Relational RGCN", "#4cc9f0"),
+    ("subspace",         "Tabular subspace", "#e5383b"),
+    ("dense_relational", "Shared-identity dense-block", "#f72585"),
+    ("hybrid",           "Relational RGCN", "#4cc9f0"),
 ]
 GROUP_LABELS = {"financial": "Financial", "identity": "Identity", "network": "Network"}
 EDGE_LABELS = {
@@ -58,6 +58,11 @@ def _risk_color(v: float) -> str:
 # key -> (short label, colour) for the model-traceability pills. Same keys and
 # colours as DETECTOR_ORDER so pills match the fusion-composition footer.
 DETECTOR_PILL = {k: (lbl, col) for k, lbl, col in DETECTOR_ORDER}
+# Deep SAD (V4.2) is SUPPLEMENTARY, not a fusion driver — deliberately NOT added
+# to DETECTOR_ORDER (that list drives the fusion-composition footer, which must
+# stay exactly the 3 locked fusion inputs). It still gets its own pill colour so
+# its evidence line can be visually distinguished from the fused-score drivers.
+DETECTOR_PILL["deepsad"] = ("Deep SAD (supplementary)", "#9d4edd")
 
 
 def _model_pill(key: str | None) -> str:
@@ -71,14 +76,24 @@ def _model_pill(key: str | None) -> str:
 
 def _model_trace(card: dict) -> str:
     """Render the 'How this score was produced' traceability section from the
-    pre-computed evidence.model_trace block. Adds no numbers of its own."""
+    pre-computed evidence.model_trace block. Adds no numbers of its own.
+
+    Max fusion (changed 2026-07-22): exactly one detector's own normalised
+    value IS the fused score's source — there is no "% share of a blend" any
+    more, so each bar shows the detector's own value (0-1) with a WON DRIVER
+    badge on whichever one is the max, plus how far it led the runner-up."""
     mt = card.get("evidence", {}).get("model_trace")
     if not mt or not mt.get("models"):
         return ""
     rows = []
     for m in mt["models"]:
         lbl, col = DETECTOR_PILL.get(m["key"], (m.get("name", m["key"]), "#8b949e"))
-        share = float(m.get("share", 0.0)) * 100
+        normalized = float(m.get("normalized", 0.0)) * 100
+        is_driver = bool(m.get("drove_score"))
+        margin = m.get("margin_over_next")
+        driver_badge = (f" <span class='flagchip' style='background:{col}22;color:{col};"
+                        f"border-color:{col}55'>DRIVER"
+                        + (f" · led by {margin:.2f}" if margin is not None else "") + "</span>") if is_driver else ""
         fired = m.get("fired_triggers", [])
         if fired:
             meta_tail = " · fired " + ", ".join(f"<span class='num'>{_esc(t)}</span>" for t in fired)
@@ -91,17 +106,17 @@ def _model_trace(card: dict) -> str:
             <div class="mtrace-h">
               <span class="mpill" style="color:{col};border-color:{col}55;background:{col}1a">{_esc(lbl)}</span>
               <span class="mtrace-name">{_esc(m['name'])}</span>
-              <span class="mtrace-share num" style="color:{col}">{share:.0f}%</span>
+              <span class="mtrace-share num" style="color:{col}">{normalized:.0f}</span>{driver_badge}
             </div>
-            <div class="mtrace-track"><div style="width:{max(0.0, min(100.0, share)):.0f}%;background:{col}"></div></div>
+            <div class="mtrace-track"><div style="width:{max(0.0, min(100.0, normalized)):.0f}%;background:{col}"></div></div>
             <div class="mtrace-what">{_esc(m['what'])}</div>
             <div class="mtrace-meta"><b>Reads:</b> {_esc(m['reads'])}{meta_tail}</div>
           </div>""")
     return (
         "<div class='section-t'>How this score was produced — model traceability</div>"
-        "<div class='mtrace-intro'>Score-level fusion of three independent models. Each "
-        "percentage is this application's exact contribution from the closed-form fusion "
-        f"(<code>{_esc(mt.get('fusion_formula', ''))}</code>).</div>"
+        "<div class='mtrace-intro'>Max fusion of three independent models — the fused score IS "
+        "the single highest normalised detector value below, marked DRIVER; the others are shown "
+        f"for context (<code>{_esc(mt.get('fusion_formula', ''))}</code>).</div>"
         + "".join(rows)
     )
 
@@ -437,24 +452,40 @@ def _signal_bars(card: dict) -> str:
                          f"{pct:.1f}<span style='color:var(--faint)'>pct</span>",
                          pct, fill, note))
 
-    # 2) dense-block-IP
-    dib = ev.get("dense_block_ip", {})
+    # 2) dense-block-relational (mobile/IP/pincode, IP-priority weighted)
+    dib = ev.get("dense_block_relational", {})
     if dib.get("score", 0.0) > 0.0 and dib.get("percentile") is not None:
-        rows.append(_bar(f"Shared-IP dense-block {_model_pill('dense_ip')}",
+        by_rel = dib.get("by_relation", {})
+        top_rel = max(by_rel.items(), key=lambda kv: kv[1])[0] if by_rel else None
+        rel_label = {"mobile": "mobile number", "ip": "IP address", "pincode": "pincode"}.get(top_rel, "identity value")
+        rows.append(_bar(f"Shared-identity dense-block {_model_pill('dense_relational')}",
                          f"{dib['percentile']:.1f}<span style='color:var(--faint)'>pct</span>",
                          dib["percentile"], "linear-gradient(90deg,#b5187f,#f72585)",
-                         "member of a dense shared-IP cluster — the IP specialist"))
+                         f"member of a dense shared-{rel_label} cluster"))
 
-    # 3) fusion composition footer
+    # 2b) Deep SAD center-distance — SUPPLEMENTARY, not a fusion input. Only
+    # shown when notably elevated (matches the narrative's 75th-pct cutoff).
+    dsad = ev.get("deepsad") or {}
+    if dsad.get("percentile") is not None and dsad["percentile"] >= 75.0:
+        rows.append(_bar(f"Deep SAD center-distance {_model_pill('deepsad')}",
+                         f"{dsad['percentile']:.1f}<span style='color:var(--faint)'>pct</span>",
+                         dsad["percentile"], "linear-gradient(90deg,#5a189a,#9d4edd)",
+                         "supplementary signal — informative context, does not drive the fused score"))
+
+    # 3) fusion composition footer — max fusion (2026-07-22): shows each
+    # detector's own normalised value, DRIVER marks the one that won.
     fc = ev.get("fusion_contributions", {})
     comp = ""
     if fc:
-        items = [(lbl, fc[k]["share"] * 100, col)
-                 for k, lbl, col in DETECTOR_ORDER if k in fc and fc[k]["share"] > 0.005]
-        parts = " · ".join(f"<span style='color:{c}'>{lbl} {v:.0f}%</span>" for lbl, v, c in items)
+        items = [(lbl, fc[k]["normalized"] * 100, col, fc[k].get("is_driver"))
+                 for k, lbl, col in DETECTOR_ORDER if k in fc]
+        parts = " · ".join(
+            f"<span style='color:{c}'>{lbl} {v:.0f}{' <b>(DRIVER)</b>' if drv else ''}</span>"
+            for lbl, v, c, drv in items
+        )
         comp = (f"<div class='sig-note' style='margin-top:18px;padding-top:12px;"
                 f"border-top:1px solid var(--border)'><b style='color:var(--muted)'>Fusion "
-                f"composition:</b> {parts}. &nbsp;risk = minmax(1.0·subspace + 0.5·dense-IP + 0.3·hybrid).</div>")
+                f"composition:</b> {parts}. &nbsp;risk = minmax(max(subspace, dense-relational, hybrid)).</div>")
 
     intro = ("<p style='font-size:12px;color:var(--muted);margin:0 0 16px'>What is pushing this "
              "application's score, by detector. The marker on a track is its EVT flag threshold.</p>")
@@ -495,7 +526,7 @@ def _reason_codes(card: dict) -> str:
                 if pct is not None else "")
         rows.append(
             f"<div class='reason'><div class='rk'>{rank:02d}</div><div class='rc'>"
-            f"<div class='rt'>Shared-IP concentration {_model_pill('dense_ip')}</div>"
+            f"<div class='rt'>Shared-IP concentration {_model_pill('dense_relational')}</div>"
             f"<div class='rd'>Shares one IP with <span class='num'>{ip_conn['count']}</span> "
             f"other application(s){pstr}.</div></div></div>")
         rank += 1
@@ -606,7 +637,7 @@ def _suggest_fraud_type(card: dict) -> str:
     """Pre-select the most likely fraud type from the card's own evidence, so the
     reviewer usually just clicks Confirm. Heuristic only — fully overridable."""
     ev = card["evidence"]
-    if ev.get("dense_block_ip", {}).get("score", 0.0) > 0.0:
+    if ev.get("dense_block_relational", {}).get("score", 0.0) > 0.0:
         return "IP_CLUSTER"
     ip_conn = next((c for c in ev.get("graph_connections", [])
                     if c["edge_type"] == "shares_ip" and c.get("count", 0) > 0), None)
@@ -743,7 +774,8 @@ def _right_pane(card: dict) -> str:
       <div class="footnote">Every number on this card traces to
         <code>explanation_cards_v3.json</code> — no hand-set thresholds; the only numeric gates
         quoted are EVT-derived. Signal bars show each detector's population percentile; the fusion
-        composition is the closed-form score-level split.</div>
+        composition shows each detector's own normalised value, with the single argmax DRIVER marked
+        (max fusion, changed 2026-07-22 — see README changelog).</div>
     </div></div>"""
 
 
@@ -811,8 +843,21 @@ def _ego_figure(app_id: str, app_ids, id_to_idx: dict, nidx: dict, rel_id: dict,
     return fig
 
 
+# mtime-keyed cache (added 2026-07-22, same pattern as confirmed_fraud_graph_store.py's
+# _ip_cache) — this is the .pt GRAPH FALLBACK path only (used when Postgres is
+# unavailable; the ring's primary path is already PG-indexed and needs none of
+# this). Rebuilding the whole graph's neighbor index from scratch on every
+# fallback ring request is the kind of full-population rescan the rest of this
+# change is trying to eliminate; keyed by (graph path, mtime, ids path, mtime)
+# so both the default committed graph and any staged cohort graph are cached
+# independently and safely invalidate when their underlying file changes.
+_GRAPH_CTX_CACHE: dict = {}
+
+
 def _graph_ctx(graph_pt: "Path | None" = None, nodeorder_csv: "Path | None" = None):
-    """Load the graph neighbour index + id mapping once (shared by batch + API).
+    """Load the graph neighbour index + id mapping once (shared by batch + API),
+    cached by file identity + mtime so a repeated fallback request doesn't
+    rebuild the whole graph's neighbor index from scratch.
 
     Defaults to the committed graph + features. Pass graph_pt + nodeorder_csv to
     render against a STAGED cohort graph instead (the merged base+cohort graph
@@ -827,11 +872,19 @@ def _graph_ctx(graph_pt: "Path | None" = None, nodeorder_csv: "Path | None" = No
     ids_csv  = Path(nodeorder_csv) if nodeorder_csv else FINAL_CSV
     if not graph_pt.exists() or not ids_csv.exists():
         return None
+
+    cache_key = (str(graph_pt), graph_pt.stat().st_mtime, str(ids_csv), ids_csv.stat().st_mtime)
+    cached = _GRAPH_CTX_CACHE.get(str(graph_pt))
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+
     app_ids = pd.read_csv(ids_csv)["application_id"].values
     id_to_idx = {a: i for i, a in enumerate(app_ids)}
     nidx = _build_neighbor_index(graph_pt)
     rel_id = {name: i for i, name in enumerate(EDGE_TYPES)}
-    return app_ids, id_to_idx, nidx, rel_id
+    ctx = (app_ids, id_to_idx, nidx, rel_id)
+    _GRAPH_CTX_CACHE[str(graph_pt)] = (cache_key, ctx)
+    return ctx
 
 
 def _ring_fig_from_pg(app_id: str, risk_map: dict | None):
@@ -918,7 +971,7 @@ def build_staged_card_html(name: str, app_id: str) -> str | None:
     persisted (Evaluate ran with a graph), REAL shares_ip neighbours from it.
 
     Genuinely absent pre-commit (never fabricated): subspace_groups,
-    dense_block_ip, fusion_contributions, evt_crossings — these require a
+    dense_block_relational, fusion_contributions, evt_crossings — these require a
     committed pipeline run. _reason_codes/_signal_bars/_model_trace already
     degrade gracefully on empty inputs, so omitting them is a truthful gap,
     not a rendering failure. The reviewer-decision form is omitted (not
@@ -993,7 +1046,7 @@ def build_staged_card_html(name: str, app_id: str) -> str | None:
         "triggers": [],
         "top_feature_errors": top_feats,
         "evidence": {
-            "subspace_groups": {}, "dense_block_ip": {}, "fusion_contributions": {},
+            "subspace_groups": {}, "dense_block_relational": {}, "fusion_contributions": {},
             "graph_connections": graph_connections, "evt_crossings": [],
             "risk_percentile": risk_percentile, "risk_rank": risk_rank,
             "population_size": len(sdf), "label_source": "preview",
@@ -1043,13 +1096,23 @@ def generate_ego_rings(cards: list[dict], risk_map: dict) -> dict[str, str]:
 
 def build_card_html(app_id: str, rank: int = 1) -> str | None:
     """LAZY: render one lightweight reviewer card as HTML for the API's /card
-    endpoint. Reads the pre-computed explanation_cards_v3.json (produced by the
-    XAI layer). The 3D link points at the API's /ring route (lazy Plotly).
-    Returns None if no card exists for this application."""
-    if not CARDS_JSON.exists():
-        return None
-    cards = json.loads(CARDS_JSON.read_text())
-    card = next((c for c in cards if str(c["application_id"]) == str(app_id)), None)
+    endpoint. First checks the pre-computed explanation_cards_v3.json (the
+    top-N reviewer-queue batch, fast path — just a JSON scan). If the
+    application isn't in that batch (added 2026-07-22 — see README changelog),
+    falls back to build_card_for_app(), which assembles a card on demand from
+    the cached population context: O(1) relative to population size after the
+    first call in this process, not a full-population rescan. This is what
+    gives every application a card, not just the top 500, without needing to
+    pre-render and store one for the whole scored population. The 3D link
+    points at the API's /ring route (also lazy). Returns None only if the
+    application isn't in the scored population at all."""
+    card = None
+    if CARDS_JSON.exists():
+        cards = json.loads(CARDS_JSON.read_text())
+        card = next((c for c in cards if str(c["application_id"]) == str(app_id)), None)
+    if card is None:
+        from src.xai_layer_v3 import build_card_for_app
+        card = build_card_for_app(app_id)
     if card is None:
         return None
     risk_map = {}

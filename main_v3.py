@@ -45,6 +45,7 @@ PIPELINE_STEPS = [
     "train_hybrid",
     "subspace_if",
     "dense_block",
+    "deepsad",
     "evt",
     "self_training",
     "fusion",
@@ -216,6 +217,11 @@ def run_pipeline(steps: list[str] | None = None, smoke_test: bool = False, cycle
             print("\n[main] Step 6b: Dense-block detector (IP) -- run_dense_block()")
             from src.dense_block_detector_v3 import run_dense_block
             run_dense_block()
+
+        if should_run("deepsad"):
+            print("\n[main] Step 6c: Deep SAD center-distance (XAI-only, not fusion) -- run_deepsad()")
+            from src.deepsad_detector_v3 import run_deepsad
+            run_deepsad()
 
         if should_run("evt"):
             print("\n[main] Step 7: EVT scorer -- run_evt()")

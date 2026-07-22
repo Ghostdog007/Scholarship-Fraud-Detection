@@ -42,6 +42,7 @@ from src.config_v3 import (
     LAMBDA_EDGE,
     LAMBDA_EXPOSURE,
     LOE_MARGIN,
+    LOE_STAGE2_WEIGHT,
     LR,
     MASK_NUM,
     MLP_HIDDEN,
@@ -87,8 +88,18 @@ def _check_shape(tensor: torch.Tensor, expected: tuple, name: str) -> None:
 class RGCNEncoder(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.conv1 = RGCNConv(N_FEATURES, GRAPH_HIDDEN, num_relations=N_EDGE_TYPES, aggr="add")
-        self.conv2 = RGCNConv(GRAPH_HIDDEN, GRAPH_EMB_DIM, num_relations=N_EDGE_TYPES, aggr="add")
+        # root_weight=False (2026-07-22): RGCNConv defaults to root_weight=True,
+        # which adds a learned self-transform of each node's OWN unmasked
+        # features directly into h_n -- independent of the MCM masking in
+        # _apply_masks(). That leaks self-signal around the intentional mask
+        # for every connected node (isolated nodes are unaffected; they're
+        # already overridden by isolated_embedding). Disabling it makes h_n
+        # pure multi-relation neighbor aggregation, which is the actual MCM
+        # contract. Validated on stress_testing_1: overall PR-AUC 0.153->0.201,
+        # mobile-ring 0.029->0.078, IP-ring 0.032->0.055, no low-degree
+        # regression (3-5 degree bucket 0.193->0.385, 6+ bucket 0.153->0.201).
+        self.conv1 = RGCNConv(N_FEATURES, GRAPH_HIDDEN, num_relations=N_EDGE_TYPES, aggr="add", root_weight=False)
+        self.conv2 = RGCNConv(GRAPH_HIDDEN, GRAPH_EMB_DIM, num_relations=N_EDGE_TYPES, aggr="add", root_weight=False)
         self.last_beta_r = torch.ones(N_EDGE_TYPES) / N_EDGE_TYPES
 
     def forward(
@@ -431,13 +442,44 @@ def _edge_pred_loss(
     return F.binary_cross_entropy(edge_prob, target)
 
 
+def _derive_loe_margin(h_real: torch.Tensor, centroid: torch.Tensor, percentile: float = 75.0) -> torch.Tensor:
+    """Data-derived LOE margin (added 2026-07-22, see README changelog) —
+    replaces the fixed LOE_MARGIN=2.0 constant, which was found (by direct
+    measurement, not assumption) to be ~3x SMALLER than even the REAL
+    population's own median embedding-to-centroid distance at this embedding
+    dimensionality (GRAPH_EMB_DIM=64): real dist-to-centroid median ~5.9 vs a
+    margin of 2.0. That meant exposure embeddings were already past the
+    "margin" before training even started, in both the old exp(-sqrt(dist))
+    formula and a fixed hinge — the constant was never calibrated to the
+    embedding space's actual scale. Deriving the margin from the CURRENT
+    epoch's real embedding distribution (same principle as
+    CENTROID_CLEAN_PERCENTILE — percentile of an observed distribution, not a
+    hand-picked number, hard stop #1) makes the target self-calibrating:
+    "push exposure embeddings out beyond what's typical for real data,"
+    whatever scale the network currently lives at."""
+    with torch.no_grad():
+        real_dist = torch.norm(h_real - centroid.unsqueeze(0), dim=1)
+        return torch.quantile(real_dist, percentile / 100.0)
+
+
 def _loe_loss(
     h_synth: torch.Tensor,
     centroid: torch.Tensor,
     lam: float,
+    margin: torch.Tensor | float = LOE_MARGIN,
 ) -> torch.Tensor:
+    """Hinge/margin loss (changed 2026-07-22, see README changelog): pushes
+    exposure embeddings at least `margin` away from the centroid. Replaces
+    exp(-sqrt(dist)), which saturates to ~0 the moment dist exceeds a handful
+    of units — found via prototyping to vanish within the first few epochs of
+    training regardless of epoch budget, so it was only ever a nudge at
+    initialization, not a real training signal. A hinge has a genuine,
+    non-vanishing gradient anywhere inside the margin. `margin` defaults to
+    the LOCKED constant for backward compatibility but every production call
+    site now passes a data-derived margin from _derive_loe_margin — see there
+    for why the fixed constant doesn't work at this embedding scale."""
     dist = torch.norm(h_synth - centroid.unsqueeze(0), dim=1)
-    exposure = torch.exp(-torch.sqrt(dist + 1e-8))
+    exposure = torch.clamp(margin - dist, min=0.0)
     return lam * exposure.mean()
 
 
@@ -662,18 +704,26 @@ def train(smoke_test: bool = False) -> None:
             h_synth = _get_synth_h_topology(model, topo_pack, DEVICE)
         else:
             h_synth = _get_synth_h(model, x_synth, edge_index_list, edge_type_tensor, DEVICE)
-            
-        loe     = _loe_loss(h_synth, model.centroid, lam_t)
+
+        margin  = _derive_loe_margin(h_n, model.centroid)
+        loe     = _loe_loss(h_synth, model.centroid, lam_t, margin)
 
         loss = svdd_loss + loe
         loss.backward()
         optimizer.step()
 
         if (epoch + 1) % max(1, epochs_s1 // 5) == 0 or smoke_test:
-            print(f"  S1 epoch {epoch+1}/{epochs_s1} | svdd={svdd_loss.item():.4f} loe={loe.item():.4f} lam={lam_t:.3f} std={h_synth.std(0).mean().item():.4f}")
+            print(f"  S1 epoch {epoch+1}/{epochs_s1} | svdd={svdd_loss.item():.4f} loe={loe.item():.4f} "
+                  f"lam={lam_t:.3f} margin={margin.item():.3f} std={h_synth.std(0).mean().item():.4f}")
 
-    # ---- Stage 2: Free joint reconstruction ----
-    print(f"[hybrid] Stage 2: {epochs_s2} epochs (free joint reconstruction) ...")
+    # ---- Stage 2: Free joint reconstruction + a PERSISTENT (non-decaying) LOE
+    # term (added 2026-07-22 — see README changelog). Previously Stage 2 had no
+    # exposure term at all, so whatever separation Stage 1 built could be freely
+    # re-absorbed by 120 epochs of unconstrained reconstruction (dense synthetic
+    # cliques reconstruct too easily — MAR critique — and nothing stopped Stage 2
+    # re-learning to reconstruct them well). LOE_STAGE2_WEIGHT is fixed, not
+    # decayed, so the signal survives to the end of training.
+    print(f"[hybrid] Stage 2: {epochs_s2} epochs (free joint reconstruction + persistent LOE) ...")
     model.train()
     for epoch in range(epochs_s2):
         optimizer.zero_grad()
@@ -682,13 +732,22 @@ def train(smoke_test: bool = False) -> None:
 
         feat_loss = _feature_pred_loss(pred_x, x_all)
         edge_loss = _edge_pred_loss(edge_prob, edge_index_list, x_all.shape[0], DEVICE)
-        loss      = feat_loss + LAMBDA_EDGE * edge_loss
+
+        if TOPO_EXPOSURE_ENABLED and topo_pack is not None:
+            h_synth_s2 = _get_synth_h_topology(model, topo_pack, DEVICE)
+        else:
+            h_synth_s2 = _get_synth_h(model, x_synth, edge_index_list, edge_type_tensor, DEVICE)
+        margin_s2 = _derive_loe_margin(h_n, model.centroid)
+        loe_s2 = _loe_loss(h_synth_s2, model.centroid, LOE_STAGE2_WEIGHT, margin_s2)
+
+        loss = feat_loss + LAMBDA_EDGE * edge_loss + loe_s2
 
         loss.backward()
         optimizer.step()
 
         if (epoch + 1) % max(1, epochs_s2 // 5) == 0 or smoke_test:
-            print(f"  S2 epoch {epoch+1}/{epochs_s2} | feat={feat_loss.item():.4f} edge={edge_loss.item():.4f}")
+            print(f"  S2 epoch {epoch+1}/{epochs_s2} | feat={feat_loss.item():.4f} "
+                  f"edge={edge_loss.item():.4f} loe={loe_s2.item():.4f} margin={margin_s2.item():.3f}")
 
     # ---- Scoring ----
     print("[hybrid] Scoring all nodes ...")
@@ -906,13 +965,21 @@ def train_sampled(data, x_synth, topo_pack, fanout: tuple[int, int] = (25, 10),
                         h_synth = _get_synth_h_topology(model, topo_pack, device)
                     else:
                         h_synth = _get_synth_h(model, x_synth, eil, ett, device)
-                    loss = svdd + _loe_loss(h_synth, model.centroid, lam_t)
+                    margin = _derive_loe_margin(h_n, model.centroid)
+                    loss = svdd + _loe_loss(h_synth, model.centroid, lam_t, margin)
                 else:
-                    pred_x, edge_prob, _, _ = model(x, eil, ett, iso)
+                    pred_x, edge_prob, h_n, _ = model(x, eil, ett, iso)
                     tgt = target_global[n_id[:n_seed]].to(device)
                     feat_loss = F.mse_loss(pred_x[:n_seed], x[:n_seed])
                     edge_loss = F.binary_cross_entropy(edge_prob[:n_seed], tgt)
-                    loss = feat_loss + LAMBDA_EDGE * edge_loss
+                    # Persistent Stage 2 LOE (mirrors train(), added 2026-07-22)
+                    if TOPO_EXPOSURE_ENABLED and topo_pack is not None:
+                        h_synth_s2 = _get_synth_h_topology(model, topo_pack, device)
+                    else:
+                        h_synth_s2 = _get_synth_h(model, x_synth, eil, ett, device)
+                    margin_s2 = _derive_loe_margin(h_n[:n_seed], model.centroid)
+                    loss = (feat_loss + LAMBDA_EDGE * edge_loss
+                            + _loe_loss(h_synth_s2, model.centroid, LOE_STAGE2_WEIGHT, margin_s2))
                 loss.backward()
                 optimizer.step()
                 agg["loss"] += float(loss.item())
@@ -993,8 +1060,9 @@ def train_incremental(
         edge_loss = _edge_pred_loss(edge_prob, edge_index_list, x_all.shape[0], DEVICE)
 
         # LOE on confirmed/synthetic exposure — keeps fraudster embeddings away from centroid
-        h_exp = _get_synth_h(model, x_exposure, edge_index_list, edge_type_tensor, DEVICE)
-        loe   = _loe_loss(h_exp, model.centroid, LAMBDA_EXPOSURE * 0.5)  # half weight during fine-tune
+        h_exp  = _get_synth_h(model, x_exposure, edge_index_list, edge_type_tensor, DEVICE)
+        margin = _derive_loe_margin(h_n, model.centroid)
+        loe    = _loe_loss(h_exp, model.centroid, LAMBDA_EXPOSURE * 0.5, margin)  # half weight during fine-tune
 
         loss = feat_loss + LAMBDA_EDGE * edge_loss + loe
         loss.backward()

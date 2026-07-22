@@ -29,6 +29,17 @@ GRAPH_EMB_DIM   = 64
 MLP_HIDDEN      = 256
 Z_DIM           = 64
 LOE_MARGIN      = 2.0
+# Persistent Stage 2 LOE weight (added 2026-07-22 — see README changelog). Stage 2
+# previously had NO exposure term at all, so any separation Stage 1 bought could be
+# freely re-absorbed by 120 epochs of unconstrained reconstruction — this showed up
+# concretely in prototyping: dense synthetic cliques reconstruct too easily (MAR
+# critique), and Stage 2 had nothing stopping the model re-learning to reconstruct
+# them well. A small non-zero weight through Stage 2 keeps that separation alive
+# instead of letting it decay to nothing. Paired with the hinge-margin _loe_loss
+# rewrite (was exp(-sqrt(dist)), which saturated to ~0 within the first few epochs
+# in BOTH a 30-epoch and a 150-epoch prototype run — an exponential decay is not a
+# usable training signal once distances exceed a handful of units).
+LOE_STAGE2_WEIGHT = 0.15
 LAMBDA_EDGE     = 0.3
 LAMBDA_EXPOSURE = 1.0
 EPOCHS_STAGE1   = 80
@@ -173,19 +184,71 @@ RING_CLASSIFIER_ENABLED = _env("V4_RING", "0") == "1"  # default OFF; flip to ad
 COMPARE_SEEDS       = (42, 43, 44)   # the three seeds the head-to-head averages over
 EVAL_HELDOUT_SIZE_RANGE = (6, 40)    # T9b held-out topology size (structure differs, see T9b)
 
-# ── V4 FINAL: dense-block detector — IP specialist, part of the locked architecture ─
+# ── V4.1: dense-block detector — relational specialist, part of the locked architecture ─
+# Extended 2026-07-22 from shares_ip-only to shares_mobile + shares_ip + shares_pincode,
+# per the stress_testing_1 ablation (50k synthetic cohort, ground-truth fraud rings):
+# ip-only PR-AUC 0.209 -> relational (IP-priority-weighted) 0.261, with IP-ring
+# detection held ~unchanged (0.2199 -> 0.2196) and mobile-ring detection going from
+# near-zero (0.030) to real signal (0.149). Equal-weighting the 3 relations was
+# tried first and rejected: it gained more overall (0.268) but let ordinary,
+# non-fraud density in mobile/pincode outrank true IP-ring members (IP PR-AUC
+# collapsed to 0.067) -- unacceptable given IP is the dominant real fraud vector.
+# See README.md changelog (2026-07-22) and outputs/stress_testing_1_v2b_stats.json
+# for the full sweep. Redlined under explicit lead direction (sole author).
 DENSE_BLOCK_ENABLED   = _env("V4_DENSE_BLOCK", "1") == "1"   # default ON (architected component)
-DENSE_BLOCK_RELATIONS = [1]                                   # gated to shares_ip exclusively (see AGENTS.md H.5)
+DENSE_BLOCK_RELATIONS = [0, 1, 4]                             # shares_mobile, shares_ip, shares_pincode
+# Priority weights applied to each relation's own min-max-normalised score BEFORE
+# the max-combine (DENSE_BLOCK_RELATIONS index -> weight). IP dominant by design —
+# most real fraud in this population runs through IP; mobile/pincode are boosts,
+# not equals. This is the "ip_priority_strong" setting from the ablation sweep.
+DENSE_BLOCK_RELATION_WEIGHTS = {0: 0.3, 1: 1.0, 4: 0.2}       # mobile, ip, pincode
 DENSE_BLOCK_KCORE_PREFILTER = True                            # k-core narrows, then peel
 DENSE_BLOCK_CAMOUFLAGE_C    = 5.0                             # w = 1/log(deg + c)
 
-# ── V4 FINAL: score-level fusion (LOCKED — replaces the 14-positive LightGBM) ──
-# risk = minmax( W_SUBSPACE*subspace + W_DENSE_IP*dense_block_ip + W_HYBRID*hybrid )
-# each component min-max normalised first. See AGENTS.md H.8 for why LightGBM was
-# dropped (it destroyed subspace 0.966->0.315 and RGCN IP 0.51->0.169).
-FUSION_W_SUBSPACE = 1.0    # tabular backbone (dominant; wins 4/5 categories raw)
-FUSION_W_DENSE_IP = 0.5    # IP specialist boost (subspace's one blind spot)
-FUSION_W_HYBRID   = 0.3    # RGCN relational (best generalisation to novel topology)
+# ── V4.2: Deep SAD center-distance (2026-07-22, XAI-only — NOT in fusion) ──────
+# Separate encoder + objective from Hybrid GraphMCM: pulls real nodes toward a
+# learned "normal" center, pushes topology exposure's synthetic archetypes away
+# via an inverted-distance term (Ruff et al., ICLR 2020). No reconstruction loss,
+# so it doesn't inherit the MAR reconstruct-too-easily failure mode reconstruction
+# based components have. Validated on stress_testing_1 against hybrid_reconstruction
+# (0.153 overall / 0.029 mobile-ring): center_dist_score reached 0.201 overall /
+# 0.093 mobile-ring, 0.050 IP-ring — the single strongest relational signal found
+# this session. A companion per-cluster "nearest known archetype" prototype-match
+# score was also tested and rejected (0.116, near-random on every category — no
+# inter-prototype separation term, prototypes collapsed too close together).
+# Deliberately kept OUT of FUSION_COMPONENTS / final_risk_score. Tested directly
+# (2026-07-22): re-scored stress_testing_1 with a candidate 4-way max fusion
+# (existing 3 + minmax(center_dist_score)) — overall PR-AUC 0.4182 -> 0.4181
+# (noise-level, not an improvement). Deep SAD only won the argmax in 483/50,000
+# nodes (<1%): the existing trio already dominates its specialty categories so
+# completely (e.g. mobile-ring alone reaches 0.53 PR-AUC under the current fusion,
+# far above Deep SAD's standalone 0.09-0.10 there) that a 4th max-input rarely
+# gets to matter. REJECTED for fusion on this evidence; remains XAI-card-only
+# (xai_layer_v3.py). See outputs/stress_testing_1_{deepsad,fusion4}_stats.json.
+DEEPSAD_ENABLED  = _env("V4_DEEPSAD", "1") == "1"
+DEEPSAD_HIDDEN   = 64
+DEEPSAD_EMB_DIM  = 32
+DEEPSAD_EPOCHS   = 150
+DEEPSAD_ETA      = 1.0     # inverted-distance weight for exposure (anomaly) nodes
+DEEPSAD_LR       = 1e-3
+DEEPSAD_CENTER_REFRESH_EVERY = 25   # epochs between centroid recomputation
+
+# ── V4.1: score-level fusion (LOCKED — replaces the 14-positive LightGBM) ──────
+# risk = minmax( max( minmax(subspace), minmax(dense_block_relational), minmax(hybrid) ) )
+# Changed 2026-07-22 from the additive weighted-sum to an unweighted max, per the
+# stress_testing_1 ablation: on every category where one detector actually had
+# signal, the weighted-sum scored WORSE than that detector alone (e.g. mobile-ring:
+# subspace alone 0.674 vs fused 0.349) -- summing let the other two detectors'
+# near-random noise dilute the one that found the fraud. Plain max: overall PR-AUC
+# 0.403 -> 0.447 on the same data. Still label-independent (no learned gate) and,
+# if anything, MORE protective of a strong raw signal than the sum was, since max
+# preserves the single strongest detector's value exactly regardless of the other
+# two. See AGENTS.md H.8 for why a LEARNED fusion (LightGBM) was rejected instead —
+# that risk (overfitting on sparse labels) does not apply to switching combination
+# functions, only to learning the combination from labels.
+# FUSION_W_SUBSPACE/DENSE_IP/HYBRID are retired (max has no per-component weight);
+# FUSION_COMPONENTS lists the three inputs for display/ordering only.
+FUSION_COMPONENTS = ("subspace", "dense_relational", "hybrid")
 
 # ── V4 revamp: deviation layer (D2/D3) ───────────────────────────────────────
 DEVIATION_LAYER_ENABLED     = _env("V4_DEVIATION", "0") == "1"  # default OFF

@@ -35,6 +35,19 @@ class ConfirmPatternRequest(BaseModel):
 
 class PromotePatternRequest(BaseModel):
     pattern_ids: list[str]
+    mode: str = "incremental"   # "incremental" | "full_retrain"
+    smoke_test: bool = False
+
+
+class RetrainPatternsRequest(BaseModel):
+    """Dispatch a retrain over the flagged-history store, independent of the
+    pending-queue promote flow — covers patterns already PROMOTED (their
+    topology is already in synthetic_exposure_graph_v3.pt; this just (re)runs
+    training) as well as any still CONFIRMED/SELECTED (promoted first, same as
+    /patterns/promote, so their topology lands before the chosen job runs).
+    pattern_ids empty/omitted = every non-REJECTED pattern in the store."""
+    pattern_ids: list[str] = []
+    mode: str = "incremental"   # "incremental" | "full_retrain"
     smoke_test: bool = False
 
 

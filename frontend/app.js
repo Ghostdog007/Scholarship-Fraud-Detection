@@ -893,6 +893,8 @@ function updateFlaggedSelectionUI() {
   const n = flaggedSelected.size;
   document.getElementById("fh-count").textContent = `${n} selected`;
   document.getElementById("btn-delete-flagged").disabled = n === 0;
+  document.getElementById("btn-export-flagged-selected").disabled = n === 0;
+  document.getElementById("btn-retrain-flagged-selected").disabled = n === 0;
   const all = document.getElementById("fh-select-all");
   const chks = document.querySelectorAll("#flagged-history-body .fh-check");
   all.checked = chks.length > 0 && [...chks].every((c) => c.checked);
@@ -938,15 +940,26 @@ document.getElementById("btn-delete-flagged").addEventListener("click", async ()
 
 document.getElementById("btn-refresh-flagged-history").addEventListener("click", loadFlaggedHistory);
 
+document.getElementById("btn-export-flagged-bulk").addEventListener("click", () => {
+  downloadUrl("/v3/supervisor/patterns/export/bulk");
+});
+
+document.getElementById("btn-export-flagged-selected").addEventListener("click", () => {
+  const ids = [...flaggedSelected];
+  if (!ids.length) return;
+  downloadUrl(`/v3/supervisor/patterns/export/selected?ids=${ids.map(encodeURIComponent).join(",")}`);
+});
+
 document.getElementById("btn-promote").addEventListener("click", async () => {
   const ids = Array.from(document.querySelectorAll(".pattern-check:checked")).map((c) => c.value);
   if (!ids.length) { toast("Select at least one pattern.", "error"); return; }
   const smoke_test = document.getElementById("chk-smoke-test").checked;
+  const mode = document.getElementById("promote-retrain-mode").value;
   const statusEl = document.getElementById("promote-job-status");
   statusEl.style.display = "block";
   statusEl.textContent = "Dispatching…";
   try {
-    const res = await apiPost("/v3/supervisor/patterns/promote", { pattern_ids: ids, smoke_test });
+    const res = await apiPost("/v3/supervisor/patterns/promote", { pattern_ids: ids, mode, smoke_test });
     statusEl.textContent = `${res.message} job_id=${res.job_id}`;
     toast("Retrain dispatched.", "success");
     pollJob(res.job_id, statusEl);
@@ -955,6 +968,37 @@ document.getElementById("btn-promote").addEventListener("click", async () => {
     statusEl.textContent = `Failed: ${e.message}`;
     toast(`Failed: ${e.message}`, "error");
   }
+});
+
+// Retrain directly from the flagged-history store — covers already-PROMOTED
+// patterns (topology already appended, this just (re)runs training) as well
+// as any still CONFIRMED/SELECTED among the selection (promoted first).
+async function retrainFlagged(pattern_ids) {
+  const mode = document.getElementById("flagged-retrain-mode").value;
+  const smoke_test = document.getElementById("chk-flagged-smoke-test").checked;
+  const statusEl = document.getElementById("flagged-retrain-job-status");
+  statusEl.style.display = "block";
+  statusEl.textContent = "Dispatching…";
+  try {
+    const res = await apiPost("/v3/supervisor/patterns/retrain", { pattern_ids, mode, smoke_test });
+    statusEl.textContent = `${res.message} job_id=${res.job_id}`;
+    toast("Retrain dispatched.", "success");
+    pollJob(res.job_id, statusEl);
+  } catch (e) {
+    statusEl.textContent = `Failed: ${e.message}`;
+    toast(`Failed: ${e.message}`, "error");
+  }
+}
+
+document.getElementById("btn-retrain-flagged-selected").addEventListener("click", () => {
+  const ids = [...flaggedSelected];
+  if (!ids.length) return;
+  retrainFlagged(ids);
+});
+
+document.getElementById("btn-retrain-flagged-all").addEventListener("click", () => {
+  if (!confirm("Retrain over every non-rejected flagged pattern? This promotes any not yet promoted, then dispatches the chosen retrain job.")) return;
+  retrainFlagged([]);
 });
 
 async function pollJob(jobId, statusEl, intervalMs = 3000, maxTries = 200) {

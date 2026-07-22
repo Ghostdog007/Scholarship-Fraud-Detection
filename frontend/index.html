@@ -107,15 +107,27 @@
     </div>
     <div class="panel">
       <div class="panel-head">
-        <span>Promote selected → dispatch incremental retrain</span>
+        <span>Promote selected → dispatch retrain</span>
       </div>
       <div class="panel-body">
         <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--fg2);">
+            retrain mode
+            <select id="promote-retrain-mode">
+              <option value="incremental">Incremental (fast, fine-tune only)</option>
+              <option value="full_retrain">Full (slow, RGCN learns the ring's topology)</option>
+            </select>
+          </label>
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--fg2);">
             <input type="checkbox" id="chk-smoke-test"> smoke test (fast, no real training)
           </label>
           <button id="btn-promote" class="primary">Promote selected patterns</button>
         </div>
+        <p style="font-size:12px;color:var(--muted);margin:8px 0 0;">
+          Incremental fine-tunes the existing checkpoint but does not train the RGCN on the
+          promoted ring's real edges. Full re-runs the pipeline end-to-end so the RGCN actually
+          learns the topology (slower — full epoch budget).
+        </p>
         <div id="promote-job-status" class="job-status" style="display:none;"></div>
       </div>
     </div>
@@ -126,6 +138,8 @@
           <label class="qt-select" style="font-size:12px;"><input type="checkbox" id="fh-select-all"> Select all</label>
           <span class="qt-count" id="fh-count" style="min-width:auto;">0 selected</span>
           <button id="btn-delete-flagged" class="ghost danger" disabled>✕ Delete selected</button>
+          <button id="btn-export-flagged-selected" class="ghost" disabled>⤓ Export selected</button>
+          <button id="btn-export-flagged-bulk" class="ghost">⤓ Export all</button>
           <button id="btn-refresh-flagged-history" class="ghost">↻ Refresh</button>
         </div>
       </div>
@@ -136,6 +150,21 @@
           <code>shares_ip</code> and warns you if its cluster may already be here &mdash;
           verify with the <b>3D identity ring</b> before re-adding.
         </p>
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:0 0 12px;">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--fg2);">
+            retrain mode
+            <select id="flagged-retrain-mode">
+              <option value="incremental">Incremental (fast, fine-tune only)</option>
+              <option value="full_retrain">Full (slow, RGCN learns topology)</option>
+            </select>
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--fg2);">
+            <input type="checkbox" id="chk-flagged-smoke-test"> smoke test
+          </label>
+          <button id="btn-retrain-flagged-selected" class="primary" disabled>▶ Retrain selected</button>
+          <button id="btn-retrain-flagged-all" class="ghost">▶ Retrain all</button>
+        </div>
+        <div id="flagged-retrain-job-status" class="job-status" style="display:none;"></div>
         <div id="flagged-history-body"><div class="empty-state">Loading…</div></div>
       </div>
     </div>

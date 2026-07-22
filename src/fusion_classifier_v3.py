@@ -1,17 +1,28 @@
 """
 fusion_classifier_v3.py
 
-V4 FINAL — weighted SCORE-LEVEL fusion (locked). Replaces the 14-positive LightGBM,
-which destroyed the raw detector signals (subspace INCOME 0.966->0.315, RGCN IP
-0.51->0.169; see docs/AGENTS.md H.8).
+V4.1 FINAL — max SCORE-LEVEL fusion (locked, changed 2026-07-22). Originally an
+additive weighted-sum; replaced with an unweighted max after the stress_testing_1
+ablation showed the sum diluting whichever detector actually found the fraud with
+near-random noise from the other two on every category tested (e.g. mobile-ring:
+subspace alone 0.674 PR-AUC vs the old weighted-sum fused 0.349). Overall PR-AUC on
+that ablation: 0.403 (weighted-sum) -> 0.447 (max). See README changelog and
+outputs/stress_testing_1_v2_stats.json / _v2b_stats.json for the full numbers.
+The original LightGBM replacement rationale (docs/AGENTS.md H.8: destroyed subspace
+INCOME 0.966->0.315, RGCN IP 0.51->0.169) still holds for why the combiner is not
+LEARNED — that risk is about fitting weights to sparse labels, not about which
+fixed combination FUNCTION (sum vs max) is used.
 
-risk_score_v3 = minmax( W_SUBSPACE*subspace_if_score
-                      + W_DENSE_IP *dense_block_score_ip
-                      + W_HYBRID   *hybrid_anomaly_score )
+risk_score_v3 = minmax( max( minmax(subspace_if_score),
+                             minmax(dense_block_score_relational),
+                             minmax(hybrid_anomaly_score) ) )
 
-each component min-max normalised to [0,1] first. No labels used in the combine
-(label-independent) — subspace is the tabular backbone, dense-block-IP the IP
-specialist, RGCN the relational/topology signal. All scalar inputs only.
+each component min-max normalised to [0,1] first, THEN maxed — no weights: max has
+no per-component weight to tune, it takes whichever raw signal is strongest for
+that application. No labels used in the combine (label-independent) — subspace is
+the tabular backbone, dense-block-relational the mobile/IP/pincode structural
+specialist (IP-priority weighted internally, see dense_block_detector_v3), RGCN the
+relational/topology signal. All scalar inputs only.
 
 Inputs : outputs/hybrid_scores_v3.csv, outputs/subspace_if_scores_v3.csv,
          outputs/dense_block_scores_v3.csv
@@ -24,9 +35,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.config_v3 import (
-    FUSION_W_SUBSPACE, FUSION_W_DENSE_IP, FUSION_W_HYBRID, DENSE_BLOCK_ENABLED,
-)
+from src.config_v3 import DENSE_BLOCK_ENABLED
 
 HYBRID_CSV   = Path("outputs/hybrid_scores_v3.csv")
 SUBSPACE_CSV = Path("outputs/subspace_if_scores_v3.csv")
@@ -43,24 +52,24 @@ def _minmax(x: np.ndarray) -> np.ndarray:
 
 def score_level_fusion(
     subspace_if_score: np.ndarray,
-    dense_block_score_ip: np.ndarray,
+    dense_block_score_relational: np.ndarray,
     hybrid_anomaly_score: np.ndarray,
 ) -> np.ndarray:
     """
-    The LOCKED weighted score-level fusion (single source of truth).
+    The LOCKED max score-level fusion (single source of truth).
 
-    risk = minmax( W_SUBSPACE*minmax(subspace)
-                 + W_DENSE_IP *minmax(dense_ip)
-                 + W_HYBRID   *minmax(hybrid) )
+    risk = minmax( max( minmax(subspace), minmax(dense_relational), minmax(hybrid) ) )
 
     All inputs higher = more anomalous (hard stop #3). Label-independent: no
-    learned gate can bury a strong raw signal. Used by both run_fusion (production)
+    learned gate can bury a strong raw signal — max is stricter about this than
+    the old sum was, since it preserves the single strongest detector's value
+    exactly regardless of the other two. Used by both run_fusion (production)
     and compare_architectures_v3 (validation) so the two never drift.
     """
     s = _minmax(subspace_if_score)
-    d = _minmax(dense_block_score_ip)
+    d = _minmax(dense_block_score_relational)
     h = _minmax(hybrid_anomaly_score)
-    combined = FUSION_W_SUBSPACE * s + FUSION_W_DENSE_IP * d + FUSION_W_HYBRID * h
+    combined = np.maximum.reduce([s, d, h])
     return _minmax(combined)
 
 
@@ -73,23 +82,23 @@ def run_fusion() -> None:
 
     if DENSE_BLOCK_ENABLED and DENSE_CSV.exists():
         dense_df = pd.read_csv(DENSE_CSV)
-        ip_col = "dense_block_score_ip" if "dense_block_score_ip" in dense_df.columns else None
-        if ip_col:
-            merged = merged.merge(dense_df[["application_id", ip_col]], on="application_id", how="left")
-            merged["dense_block_score_ip"] = merged["dense_block_score_ip"].fillna(0.0)
+        rel_col = "dense_block_score_relational" if "dense_block_score_relational" in dense_df.columns else None
+        if rel_col:
+            merged = merged.merge(dense_df[["application_id", rel_col]], on="application_id", how="left")
+            merged["dense_block_score_relational"] = merged["dense_block_score_relational"].fillna(0.0)
         else:
-            merged["dense_block_score_ip"] = 0.0
+            merged["dense_block_score_relational"] = 0.0
     else:
-        merged["dense_block_score_ip"] = 0.0
-        print("[fusion] dense-block disabled/absent -> IP specialist contributes 0")
+        merged["dense_block_score_relational"] = 0.0
+        print("[fusion] dense-block disabled/absent -> relational specialist contributes 0")
 
     risk = score_level_fusion(
         merged["subspace_if_score"].values,
-        merged["dense_block_score_ip"].values,
+        merged["dense_block_score_relational"].values,
         merged["hybrid_anomaly_score"].values,
     ).astype(np.float32)
 
-    print(f"[fusion] weights: subspace={FUSION_W_SUBSPACE} dense_ip={FUSION_W_DENSE_IP} hybrid={FUSION_W_HYBRID}")
+    print("[fusion] combine: max(minmax(subspace), minmax(dense_relational), minmax(hybrid))")
 
     # label_source is metadata only (not used in the combine)
     label_source = pd.Series("negative", index=merged.index)
