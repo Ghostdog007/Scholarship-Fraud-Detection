@@ -161,7 +161,7 @@ terminal or a headless server.
 
 | Endpoint | Returns | Cost |
 |---|---|---|
-| `GET /v3/monitoring/{app_id}/card` | Interactive reviewer card: risk placement, ranked reason codes, per-field declared-vs-model-expected breakdown, closed-form fusion split, the **model-traceability trail** (which model drove the score + fired which trigger), and a lightweight identity ego-graph | Cheap — reads pre-computed `explanation_cards_v3.json` |
+| `GET /v3/monitoring/{app_id}/card` | Interactive reviewer card: risk placement, ranked reason codes, per-field declared-vs-model-expected breakdown, closed-form fusion attribution (max fusion — single argmax DRIVER + margin over the next-highest detector, not a proportional split), the **model-traceability trail** (which model drove the score + fired which trigger), a supplementary Deep SAD center-distance signal when elevated (does not drive the fused score), and a lightweight identity ego-graph | Cheap — reads pre-computed `explanation_cards_v3.json` |
 | `GET /v3/monitoring/{app_id}/ring` | Rotatable Plotly 3D identity ring (the deep-dive) | **Lazy** — the ring is computed only on this request (i.e. when the card's "Examine full ring in 3D" link is clicked), never in batch |
 | `GET /v3/monitoring/{app_id}/export` | Zip bundle for one flagged application: `<id>_scorecard.csv` (flat audit row incl. model-traceability summary) + `<id>_card.html` + `<id>_evidence.json` | Cheap — projects `explanation_cards_v3.json` |
 | `GET /v3/monitoring/export/bulk` | Zip of **all** flagged applications: `manifest.csv` (one scorecard row each) + `cards/<id>.html` + `evidence/<id>.json` | Renders every card once — seconds for the top-N set |
@@ -453,6 +453,20 @@ Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/patterns/del
   -Body '{"pattern_ids": ["pat_xxxxxxxx"]}'
 ```
 
+Export every flagged pattern (all states, all sessions) as a zip — manifest.csv
++ patterns/<pattern_id>.json (full record, matching the application export shape):
+```powershell
+curl.exe -s -o patterns_export.zip http://localhost:8000/v3/supervisor/patterns/export/bulk
+```
+
+Export a reviewer-chosen subset of flagged patterns (comma-separated pattern_ids,
+console multi-select feeds this):
+```powershell
+curl.exe -s -o patterns_selected.zip "http://localhost:8000/v3/supervisor/patterns/export/selected?ids=pat_xxxxxxxx,pat_yyyyyyyy"
+```
+Unknown ids are skipped and listed in `_skipped.txt` inside the zip; 404 only if
+none of the requested ids exist.
+
 Confirm a pattern (saves subgraph):
 ```powershell
 Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/patterns/confirm" `
@@ -460,12 +474,33 @@ Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/patterns/con
   -Body '{"application_id": "APP_2024_00123", "fraud_type": "IP_CLUSTER", "subgraph": {}, "confirmed_by": "investigator_name"}'
 ```
 
-Promote a pattern to exposure and retrain:
+Promote a pattern to exposure and retrain. `mode` picks the retrain job:
+`"incremental"` (default) fine-tunes the existing checkpoint but does NOT read
+`synthetic_exposure_graph_v3.pt` — the promoted ring's real topology sits
+unused until a full retrain runs. `"full_retrain"` reruns the full pipeline,
+which trains the RGCN's Stage 1 LOE against that topology file directly — the
+only path that actually teaches the model the ring's structure, not just its
+feature values:
 ```powershell
 Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/patterns/promote" `
   -ContentType "application/json" `
-  -Body '{"pattern_ids": ["pat_xxxxxxxx"], "smoke_test": true}'
+  -Body '{"pattern_ids": ["pat_xxxxxxxx"], "mode": "incremental", "smoke_test": true}'
 ```
+
+Retrain directly from the flagged-history store — covers patterns already
+PROMOTED (topology already appended; this just (re)runs training) as well as
+any still CONFIRMED/SELECTED in the selection (promoted first, same as
+`/patterns/promote`). Empty `pattern_ids` = every non-rejected pattern in the
+store (the console's "Retrain all" button):
+```powershell
+Invoke-RestMethod -Method POST "http://localhost:8000/v3/supervisor/patterns/retrain" `
+  -ContentType "application/json" `
+  -Body '{"pattern_ids": [], "mode": "full_retrain", "smoke_test": true}'
+```
+`mode` must be `"incremental"` or `"full_retrain"` (422 otherwise). Response
+reports `n_target`, `newly_promoted_pattern_ids` (patterns that weren't
+PROMOTED yet and were promoted as part of this call), and the dispatched
+`job_id` (poll via `GET /v3/training/jobs/{job_id}`).
 
 ### 5.1 Confirm a fraud case
 

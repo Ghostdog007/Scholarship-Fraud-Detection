@@ -151,10 +151,14 @@ universe.
 >    and "Identity graph (5 relations)", each with a small annotation "SQL-
 >    pushdown at scale" / "hub-capped at scale", feeding into...
 > 3. **Detection** — three parallel boxes side by side: "Hybrid GraphMCM
->    (RGCN)", "Subspace Isolation Forest", "Dense-block (IP-gated)", each
->    with its one-line job description from §6, converging into a single
->    diamond "Locked score-level fusion" with the formula
->    `risk = minmax(1.0·subspace + 0.5·dense_ip + 0.3·hybrid)` printed beside it.
+>    (RGCN, root_weight=False)", "Subspace Isolation Forest", "Dense-block
+>    (mobile+IP+pincode, IP-weighted)", each with its one-line job description
+>    from §6, converging into a single diamond "Locked score-level fusion"
+>    with the formula `risk = minmax(max(subspace, dense_relational, hybrid))`
+>    printed beside it. A fourth, visually distinct box "Deep SAD
+>    (supplementary)" feeds ONLY into "XAI cards" directly, bypassing the
+>    fusion diamond — tested as a 4th fusion input and rejected (no
+>    improvement, see §6.6b).
 > 4. **Output** — the fusion diamond feeds into "EVT thresholds", then
 >    branches to "XAI cards" and "Human-gated self-training", both feeding
 >    into a "Console" box at the far right.
@@ -270,9 +274,28 @@ signals 24×):
   subgraph** is appended as a topology-exposure cluster — the loop that turns
   investigations into training signal.
 
-During training, LOE (Latent Outlier Exposure) pushes exposure samples' errors
-**up** by margin `LOE_MARGIN = 2.0` while normal reconstruction pulls real-data
-errors down (`LAMBDA_EXPOSURE = 1.0`).
+> **Naming note (corrected 2026-07-22):** this section previously expanded
+> "LOE" as "Latent Outlier Exposure" — that is the name of a *different*,
+> unrelated technique (Qiu et al., ICML 2022: jointly re-inferring which
+> unlabeled real training points are secretly contaminated, via
+> block-coordinate updates). This project's LOE is this project's own
+> synthetic-exposure margin mechanism (below) — the two were never the same
+> thing, and the Qiu et al. method was itself prototyped separately against
+> `stress_testing_1` this session and rejected (not adopted; see README
+> changelog). Do not conflate the two when reading older records.
+
+During training, LOE pushes exposure samples' embedding-distance-to-centroid
+**up** past a **data-derived margin** (`_derive_loe_margin` — the 75th
+percentile of real nodes' own distance to the centroid, recomputed each
+epoch) via a hinge loss, while normal reconstruction pulls real-data errors
+down (`LAMBDA_EXPOSURE = 1.0`). Changed 2026-07-22 from a fixed
+`LOE_MARGIN = 2.0`: measurement showed 2.0 was ~3x too small for this
+embedding scale, so the margin term contributed effectively zero gradient
+throughout training since some point after RGCN adoption — the mechanism
+had silently stopped working. Stage 2 (free reconstruction) also gained a
+small **persistent** LOE term (`LOE_STAGE2_WEIGHT = 0.15`, non-decaying) it
+previously lacked entirely, so separation bought in Stage 1 can't be freely
+re-absorbed by 120 epochs of unconstrained reconstruction.
 
 ## 6. The detectors — how each model works, and how each one reaches a conclusion
 
@@ -288,7 +311,16 @@ errors down (`LAMBDA_EXPOSURE = 1.0`).
   (`GRAPH_HIDDEN = 128` → `GRAPH_EMB_DIM = 64`), producing a 64-dim
   neighborhood embedding `h_N` per node. (A HAN encoder exists behind
   `V4_ENCODER_ARCH=han` but regresses −0.091 over 3 seeds — RGCN is the
-  default.)
+  default.) **`root_weight=False` since 2026-07-22**: `RGCNConv` defaults to
+  `root_weight=True`, which adds a learned self-transform of a node's own
+  UNMASKED features directly into `h_N`, independent of the MCM masking above
+  — leaking self-signal around the intentional mask for every connected node
+  (isolated nodes were already unaffected, overridden by
+  `isolated_embedding`). Disabling it makes `h_N` pure multi-relation
+  neighbor aggregation, the actual MCM contract. Validated on
+  `stress_testing_1` (overall PR-AUC 0.153→0.201, mobile-ring 0.029→0.078,
+  no low-degree regression) and on the real 15k set (5/5 V2 floors still
+  pass, edge-dropout retention 2.34).
 - **Fusion MLP:** concat(masked features, `h_N`) → `MLP_HIDDEN = 256` →
   `Z_DIM = 64` → predicted feature vector + edge-existence probabilities.
 
@@ -349,28 +381,42 @@ get diluted by being perfectly normal on identity/network features — a
 only structural signal for **isolated nodes**: unique mobile + unique IP →
 zero graph edges).
 
-### 6.3 Dense-block detector (`dense_block_detector_v3.py`) — the IP-ring specialist
+### 6.3 Dense-block detector (`dense_block_detector_v3.py`) — the shared-identity ring specialist
 
 Reconstruction models **smooth over dense cliques** — a tight fraud ring
 reconstructs *easily*, weakening the relational signal (MAR critique). The
 dense-block detector attacks exactly that blind spot:
 
-- **Gated to `shares_ip` edges only** (`DENSE_BLOCK_RELATIONS = [1]`) — the one
-  relation where subspace IF is weak.
+- **Gated to `shares_mobile` + `shares_ip` + `shares_pincode`**
+  (`DENSE_BLOCK_RELATIONS = [0, 1, 4]`) since 2026-07-22 — was `shares_ip`
+  only. Extending to mobile+pincode was tested against `stress_testing_1`
+  after the IP-only gate was found to score mobile-sharing rings near zero
+  (PR-AUC 0.030); each relation is peeled **independently**, then
+  **IP-priority-weighted max-combined**: `DENSE_BLOCK_RELATION_WEIGHTS =
+  {mobile: 0.3, ip: 1.0, pincode: 0.2}` — IP stays dominant (the real
+  population's primary fraud vector) while mobile/pincode contribute as
+  boosts, not equals. Equal weighting was tried first and rejected: it
+  gained more in aggregate but let ordinary non-fraud density in
+  mobile/pincode outrank true IP rings (IP PR-AUC collapsed 0.220→0.067).
+  Output columns: `dense_block_score_mobile/ip/pincode` (per-relation, for
+  XAI transparency) + `dense_block_score_relational` (the weighted max,
+  what fusion actually consumes).
 - k-core prefilter narrows candidates, then greedy peeling extracts dense
   blocks; camouflage-resistant weighting `w = 1/log(deg + 5.0)`
   (`DENSE_BLOCK_CAMOUFLAGE_C`).
 
 **How it reaches a conclusion:** it doesn't look at any of the 44 features at
-all — purely graph structure on the `shares_ip` relation. It repeatedly
-removes the lowest-weighted-degree node from the IP graph (FRAUDAR-style
-greedy peeling — §13.3 has the complexity citation) until what's left is a
-provably dense subgraph. Every application inside that dense remainder gets a
-`dense_block_ip` score proportional to how dense and how camouflage-resistant
-the block is. **A high score means: this application is part of a
-mathematically dense cluster of applications sharing one IP address** —
-exactly the "many students, one internet connection" signature a
-reconstruction model alone would miss.
+all — purely graph structure, run separately on each of the 3 gated
+relations. For each relation it repeatedly removes the lowest-weighted-degree
+node from that relation's graph (FRAUDAR-style greedy peeling — §13.3 has the
+complexity citation) until what's left is a provably dense subgraph. Every
+application inside a dense remainder gets a per-relation score proportional
+to how dense and camouflage-resistant that block is; the three per-relation
+scores are min-max normalised and combined via the IP-weighted max above.
+**A high `dense_block_score_relational` means: this application is part of a
+mathematically dense cluster of applications sharing one identity value**
+(mobile, IP, or pincode) — exactly the "many students, one internet
+connection / one phone" signature a reconstruction model alone would miss.
 
 ### 6.4 EVT scorer (`evt_scorer_v3.py`) — statistical thresholds, not policy
 
@@ -391,42 +437,82 @@ allowed anywhere in the system (hard stop #1).
 - Supervisor-confirmed fraud (from the console) enters as **hard labels** with
   sample weight `CONFIRMED_WEIGHT = 3.0`.
 
-### 6.6 Fusion (`fusion_classifier_v3.py`) — LOCKED score-level weighted sum
+### 6.6 Fusion (`fusion_classifier_v3.py`) — LOCKED score-level max
 
-> **Fusion history — read this if your records mention LightGBM.** LightGBM
-> was the *former* fusion layer and is **superseded**. Any recorded
-> "LightGBM fusion, PR-AUC ~0.639" describes the removed stacker, not the
-> current system. Source: `docs/HISTORY.md` and
-> `outputs/ablation/locked_fusion_validation.json`.
+> **Fusion history — read this if your records mention LightGBM or a
+> weighted sum.** LightGBM was the *first* fusion layer, superseded by a
+> **weighted sum** (`1.0·subspace + 0.5·dense_ip + 0.3·hybrid`), itself
+> superseded 2026-07-22 by the **unweighted max** described below. Any
+> record showing LightGBM, or a `+` between detector terms, is stale.
+> Source: `docs/HISTORY.md` and `outputs/ablation/locked_fusion_validation.json`.
 
 The original LightGBM stacker was **removed**: with only 14 positives the
 meta-learner had essentially no signal to fit combination weights on, and it
 destroyed calibrated components (subspace PR-AUC 0.966 → 0.315, RGCN IP
-0.51 → 0.169). The locked replacement:
+0.51 → 0.169). The weighted-sum replacement that followed was **itself
+replaced 2026-07-22** after a `stress_testing_1` ablation showed it diluting
+strong signals: on every category where one detector actually had signal,
+the sum scored *worse* than that detector alone (e.g. mobile-ring: subspace
+alone 0.674 vs the summed fusion 0.349) — the other two detectors' near-random
+noise on that category dragged the strong one down. The current, locked
+replacement:
 
 ```
-final_risk = minmax( 1.0 · minmax(subspace_if_score)
-                   + 0.5 · minmax(dense_block_ip_score)
-                   + 0.3 · minmax(hybrid_anomaly_score) )
+final_risk = minmax( max( minmax(subspace_if_score),
+                           minmax(dense_block_score_relational),
+                           minmax(hybrid_anomaly_score) ) )
 ```
 
-(`FUSION_W_SUBSPACE / W_DENSE_IP / W_HYBRID` in `config_v3.py`.) **How the
-conclusion is reached:** each of the three raw scores is independently
-rescaled to [0,1] across the current population, then combined with these
-fixed weights. There is no learned combination step — the weights are fixed
-constants set from the six-mode comparison in `docs/HISTORY.md`, not fit per
-batch. This is why the fusion never needs retraining on its own: it is
-arithmetic, not a model. Weights encode the head-to-head evidence: subspace =
-backbone, dense-IP = specialist boost, hybrid RGCN = best generalisation to
-novel topology. Output: `outputs/risk_scores_v3.csv`.
+No per-component weight (`FUSION_W_*` retired; `FUSION_COMPONENTS =
+("subspace", "dense_relational", "hybrid")` in `config_v3.py` names the 3
+inputs, not weights). **How the conclusion is reached:** each of the three
+raw scores is independently rescaled to [0,1] across the current population;
+the fused score is whichever one is highest for that application — attribution
+is therefore exact and binary (the "driver"), not a proportional share. There
+is still no learned combination step and no retraining needed for fusion
+itself — it is arithmetic. Overall PR-AUC on `stress_testing_1`: 0.403 (sum)
+→ 0.447 (max) at introduction; 0.418 with the current root_weight-fixed
+Hybrid GraphMCM (numbers move as upstream detectors change; re-derive before
+citing). Output: `outputs/risk_scores_v3.csv`.
+
+### 6.6b Deep SAD (`deepsad_detector_v3.py`) — supplementary, NOT in fusion
+
+A 4th detector exists but is deliberately **outside** the fusion above: a
+separate 2-layer RGCN encoder (own checkpoint, `models/deepsad_v3.pth`)
+trained with a Deep SAD objective (Ruff et al., ICLR 2020) — pull real nodes
+toward a learned normal center, push topology-exposure's synthetic
+archetypes away via an inverted-distance term, **no reconstruction loss** at
+all. That absence of a reconstruction term is the point: it doesn't inherit
+the MAR smooth-over-dense-cliques failure mode the way `hybrid_graphmcm_v3`
+partially does. Validated on `stress_testing_1` as the single strongest
+relational signal found this session (0.201 overall / 0.093 mobile-ring /
+0.050 IP-ring vs `hybrid_anomaly_score`'s 0.153 / 0.029 / 0.032) — yet
+**tested directly as a 4th fusion input and rejected** (2026-07-22): a
+candidate `max(subspace, dense_relational, hybrid, center_dist_score)`
+scored 0.4181 vs the locked 3-way's 0.4182 on `stress_testing_1` — noise-level,
+not an improvement, because Deep SAD only won the argmax on <1% of nodes
+(the existing trio already covers its specialty categories too well for a
+4th max-input to matter). Instead, `center_dist_score` is surfaced on XAI
+cards (§6.7) as a supplementary signal (shown when >75th population
+percentile) with an explicit "does not drive the fused score" note, and
+exported as a `deepsad_percentile` scorecard column. It reads the `deepsad`
+pipeline step (`main_v3.py`, between `dense_block` and `evt`); its own
+`CENTROID_CLEAN_PERCENTILE=95` clean-population heuristic was itself
+prototyped for a contamination-aware replacement (Qiu et al.'s Latent
+Outlier Exposure, unrelated to this project's own LOE — see §5) and that
+replacement was tested and not adopted (see README changelog for the
+alpha-sensitivity result).
 
 ### 6.7 XAI layer (`xai_layer_v3.py` + `xai_card_html_v3.py`)
 
 - **Evidence-first JSON cards** for every flagged application: ranked reason
   codes, per-feature declared vs model-predicted values (from the detector's
-  per-feature error export), the closed-form fusion split (exact — no SHAP
-  approximation), EVT threshold context, and a `model_trace` (which checkpoint /
-  component produced each line).
+  per-feature error export), the closed-form fusion attribution (exact — no
+  SHAP approximation; max fusion means a single argmax DRIVER + margin over
+  the next-highest detector, not a proportional split), a supplementary Deep
+  SAD center-distance signal when elevated (>75th percentile, explicitly
+  marked as not driving the fused score), EVT threshold context, and a
+  `model_trace` (which checkpoint / component produced each line).
 - **Narration policy:** cards narrate only continuous features and
   network-DISAGREEMENT binaries; nominal identifiers are never spoken.
   Presentation-only — XAI never gates a score.
@@ -446,15 +532,17 @@ novel topology. Output: `outputs/risk_scores_v3.csv`.
 > connected than X% of applicants." Right column, top to bottom: a circular
 > risk gauge (0–1, conic gradient by risk color) with headline text; a
 > "Why it flagged — ranked reason codes" numbered list (2–3 entries, each
-> with a colored source-model pill: red "Tabular subspace", pink "Shared-IP
-> dense-block", cyan "Relational RGCN"); an expandable "What's happening in
-> each field" accordion showing one open field with two horizontal bars
-> (declared value vs. model-expected value, ± signed, red vs. blue) and an
-> explanatory sentence; a "How this score was produced" section with three
-> stacked percentage bars (one per detector, colored to match their pills,
-> summing to the fusion composition); a reviewer-decision form (name field,
-> fraud-type dropdown, Confirm/Mark-false-positive/Undo buttons) at the
-> bottom.
+> with a colored source-model pill: red "Tabular subspace", pink "Shared-
+> identity dense-block", cyan "Relational RGCN"); an expandable "What's
+> happening in each field" accordion showing one open field with two
+> horizontal bars (declared value vs. model-expected value, ± signed, red vs.
+> blue) and an explanatory sentence; a "How this score was produced" section
+> with three percentage bars (one per fusion detector, colored to match their
+> pills, the single argmax marked DRIVER — not a proportional share, since
+> fusion is max not sum), plus a 4th, visually distinct purple bar for "Deep
+> SAD (supplementary)" shown only when elevated, explicitly captioned as not
+> driving the fused score; a reviewer-decision form (name field, fraud-type
+> dropdown, Confirm/Mark-false-positive/Undo buttons) at the bottom.
 
 > **[SVG PROMPT — 3D Identity Ring]**
 > A 3D scatter/network render (Plotly-style) on a near-black background:
@@ -619,9 +707,11 @@ CREATE TABLE feature_scaling (
     PRIMARY KEY (schema_version, feature_name)
 );
 
--- All three detector scores + fusion. DOUBLE PRECISION (not REAL): float32
--- round-trip would change the JSON representation of every score, breaking
--- byte-identical API payload parity (Gate 2 requirement).
+-- The three FUSED detector scores + fusion, plus Deep SAD (supplementary,
+-- XAI-only -- see §6.6b -- deliberately not part of final_risk_score).
+-- DOUBLE PRECISION (not REAL): float32 round-trip would change the JSON
+-- representation of every score, breaking byte-identical API payload parity
+-- (Gate 2 requirement).
 CREATE TABLE scores (
     application_id       TEXT NOT NULL REFERENCES applications(application_id),
     batch_id             INT NOT NULL REFERENCES batches(batch_id),
@@ -629,7 +719,11 @@ CREATE TABLE scores (
     hybrid_anomaly_score DOUBLE PRECISION, feature_pred_error DOUBLE PRECISION,
     edge_pred_error      DOUBLE PRECISION,
     subspace_if_score    DOUBLE PRECISION, group_scores JSONB,
-    dense_block_ip       DOUBLE PRECISION,
+    dense_block_score_relational DOUBLE PRECISION,
+    dense_block_score_mobile DOUBLE PRECISION,  -- per-relation, XAI transparency only
+    dense_block_score_ip     DOUBLE PRECISION,
+    dense_block_score_pincode DOUBLE PRECISION,
+    center_dist_score    DOUBLE PRECISION,  -- Deep SAD, supplementary, NOT in final_risk_score
     final_risk_score     DOUBLE PRECISION, label_source TEXT,
     risk_bucket          TEXT CHECK (risk_bucket IN ('High', 'Medium', 'Low')),
     feature_errors       JSONB,    -- per-feature error vector (XAI)

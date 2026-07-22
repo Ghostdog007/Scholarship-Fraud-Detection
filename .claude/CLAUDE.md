@@ -73,7 +73,8 @@ NIC fraud Detection Project/
 │   ├── synthetic_exposure_builder_v3.py# programmatic LOE exposure
 │   ├── hybrid_graphmcm_v3.py           # Hybrid GraphMCM detector (NeighborLoader in step 5)
 │   ├── subspace_if_v3.py               # per-group Isolation Forest (tabular backbone)
-│   ├── dense_block_detector_v3.py      # FRAUDAR-style peeling, shares_ip ONLY
+│   ├── dense_block_detector_v3.py      # FRAUDAR-style peeling, mobile+ip+pincode (IP-weighted max)
+│   ├── deepsad_detector_v3.py          # Deep SAD center-distance, XAI-only (not in fusion)
 │   ├── evt_scorer_v3.py                # EVT/GPD thresholds
 │   ├── self_training_loop_v3.py        # human-gated pseudo-labels
 │   ├── fusion_classifier_v3.py         # LOCKED score-level fusion
@@ -132,12 +133,14 @@ stale.
 | Model features | 44 (`N_FEATURES`; 24 nominal identifiers dropped, noid ablation 2026-07-15) |
 | Graph edge types / masks | 5 / 8 |
 | Graph hidden / emb dim | 128 / 64 · MLP hidden / Z dim 256 / 64 |
-| LOE margin / λ_edge / λ_exposure | 2.0 / 0.3 / 1.0 |
+| LOE margin / λ_edge / λ_exposure | data-derived (`_derive_loe_margin`, was fixed 2.0 — found ~3x too small for this embedding scale, changed 2026-07-22) / 0.3 / 1.0 · Stage 2 persistent LOE weight 0.15 (`LOE_STAGE2_WEIGHT`) |
 | Stage 1 / Stage 2 epochs | 80 / 120 · LR 1e-3 · batch 256 · seed 42 (`V4_SEED`) |
-| Encoder | `rgcn` (HAN available; drop-in regresses −0.091, 3-seed) |
+| Encoder | `rgcn`, `root_weight=False` since 2026-07-22 (HAN available; drop-in regresses −0.091, 3-seed) |
 | Incremental fine-tune | 10 epochs @ 1e-4, RGCN frozen |
-| Fusion weights (LOCKED) | subspace 1.0 / dense_ip 0.5 / hybrid 0.3 (`FUSION_W_*`) |
-| Dense-block gate | `shares_ip` only (`DENSE_BLOCK_RELATIONS=[1]`) |
+| Fusion (LOCKED) | max, not weighted-sum, since 2026-07-22: `minmax(max(minmax(subspace), minmax(dense_relational), minmax(hybrid)))` — no per-component weight (`FUSION_W_*` retired); Deep SAD `center_dist_score` is NOT a fusion input (XAI-only, see below) |
+| Dense-block gate | `shares_mobile`+`shares_ip`+`shares_pincode` since 2026-07-22 (`DENSE_BLOCK_RELATIONS=[0,1,4]`), IP-priority-weighted max (`DENSE_BLOCK_RELATION_WEIGHTS={0:0.3,1:1.0,4:0.2}`) — was `shares_ip` only |
+| RGCN root weight | `root_weight=False` since 2026-07-22 (`hybrid_graphmcm_v3.RGCNEncoder`) — default `True` let each node's own unmasked features leak into `h_n` via the self-transform, independent of MCM masking; disabling it made `h_n` pure neighbor aggregation. Validated on stress_testing_1 (0.153→0.201 overall, 0.029→0.078 mobile-ring) and on the real 15k set (5/5 V2 floors still pass, edge-dropout retention 2.34) |
+| Deep SAD (XAI-only) | Separate encoder/checkpoint (`deepsad_detector_v3.py`, `models/deepsad_v3.pth`), center-pull/exposure-push objective, no reconstruction loss. `center_dist_score` surfaced on XAI cards as a supplementary signal (>75th pct) — deliberately NOT in `FUSION_COMPONENTS`. Validated on stress_testing_1: 0.201 overall / 0.093 mobile-ring / 0.050 IP-ring, strongest single relational signal found this session. Fusion inclusion TESTED AND REJECTED 2026-07-22: candidate 4-way max fusion scored 0.4181 vs locked 3-way's 0.4182 (noise-level; Deep SAD won the argmax in <1% of nodes — the existing trio already covers its specialties too well for a 4th input to matter) (`DEEPSAD_*` in config_v3.py) |
 | Drift alert | KS p < 0.01 (`DRIFT_KS_THRESHOLD`) |
 | Confirmed-fraud weight | 3.0 · promotion needs ≥2 EVT signals |
 | EVT GPD shape valid range | [-0.5, 1.0] · centroid clean percentile 95 |

@@ -590,6 +590,237 @@ screen-by-screen operator walkthrough see `docs/OPERATIONS_RUNBOOK.md`.
 
 ## Changelog
 
+### 2026-07-22 — RGCN root_weight fix + Deep SAD supplementary signal (XAI cards)
+
+Two real architecture changes, both prototyped on `stress_testing_1` before
+touching production, both now live.
+
+**`root_weight=False` on Hybrid GraphMCM's RGCN encoder.** `RGCNConv`
+defaults to `root_weight=True`, so `h_n` (the "neighborhood context" fed to
+the MCM feature predictor) contained a direct learned self-transform of a
+node's own UNMASKED features, independent of the intentional masking in
+`_apply_masks()` — leaking self-signal around the mask for every connected
+node (isolated nodes were already unaffected, overridden by
+`isolated_embedding`). Disabling it makes `h_n` pure multi-relation neighbor
+aggregation — the actual MCM contract. stress_testing_1: overall PR-AUC
+0.153→0.201, mobile-ring 0.029→0.078, IP-ring 0.032→0.055, no low-degree
+regression (3-5 degree bucket 0.193→0.385, 6+ bucket 0.153→0.201). Real
+15k-dataset retrain: 5/5 V2 floors still pass, edge-dropout retention 2.34.
+Two other prototyped alternatives were tested and rejected first: a scoped
+Graph Matching Network (cross-graph attention against exposure clusters,
+0.147 overall — flat vs baseline) and a scoped UniGAD-inspired learned-
+subgraph + spectral-energy scorer (0.123 overall — worse, particularly on
+IP/mobile). See `outputs/stress_testing_1_{gmn,unigad,rootweightoff}_stats.json`.
+
+**Deep SAD center-distance (`src/deepsad_detector_v3.py`, new module).**
+Separate encoder, separate objective (Ruff et al., ICLR 2020): pulls real
+nodes toward a learned normal center, pushes topology exposure's synthetic
+archetypes away via an inverted-distance term — no reconstruction loss, so
+it doesn't inherit the MAR reconstruct-too-easily failure mode. stress_testing_1:
+0.201 overall / 0.093 mobile-ring / 0.050 IP-ring — the strongest single
+relational signal found this session, beating both hybrid_reconstruction and
+the root_weight fix on mobile-ring specifically. A companion per-cluster
+"nearest known archetype" prototype-match mechanism was tested alongside it
+and rejected (0.116, near-random on every category — no inter-prototype
+separation term). A further CARE-GNN-style self-adjusting neighbor filter
+(dormant until a relation sees ≥20 exposure examples, then loosens/tightens
+via reward feedback) was layered on top of Deep SAD and also rejected net
+(0.189 vs 0.201 — helped mother-name/pincode, cost IP/mobile through the
+shared encoder). Deliberately kept OUT of `FUSION_COMPONENTS` /
+`final_risk_score` — promoting a 4th signal into the locked fusion is a
+bigger structural decision than this session resolved. Instead surfaced on
+XAI cards (`xai_layer_v3.py`, `xai_card_html_v3.py`) as a supplementary
+"Deep SAD center-distance" panel + narrative sentence when >75th percentile,
+clearly marked as not driving the fused score, plus a `deepsad_percentile`
+column in scorecard exports. Pipeline: new `deepsad` step in
+`main_v3.py` between `dense_block` and `evt`.
+
+Both changes redlined under explicit lead direction (sole author); see
+`docs/AGENTS.md` staleness note below.
+
+**Follow-up, same day — Deep SAD fusion inclusion tested and rejected.**
+With the card wiring live, tested whether `center_dist_score` actually
+improves the fused score if added as a 4th max-fusion input (candidate:
+`max(subspace, dense_relational, hybrid, center_dist_score)`), re-scoring
+`stress_testing_1`'s already-computed columns (no retraining). Result:
+overall PR-AUC 0.4182 (locked 3-way) vs 0.4181 (4-way) — noise-level, not
+an improvement. Deep SAD won the argmax driver role in only 483 of 50,000
+nodes (<1%): the existing three detectors already cover their specialty
+categories so completely (e.g. mobile-ring alone reaches 0.53 PR-AUC under
+the current fusion, far above Deep SAD's standalone 0.09-0.10 there) that a
+4th max-input rarely gets to matter, even though Deep SAD carries real
+information on its own. Confirms the XAI-card-only placement was the right
+call rather than an open question — not promoting it into
+`FUSION_COMPONENTS`. See `outputs/stress_testing_1_fusion4_stats.json`.
+
+**Also tested and rejected this session, for the record:** Latent Outlier
+Exposure (Qiu et al., ICML 2022) — jointly re-estimating which real nodes
+are likely-contaminated during Deep SAD training, instead of the static
+`CENTROID_CLEAN_PERCENTILE=95` heuristic. At alpha=0.05 (matching production's
+existing percentile convention): net regression, 0.201→0.193 overall. At
+alpha=0.15 (matched to stress_testing_1's actual ~15% injected fraud rate):
+overall recovered to near-parity (0.199) with the best-ever mobile-ring
+result this session (0.105), at a small cost to IP/pincode/mother-name.
+Not adopted — alpha=0.15 matches this stress-test's deliberately inflated
+contamination rate, not production's real (unmeasured, presumably much
+lower) rate; using it as-is on real data would be an unjustified guess.
+See `outputs/stress_testing_1_loe_qiu*_stats.json`. Also note the acronym
+collision: this is unrelated to the project's own "Learning-from-Only-
+Exposure" (LOE).
+
+### 2026-07-22 — On-demand explanation cards + 3D rings (scale prep for 3-4M)
+
+Found while reviewing what happens to card/ring serving at 30-40L scale: the
+**3D ring was already fully on-demand** (`build_ring_html` is PG-indexed —
+`ego_neighbors`/`induced_subgraph_edges`, no full-graph load, computed live
+per `/ring` request) — nothing to fix there. The **explanation card was not**:
+`build_card_html` only worked for an application inside the pre-computed
+top-500 batch (`explanation_cards_v3.json`), and the batch generator
+(`run_xai()`) did a full-population rescan (percentile distributions, the
+whole graph's neighbor index) on every call regardless of how many cards it
+wrote — a cost that scales with population size and would dominate at
+3-4M rows.
+
+- **`src/xai_layer_v3.py` refactored**: population-wide setup (percentile
+  stats, neighbor index, degree counts, closed-form fusion contributions) is
+  now a **cached context** (`get_xai_context`, mtime-keyed on its source
+  files — same pattern as `confirmed_fraud_graph_store.py`'s `_ip_cache`),
+  built once per scoring cycle instead of once per call. The per-application
+  assembly logic that used to live inline in `run_xai()`'s loop is now a
+  standalone `_assemble_card(app_id, ctx)`, and both `run_xai()` (the
+  top-500 batch, unchanged externally) and the new **`build_card_for_app(app_id)`**
+  (any application, on demand) call the same function — so batch and
+  on-demand cards can never drift apart. Also skips loading the hybrid model
+  entirely for attention extraction when `ENCODER_ARCH != "han"` (RGCN, the
+  production default, never uses `beta_r` — this was previously loaded and
+  forward-passed unconditionally).
+- **`src/xai_card_html_v3.build_card_html()`** now falls back to
+  `build_card_for_app()` when the requested application isn't in the
+  pre-computed batch, so the `/card` API route serves a real card for
+  *any* scored application, not just the top 500.
+- **Verified**: on a 15k population, the first on-demand call pays the
+  context-build cost (~6.3s at this scale); every subsequent on-demand card
+  for a different arbitrary application — including the single lowest-ranked
+  one, rank 15,000 — costs ~1ms. A card for application #2,847,193 will cost
+  the same as one for #1.
+- **`src/xai_card_html_v3._graph_ctx`** (the ring's `.pt`-graph fallback, used
+  only when Postgres is unavailable) is now also mtime-keyed cached instead
+  of rebuilding the whole graph's neighbor index on every fallback request.
+- Static per-application HTML file generation (`render_cards()`, gated to
+  `suspicious_only=True` already) is unchanged — it was already bounded by
+  flag rate, not population size, so it wasn't the actual problem.
+
+### 2026-07-22 — Dense-block relational extension, max fusion, LOE margin fix (redlined, sole-author lead direction)
+
+Three locked-architecture changes, all validated on the stress_testing_1
+ablation before being adopted into production. `docs/AGENTS.md`'s hard-stop
+table needs a corresponding redline (dense-block relation gate, fusion
+formula, LOE margin are all named there) — flagged, not yet applied to that
+file.
+
+- **Dense-block extended from `shares_ip`-only to mobile + IP + pincode**
+  (`DENSE_BLOCK_RELATIONS = [0, 1, 4]`), each relation scored independently
+  then combined via an **IP-priority-weighted max**
+  (`DENSE_BLOCK_RELATION_WEIGHTS = {mobile: 0.3, ip: 1.0, pincode: 0.2}` —
+  `dense_block_score_relational`). Equal-weighting was tried first and
+  rejected: it gained more overall (0.268 PR-AUC) but let ordinary, non-fraud
+  density in mobile/pincode outrank true IP-ring members (IP PR-AUC collapsed
+  0.220→0.067) — unacceptable given IP is the dominant real fraud vector.
+  IP-priority-strong keeps IP detection ~unchanged (0.220→0.220) while mobile
+  goes from near-zero (0.030) to real signal (0.149-0.349 depending on
+  weighting). `src/dense_block_detector_v3.py`, `src/config_v3.py`.
+- **Fusion changed from a weighted sum to an unweighted max**:
+  `risk = minmax(max(minmax(subspace), minmax(dense_relational), minmax(hybrid)))`.
+  The weighted-sum was found to dilute whichever detector actually found the
+  fraud with near-random noise from the other two on every category tested
+  (e.g. mobile-ring: subspace alone 0.674 PR-AUC vs the old fused 0.349).
+  Overall PR-AUC on the ablation: 0.403 (sum) → 0.447 (max). A rank-based
+  (Borda) alternative was also tried and rejected — it scored worse (0.295),
+  likely because most detector outputs are exact zero for the vast majority
+  of rows, so rank-averaging gets dominated by tie blocks.
+  `src/fusion_classifier_v3.py`.
+- **XAI cards refactored for max-fusion attribution**: "share of a blend" no
+  longer means anything under max fusion, so `build_fusion_contributions`
+  now reports each detector's own normalised value + an `is_driver` flag
+  (the argmax) + `margin_over_next` (how clearly it won). Cards show a
+  DRIVER badge on the winning detector instead of a percentage-share bar;
+  the dense-block evidence section now names WHICH shared identity value
+  (mobile/IP/pincode) actually drove the flag. `src/xai_layer_v3.py`,
+  `src/xai_card_html_v3.py`, `src/export_v3.py` (scorecard columns renamed
+  `subspace_normalized`/`dense_relational_normalized`/`hybrid_normalized` +
+  `driving_margin`, replacing the old `*_share` columns).
+- **LOE topology-exposure margin fixed** — found via direct measurement,
+  not assumption, while testing why hybrid's ring detection stayed weak: the
+  locked `LOE_MARGIN=2.0` constant is ~3x SMALLER than even the REAL
+  population's own median embedding-to-centroid distance at this embedding
+  dimensionality (measured: real median ≈5.9, exposure mean ≈6.9, margin
+  2.0) — meaning exposure embeddings were already past the "margin" before
+  training even started, so the LOE warm-start term contributed exactly
+  `0.0000` throughout training regardless of formula (`exp(-sqrt(dist))`,
+  the old formula, and a fixed hinge were both tested and both stayed at
+  zero). Fixed in two parts: (1) `_loe_loss` is now a hinge
+  (`clamp(margin - dist, min=0)`) instead of the old exponential, which
+  saturates to ~0 once distances exceed a handful of units; (2) the margin
+  is now **derived from the current epoch's real embedding distribution**
+  (`_derive_loe_margin`, a percentile of real dist-to-centroid — same
+  principle as `CENTROID_CLEAN_PERCENTILE`, not a hand-picked constant) so
+  it self-calibrates to whatever scale the network's embedding space
+  actually lives at. Stage 2 also gained a small **persistent** LOE term
+  (`LOE_STAGE2_WEIGHT=0.15`, not decayed to zero) — previously Stage 2 had
+  no exposure term at all, so any separation Stage 1 bought could be freely
+  re-absorbed by 120 epochs of unconstrained reconstruction (dense synthetic
+  cliques reconstruct too easily — the MAR critique). Verified on a 15-epoch
+  test run: LOE now goes 0.85→0.25 in early epochs (genuine gradient-driven
+  separation, not saturation-from-init), decaying toward zero as embeddings
+  clear the margin — convergence, not failure to engage. `src/config_v3.py`,
+  `src/hybrid_graphmcm_v3.py` (`train`, `train_incremental`, and the
+  NeighborLoader mini-batch path all updated to keep the three training
+  loops in sync).
+
+Two prototype alternatives to Hybrid GraphMCM itself were tried and
+**rejected** on the same stress-test data before landing on the margin fix
+above — kept for the record, not adopted:
+- A GRACE/DGI-style contrastive encoder + embedding-redundancy anomaly
+  score: 0.097 PR-AUC at 120 epochs on GPU (vs hybrid's 0.276), no better
+  than a 25-epoch run — properly tested, genuinely underperforms for this
+  fraud shape.
+- A "predict from real vs. randomly-swapped neighbors" margin score on a
+  simplified MCM/RGCN: underperformed even its own model's raw error (0.148
+  vs 0.213) at 150 epochs on GPU — a clean, controlled negative result.
+
+Full numbers: `outputs/stress_testing_1_v2_stats.json` (dense-block +
+contrastive), `outputs/stress_testing_1_v2b_stats.json` (dense-block weight
+sweep), `outputs/stress_testing_1_v3_stats.json` (MCM-margin prototype).
+Prototype scripts (not part of the production module ownership):
+`scripts/prototype_v2_components.py`, `scripts/prototype_dense_weighted_max.py`,
+`scripts/prototype_mcm_margin.py`.
+
+### 2026-07-21 — 50k-application stress test ("stress_testing_1")
+
+Ad hoc scale/quality exercise, not a formal migration gate (that's the 3.5M
+K_CAP profiling in `docs/IMPLEMENTATION.md`). Generated a 50,000-row synthetic
+cohort (`scripts/generate_stress_test_dataset.py`) — 85% valid, 15% fraud
+across 4 tabular archetypes (fee inflation, income violation, age violation,
+mother-name collision) + 3 relational ring types (IP/mobile/pincode-sharing,
+147 rings, sizes 6-40), sampled/perturbed from the real 15k population per
+AGENTS.md Appendix B (no GAN/CTGAN/TVAE). Ground truth in
+`data/uploads/stress_testing_1_ground_truth.csv`.
+
+Ingested via the existing intake path (`upload-dataset` → Postgres batch
+`stress_testing_1`, 50k rows / 0 conflicts, 31s; `evaluate-dataset` → merge
+with the base 15k, rebuild features + identity graph, score with the current
+checkpoint, restore — 146s for ~65k merged nodes). Since the cohort endpoint
+only stages the pre-fusion hybrid score, `scripts/stress_test_1_analysis.py`
+separately computed subspace IF + dense-block-IP on the staged artifacts
+(same code paths, read-only) and applied the unmodified locked fusion formula
+to get the real three-detector picture: fused `risk_score_v3` PR-AUC 0.403 /
+ROC-AUC 0.800 at a 15% base rate; strongest on mobile-sharing rings (PR-AUC
+0.349, 98.6% of ring members in a top-5,000 queue) and identity-collision
+(0.187); weakest on pincode-sharing rings and the fee/age tabular archetypes
+(PR-AUC <0.05 across all three detectors — flagged as "observed, not yet
+explained," not diagnosed). Full numbers: `outputs/stress_testing_1_stats.json`,
+per-row scores in `outputs/stress_testing_1_full_scores.csv`.
+
 ### 2026-07-21 — V4-Scale: PostgreSQL system of record + Kubernetes-scale remodel
 
 Branch `V4-Scale`. Detection architecture unchanged (locked, see above);
@@ -638,6 +869,42 @@ every I/O boundary rebuilt for 30–40 lakh (3–4M) applications. Full detail:
 - Two real deployment bugs found and fixed via a live `docker compose up`
   test: `postgres:18`'s changed volume-mount convention, and the Dockerfile
   not copying `deploy/postgres/schema.sql` into the image.
+
+### 2026-07-21 — Flagged-pattern export + explicit incremental/full retrain choice
+
+Found and fixed a real gap while checking that "flag a pattern → the model
+learns its topology" actually holds end-to-end: `append_ring_to_topology_exposure()`
+correctly writes a promoted ring's **real** identity-graph edges to
+`synthetic_exposure_graph_v3.pt`, but every retrain the console/API dispatched
+(`patterns/promote`, `confirm-batch`, `pattern/ingest`, `training/decision`)
+called `train_incremental()`, which never reads that file — it only fine-tunes
+on isolated (edge-free) feature vectors, so a promoted ring's structure sat
+unused until someone manually ran a full `main_v3.py`. The topology-consuming
+path (`hybrid_graphmcm_v3.train()` Stage 1 LOE against `synthetic_exposure_graph_v3.pt`)
+already existed via the full pipeline — it just was never wired to the pattern
+flows.
+
+- **Explicit retrain-mode choice, everywhere a pattern retrain is dispatched.**
+  `POST /v3/supervisor/patterns/promote` now takes `mode: "incremental" |
+  "full_retrain"` (default unchanged: `incremental`). `"full_retrain"` dispatches
+  the existing `run_full_pipeline_task` (same job the admin **Full pipeline**
+  button uses) instead of the incremental fine-tune, so the RGCN actually
+  trains against the ring's topology when you want that.
+- **New `POST /v3/supervisor/patterns/retrain`** — retrain directly from the
+  flagged-history store, independent of the pending-queue promote flow. Covers
+  patterns already `PROMOTED` (topology already appended — this just (re)runs
+  training) as well as any still `CONFIRMED`/`SELECTED` in the selection
+  (promoted first). Empty `pattern_ids` = every non-rejected pattern in the
+  store. Console: **Flagged history** panel gets a retrain-mode dropdown +
+  smoke-test checkbox + **▶ Retrain selected** / **▶ Retrain all** buttons,
+  reusing the existing multi-select.
+- **Flagged-pattern export**, matching the application queue's export
+  affordance: **⤓ Export selected** / **⤓ Export all** buttons on the flagged-
+  history panel. New endpoints `GET /v3/supervisor/patterns/export/bulk` and
+  `.../export/selected?ids=…`, `build_pattern_bulk_export()` /
+  `build_pattern_selected_export()` in `src/export_v3.py` — zip of
+  `manifest.csv` + `patterns/<pattern_id>.json` (the full stored record),
+  same shape as the existing application-export bundles.
 
 ### 2026-07-15 — Supervisor CSV fraud-pattern intake (relational LOE)
 

@@ -32,30 +32,59 @@ raw applications (PostgreSQL `applications` / today: data/raw CSV)
    → graph_builder_v3           : 5-relation identity graph
        (shares_mobile, shares_ip, shares_father_name,
         shares_mother_name, shares_pincode)
-   → three detectors, all higher = more anomalous:
+   → three FUSED detectors, all higher = more anomalous:
        hybrid_graphmcm_v3       : 8-mask feature stream + RGCN graph stream
+                                  (root_weight=False since 2026-07-22 — pure
+                                  neighbor aggregation, no self-leak around
+                                  the MCM mask)
                                   → hybrid_anomaly_score
                                     = feature_pred_error + 0.3·edge_pred_error
        subspace_if_v3           : per-group IF (financial/identity/network)
-       dense_block_detector_v3  : FRAUDAR-style peeling, gated to shares_ip ONLY
+       dense_block_detector_v3  : FRAUDAR-style peeling over shares_mobile +
+                                  shares_ip + shares_pincode (independently
+                                  peeled, IP-priority-weighted max-combined —
+                                  since 2026-07-22; was shares_ip only)
    → evt_scorer_v3              : GPD tail thresholds (the only thresholds allowed)
-   → LOCKED fusion              : final_risk = minmax(1.0·subspace
-                                             + 0.5·dense_ip + 0.3·hybrid)
+   → LOCKED fusion              : final_risk = minmax(max(minmax(subspace),
+                                     minmax(dense_relational), minmax(hybrid)))
+                                   (since 2026-07-22; was a weighted sum)
    → self_training_loop_v3      : EVT-tail pseudo-labels, HUMAN-GATED
    → xai_layer_v3 / xai_card_html_v3 : evidence cards (JSON + HTML)
+
+A 4th detector, deepsad_detector_v3 (Deep SAD center-distance: separate
+RGCN encoder, center-pull/exposure-push, no reconstruction loss), runs
+alongside but is NOT fused — tested directly as a 4th max-fusion input and
+rejected (2026-07-22: candidate 4-way scored 0.4181 vs the locked 3-way's
+0.4182 on stress_testing_1, noise-level). It reads into xai_layer_v3 only,
+as a supplementary XAI-card signal, never into final_risk_score.
 ```
 
 Why each piece is locked (metrics in `HISTORY.md`, raw JSON in
 `outputs/ablation/locked_fusion_validation.json`):
 - **Subspace IF is the backbone** (3-seed mean connected PR-AUC 0.743).
-- **Dense-block exists only for IP rings** (+0.22 on IP_CONCENTRATION through
-  the fusion vs subspace alone; it misfires on legitimately-dense
-  mother-name/pincode relations, hence the gate).
-- **RGCN stays** (retirement disproven; best generalisation to novel topology).
-- **LightGBM fusion is gone** (14 positives destroyed calibrated components —
-  if you see LightGBM referenced as the fusion layer anywhere, that record is
-  stale).
+- **Dense-block extended beyond IP-only 2026-07-22** (shares_ip-only scored
+  mobile-sharing rings near zero, PR-AUC 0.030; extending to mobile+pincode
+  with IP-priority weighting — not equal weighting, which let ordinary
+  non-fraud density outrank true IP rings — fixed that while holding IP-ring
+  detection ~unchanged).
+- **RGCN stays, and its root_weight was fixed 2026-07-22** (retirement
+  disproven; best generalisation to novel topology; the root_weight=False
+  fix recovered signal the LOE-margin fix below had cost it).
+- **LOE margin was fixed 2026-07-22** (`LOE_MARGIN=2.0` was ~3x too small
+  for this embedding scale — the exposure-push term contributed
+  effectively zero gradient throughout training; replaced with a
+  data-derived margin + a small persistent Stage-2 term).
+- **LightGBM fusion is gone, and so is the weighted-sum fusion that
+  replaced it** (LightGBM: 14 positives destroyed calibrated components.
+  Weighted sum, superseded 2026-07-22: it diluted strong single-detector
+  signals — e.g. mobile-ring, subspace alone 0.674 vs summed fusion 0.349 —
+  replaced with an unweighted max). If you see LightGBM OR a `+` between
+  detector terms referenced as the fusion layer anywhere, that record is stale.
 - **HAN encoder available but off** (−0.091 vs RGCN, 3 seeds).
+- **Deep SAD exists but is XAI-only, not fused** (validated strongest single
+  relational signal this session on stress_testing_1, but tested directly
+  as a 4th fusion input and found to not improve the fused score — see
+  pipeline diagram above).
 
 Hyperparameter source of truth: `src/config_v3.py`. Naming rule: **source
 files keep `_v3` names** — "V4"/"V4-Scale" are capability/branch labels only.
@@ -94,7 +123,8 @@ One module per response. If a task spans two rows, stop and confirm scope.
 | Synthetic exposure | `src/synthetic_exposure_builder_v3.py` | features, promoted `loe_patterns` | exposure `.pt` artifacts |
 | Hybrid detector | `src/hybrid_graphmcm_v3.py` | features, graph, exposure | `hybrid_scores`, `models/hybrid_graphmcm_v3.pth` |
 | Subspace IF | `src/subspace_if_v3.py` | features | subspace scores |
-| Dense-block | `src/dense_block_detector_v3.py` | `shares_ip` edges + scores | `dense_block_ip` score |
+| Dense-block | `src/dense_block_detector_v3.py` | `shares_mobile`/`shares_ip`/`shares_pincode` edges | per-relation scores + `dense_block_score_relational` |
+| Deep SAD (XAI-only, not fused) | `src/deepsad_detector_v3.py` | features, graph, exposure | `center_dist_score`, `models/deepsad_v3.pth` |
 | EVT | `src/evt_scorer_v3.py` | score vectors | `evt_thresholds` |
 | Self-training | `src/self_training_loop_v3.py` | scores, EVT, `confirmed_fraud` | `pseudo_labels` |
 | Fusion | `src/fusion_classifier_v3.py` | three score vectors | `final_risk_score` |
@@ -192,6 +222,9 @@ Tracked in `TECHNICAL_REFERENCE_AND_SCALING.md` §15:
 4. Postgres HA / warm standby — NIC ops policy call.
 5. Batch cadence (yearly 3.5M vs rolling cohorts) — drives the retrain
    calendar.
-6. (carried from detection phase) 4th-seed confirmation of the locked fusion
-   — `locked_fusion_validation.json` `_meta` marks 3 seeds as "proposed,
-   pending."
+6. (carried from detection phase) Multi-seed confirmation of the locked
+   fusion — `locked_fusion_validation.json`'s 3-seed record predates the
+   2026-07-22 weighted-sum→max fusion change and the root_weight/LOE-margin
+   fixes to `hybrid_graphmcm_v3`; it validates a formula and an encoder that
+   no longer exist in production. Needs re-running against the CURRENT max
+   fusion + fixed encoder before it can be cited as confirming today's system.

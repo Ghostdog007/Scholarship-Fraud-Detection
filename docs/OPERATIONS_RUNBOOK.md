@@ -84,8 +84,10 @@ This is the reviewer's main screen.
   network preview drawn from the cohort's own graph. **3D ring**, **ego-graph**,
   and **export** (single / all / selected) all work on cohort apps too. What's
   genuinely different pre-commit (labeled "PREVIEW · pre-fusion" on the card,
-  never silently hidden): no EVT-threshold reason codes or fusion-composition
-  breakdown (subspace IF / dense-block only exist after a committed run), and
+  never silently hidden): no EVT-threshold reason codes or fusion-driver
+  attribution (subspace IF / dense-block / hybrid RGCN scores only exist
+  after a committed run — the fused score is the single highest of the
+  three, not a proportional split), and
   no Confirm-fraud / Mark-false-positive buttons (that write to the committed
   features file, which doesn't have this app yet). Flag-for-LOE and
   label/retrain stay gated the same way — commit the cohort first (Decide →
