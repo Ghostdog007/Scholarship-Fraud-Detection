@@ -38,7 +38,11 @@ raw applications (PostgreSQL `applications` / today: data/raw CSV)
                                   neighbor aggregation, no self-leak around
                                   the MCM mask)
                                   → hybrid_anomaly_score
-                                    = feature_pred_error + 0.3·edge_pred_error
+                                    = feature_pred_error + LAMBDA_EDGE_SCORE·edge_pred_error
+                                    (LAMBDA_EDGE_SCORE=0.0 since 2026-07-23 —
+                                    edge_pred_error still trains and is still
+                                    computed/available for XAI, just excluded
+                                    from the ranking score; see below)
        subspace_if_v3           : per-group IF (financial/identity/network)
        dense_block_detector_v3  : FRAUDAR-style peeling over shares_mobile +
                                   shares_ip (independently peeled,
@@ -99,6 +103,21 @@ Why each piece is locked (metrics in `HISTORY.md`, raw JSON in
   replaced with an unweighted max). If you see LightGBM OR a `+` between
   detector terms referenced as the fusion layer anywhere, that record is stale.
 - **HAN encoder available but off** (−0.091 vs RGCN, 3 seeds).
+- **`edge_pred_error` dropped from the hybrid score, not from training,
+  2026-07-23** (`LAMBDA_EDGE_SCORE=0.0`, decoupled from the training-loss
+  weight `LAMBDA_EDGE=0.3` which is unchanged). Showed no usable signal on
+  any of its 3 designed relational categories on `stress_testing_1`
+  (IP/MOBILE/PINCODE cluster PR-AUC 0.011–0.023, noise-floor), and actively
+  diluted `feature_pred_error`'s real MOBILE_CLUSTER signal (0.268 alone vs
+  0.017 combined) — consistent with the documented MAR critique (dense
+  cliques predict/reconstruct too easily, so ring members' edges are
+  *easier*, not harder, to predict). Dropping it improved 6/7 categories,
+  replicated on an independently-seeded second population
+  (`stress_testing_2`). **Caveat, not yet resolved:** on the real 15k
+  population (no ground truth) the reorder is substantial — old/new
+  correlation 0.56, top-100 overlap 6/100 — so this is validated against
+  synthetic ground truth only, not confirmed as an improvement for the real
+  population. See README changelog 2026-07-23.
 - **Deep SAD exists but is XAI-only, not fused** (validated strongest single
   relational signal this session on stress_testing_1, but tested directly
   as a 4th fusion input and found to not improve the fused score — see
@@ -133,6 +152,28 @@ subspace IF / EVT / fusion / XAI logic, the frontend — **does not change**.
 ## 3. Module ownership
 
 One module per response. If a task spans two rows, stop and confirm scope.
+
+**Stable interfaces (added 2026-07-23, additive/non-breaking):** `src/interfaces/`
+holds one thin re-export module per row below (`feature_engine.py`,
+`graph_builder.py`, `synthetic_exposure.py`, `hybrid_detector.py`,
+`subspace_if.py`, `dense_block.py`, `deepsad.py`, `evt.py`, `self_training.py`,
+`fusion.py`, `xai.py`, `evaluate.py`). New code should import a layer's public
+functions from its interface module, not the concrete `_v3` file directly —
+if a concrete file is ever renamed or split, only that one interface's import
+line changes, not every call site. Purely additive: existing call sites into
+the `_v3` modules are unchanged and keep working. `src/db/`, `src/api/`,
+`checkpoint_manager.py`, `retraining_orchestrator.py`, and `model_registry.py`
+already have unversioned names and have no interface module.
+
+**Deploy gate (added 2026-07-23, additive):** `src/deploy_gate.py` +
+`src/build_held_out_set.py` are a manual pre-promotion quality gate — a
+candidate checkpoint must not regress (beyond the ±0.03–0.04 noise floor) on
+any held-out fraud category vs. the currently-live checkpoint before
+`checkpoint_manager.validate_and_hotswap()` is called. Held-out set is
+versioned by `schema_version = "v3_<N_FEATURES>"` and built from the existing
+`data/uploads/stress_testing_1.csv` ground-truth cohort. See
+`MAINTAINER_PLAYBOOK.md` Recipe 3. `model_registry.log_run()` now also
+records `git_commit` and `schema_version` on every run for traceability.
 
 | Module | File(s) | Reads | Writes |
 |---|---|---|---|
@@ -258,3 +299,13 @@ Tracked in `TECHNICAL_REFERENCE_AND_SCALING.md` §15:
    fixes to `hybrid_graphmcm_v3`; it validates a formula and an encoder that
    no longer exist in production. Needs re-running against the CURRENT max
    fusion + fixed encoder before it can be cited as confirming today's system.
+7. Real-population validation of the 2026-07-23 `LAMBDA_EDGE_SCORE=0.0`
+   change — the synthetic-population evidence (2 independently-seeded
+   stress cohorts) is solid, but on the real 15k population the reorder is
+   substantial (old/new `hybrid_anomaly_score` correlation 0.56, top-100
+   overlap 6/100) and there is no ground truth there to confirm the
+   reordering is actually an improvement, not just a different set of
+   false positives/negatives. Needs a real-outcome check (confirmed-fraud
+   agreement, or a supervisor review pass on the reordered top-N) before
+   this can be called validated end-to-end rather than "validated against
+   synthetic ground truth only."

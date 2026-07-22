@@ -5,6 +5,11 @@
 > and §10 (hard stops). This README is a human-readable overview; AGENTS.md is
 > the authoritative contract for all implementation decisions.
 
+> **New to this codebase?** Start with `docs/PROJECT_OVERVIEW.md` for a
+> conceptual, no-jargon walkthrough of what the system does and why it's
+> built this way. For "how do I add a feature / detector / schema change"
+> task recipes, see `docs/MAINTAINER_PLAYBOOK.md`.
+
 ---
 
 ## V4 — Final Detection Architecture (this branch, LOCKED)
@@ -589,6 +594,51 @@ screen-by-screen operator walkthrough see `docs/OPERATIONS_RUNBOOK.md`.
 ---
 
 ## Changelog
+
+### 2026-07-23 — hybrid_anomaly_score drops edge_pred_error's contribution (redlined, lead direction)
+
+`LAMBDA_EDGE_SCORE` (new, `config_v3.py`) decouples the inference-time score
+weight on `edge_pred_error` from `LAMBDA_EDGE` (unchanged at 0.3, still the
+training-loss weight for the edge-prediction head). `hybrid_anomaly_score =
+feature_pred_error + LAMBDA_EDGE_SCORE * edge_pred_error`, with
+`LAMBDA_EDGE_SCORE = 0.0` — was effectively `LAMBDA_EDGE` (0.3) prior to this
+change.
+
+Evidence: `edge_pred_error` showed no usable signal on any of its 3 designed
+relational categories on a held-out stress cohort (`stress_testing_1`) —
+IP_CLUSTER/MOBILE_CLUSTER/PINCODE_CLUSTER PR-AUC 0.011-0.023, at or below
+what a random ranking would score — and on MOBILE_CLUSTER specifically it
+actively diluted `feature_pred_error`'s real standalone signal (0.268 alone
+vs 0.017 combined). Mechanistically consistent with the documented MAR
+critique (`.claude/CLAUDE.md` "Known Structural Weaknesses": dense cliques
+reconstruct/predict too easily) — ring members' edges are *easier*, not
+harder, for the RGCN to predict, so `edge_pred_error` points the wrong way
+for exactly the fraud shape it was meant to specialise in.
+
+Dropping the term from the score improved 6/7 held-out categories (mean
+PR-AUC 0.017 -> 0.056), with the only regression (IP_CLUSTER, -0.0007)
+smaller than the documented GPU noise floor. **Replicated on a second,
+independently-seeded stress population** (`stress_testing_2`, different
+seed, different sampled rows/rings, same archetype proportions): same sign
+on every one of the 7 categories, mean PR-AUC 0.017 -> 0.048. Raw stdout:
+`outputs/ablation_lambda_edge_v3_44.json`,
+`outputs/ablation_lambda_edge_v3_44_stress2.json`.
+
+Training is unaffected — `LAMBDA_EDGE` (the loss weight) is untouched, so
+the edge-prediction head still trains and `edge_pred_error` is still
+computed and available for XAI narration; it is excluded only from the
+ranking score. Untested: whether removing the edge-prediction objective
+from training entirely (not just from the score) would change embedding
+quality — a separate question, not addressed by this change.
+
+**Real-population caveat, stated plainly because it matters:** on the real
+15k population (no ground truth available), the new formula reorders
+rankings substantially — old vs. new `hybrid_anomaly_score` correlation
+0.56, top-100-most-suspicious overlap only 6/100. The synthetic evidence
+above supports that the new formula is better at catching the fraud shapes
+it was tested against; it does NOT by itself confirm the reordering is an
+improvement for the real population, since no ground truth exists there to
+check against. Flagged, not resolved, by this change.
 
 ### 2026-07-22 — Explainability build-out: RGCN relation ablation, EVT empirical rates, ring fixes, cohort-preview signal drivers
 

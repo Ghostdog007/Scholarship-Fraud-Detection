@@ -40,6 +40,7 @@ from src.config_v3 import (
     INCREMENTAL_EPOCHS,
     INCREMENTAL_LR,
     LAMBDA_EDGE,
+    LAMBDA_EDGE_SCORE,
     LAMBDA_EXPOSURE,
     LOE_MARGIN,
     LOE_STAGE2_WEIGHT,
@@ -524,7 +525,11 @@ def compute_score_frame(
             target[ei[1], rel_id] = 1.0
     edge_pred_error = F.binary_cross_entropy(edge_prob, target, reduction="none").mean(dim=1)
 
-    hybrid_anomaly_score = feature_pred_error + LAMBDA_EDGE * edge_pred_error
+    # LAMBDA_EDGE_SCORE (0.0), not LAMBDA_EDGE (0.3, still the training-loss
+    # weight) -- see config_v3.py comment, README changelog 2026-07-23.
+    # edge_pred_error is still computed and returned below for XAI use; it is
+    # excluded from the ranking score itself.
+    hybrid_anomaly_score = feature_pred_error + LAMBDA_EDGE_SCORE * edge_pred_error
 
     def _norm(t: torch.Tensor) -> np.ndarray:
         v = t.cpu().numpy()
@@ -966,7 +971,8 @@ def score_sampled(fanout: tuple[int, int] = (25, 10), batch_size: int = 1024,
     feature_pred_error = per_feat_err.mean(dim=1)
     edge_pred_error = F.binary_cross_entropy(
         prob_all, target_global, reduction="none").mean(dim=1)
-    hybrid = feature_pred_error + LAMBDA_EDGE * edge_pred_error
+    # LAMBDA_EDGE_SCORE, not LAMBDA_EDGE -- see compute_score_frame() above.
+    hybrid = feature_pred_error + LAMBDA_EDGE_SCORE * edge_pred_error
 
     def _norm(t: torch.Tensor) -> np.ndarray:
         v = t.numpy()

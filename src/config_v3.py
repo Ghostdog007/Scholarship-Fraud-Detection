@@ -40,7 +40,26 @@ LOE_MARGIN      = 2.0
 # in BOTH a 30-epoch and a 150-epoch prototype run — an exponential decay is not a
 # usable training signal once distances exceed a handful of units).
 LOE_STAGE2_WEIGHT = 0.15
-LAMBDA_EDGE     = 0.3
+LAMBDA_EDGE     = 0.3   # TRAINING loss weight only (edge-prediction head) -- unchanged,
+                        # untested whether removing it from training hurts embedding quality
+# Inference-time score-composition weight (added 2026-07-23, redlined under
+# explicit lead direction). hybrid_anomaly_score = feature_pred_error +
+# LAMBDA_EDGE_SCORE * edge_pred_error -- was LAMBDA_EDGE (0.3) prior to this
+# change, now decoupled from the training-loss weight above. Evidence:
+# edge_pred_error showed NO usable signal on any of its 3 designed ring
+# categories (IP/MOBILE/PINCODE clusters, held-out PR-AUC 0.011-0.023, at or
+# below noise floor) and actively diluted feature_pred_error's real
+# MOBILE_CLUSTER signal (0.268 standalone vs 0.017 combined). Dropping it
+# from the score improved 6/7 categories (mean PR-AUC 0.017->0.056) with only
+# a negligible regression on IP_CLUSTER (-0.0007), replicated on a second,
+# independently-seeded stress population (mean 0.017->0.048, same sign on
+# every category). See outputs/ablation_lambda_edge_v3_44.json and
+# outputs/ablation_lambda_edge_v3_44_stress2.json for raw stdout. Does NOT
+# affect training (LAMBDA_EDGE above is untouched) -- the edge-prediction
+# head still trains and edge_pred_error is still computed/available for XAI,
+# it is simply excluded from the ranking score. See README changelog
+# 2026-07-23.
+LAMBDA_EDGE_SCORE = 0.0
 LAMBDA_EXPOSURE = 1.0
 EPOCHS_STAGE1   = 80
 EPOCHS_STAGE2   = 120

@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.xai_layer_v3 import _trigger_description, _fmt_raw
+
 CARDS_JSON = Path("outputs/explanation_cards_v3.json")
 RISK_CSV   = Path("outputs/risk_scores_v3.csv")
 DENSE_CSV  = Path("outputs/dense_block_scores_v3.csv")
@@ -39,10 +41,13 @@ OUT_DIR    = Path("outputs/cards")
 
 # risk → colour bucket (semantic, separate from any brand accent)
 RISK_LOW, RISK_MED, RISK_HIGH = "#2c7da0", "#f4a261", "#e5383b"
+# Plain-language labels (2026-07-23 readability pass), matching xai_layer_v3.py's
+# DETECTOR_LABELS — technical name kept in the hover tooltip (_model_pill's title=),
+# not the visible pill text.
 DETECTOR_ORDER = [
-    ("subspace",         "Tabular subspace", "#e5383b"),
-    ("dense_relational", "Shared-identity dense-block", "#f72585"),
-    ("hybrid",           "Relational RGCN", "#4cc9f0"),
+    ("subspace",         "Profile pattern", "#e5383b"),
+    ("dense_relational", "Shared-identity cluster", "#f72585"),
+    ("hybrid",           "Network pattern", "#4cc9f0"),
 ]
 GROUP_LABELS = {"financial": "Financial", "identity": "Identity", "network": "Network"}
 EDGE_LABELS = {
@@ -63,7 +68,17 @@ DETECTOR_PILL = {k: (lbl, col) for k, lbl, col in DETECTOR_ORDER}
 # to DETECTOR_ORDER (that list drives the fusion-composition footer, which must
 # stay exactly the 3 locked fusion inputs). It still gets its own pill colour so
 # its evidence line can be visually distinguished from the fused-score drivers.
-DETECTOR_PILL["deepsad"] = ("Deep SAD (supplementary)", "#9d4edd")
+DETECTOR_PILL["deepsad"] = ("Second opinion (supplementary)", "#9d4edd")
+
+# Technical model name, shown only in the pill's hover tooltip (2026-07-23
+# readability pass) — visible pill text stays plain, precise name is one
+# hover away for anyone who wants it.
+DETECTOR_TECH_NAME = {
+    "subspace":         "tabular subspace Isolation Forest",
+    "dense_relational":  "FRAUDAR-style dense-block detector",
+    "hybrid":           "Hybrid GraphMCM (RGCN)",
+    "deepsad":          "Deep SAD",
+}
 
 
 def _model_pill(key: str | None) -> str:
@@ -71,8 +86,9 @@ def _model_pill(key: str | None) -> str:
     if key not in DETECTOR_PILL:
         return ""
     lbl, col = DETECTOR_PILL[key]
+    tech = DETECTOR_TECH_NAME.get(key, lbl)
     return (f"<span class='mpill' style='color:{col};border-color:{col}55;"
-            f"background:{col}1a' title='source model: {lbl}'>{lbl}</span>")
+            f"background:{col}1a' title='source model: {lbl} (technical: {tech})'>{lbl}</span>")
 
 
 def _model_trace(card: dict) -> str:
@@ -445,11 +461,11 @@ def _signal_bars(card: dict) -> str:
         thr_pct = 100.0 * float(d["threshold"]) if False else None  # thresholds are score-space
         fill = f"linear-gradient(90deg,#e5383b,#ff6d70)" if crossed else \
                f"linear-gradient(90deg,#f4a261,#ffbf85)"
-        chip = " &nbsp;<span class='flagchip'>THRESHOLD CROSSED</span>" if crossed else ""
-        note = (f"observed <span class='num'>{d['score']:.3f}</span> vs EVT threshold "
-                f"<span class='num'>{d['threshold']:.3f}</span>{chip}") if "threshold" in d else \
-               "below its EVT threshold"
-        rows.append(_bar(f"{GROUP_LABELS.get(g, g)} subspace detector {_model_pill('subspace')}",
+        chip = " &nbsp;<span class='flagchip'>RARE — AUTO-FLAGGED</span>" if crossed else ""
+        note = (f"this value ({d['score']:.3f}) is past the rarity cutoff "
+                f"({d['threshold']:.3f}) for this check{chip}") if "threshold" in d else \
+               "not yet rare enough to auto-flag"
+        rows.append(_bar(f"{GROUP_LABELS.get(g, g)} profile check {_model_pill('subspace')}",
                          f"{pct:.1f}<span style='color:var(--faint)'>pct</span>",
                          pct, fill, note))
 
@@ -460,19 +476,19 @@ def _signal_bars(card: dict) -> str:
         by_rel = dib.get("by_relation", {})
         top_rel = max(by_rel.items(), key=lambda kv: kv[1])[0] if by_rel else None
         rel_label = {"mobile": "mobile number", "ip": "IP address"}.get(top_rel, "identity value")
-        rows.append(_bar(f"Shared-identity dense-block {_model_pill('dense_relational')}",
+        rows.append(_bar(f"Shared-identity cluster check {_model_pill('dense_relational')}",
                          f"{dib['percentile']:.1f}<span style='color:var(--faint)'>pct</span>",
                          dib["percentile"], "linear-gradient(90deg,#b5187f,#f72585)",
-                         f"member of a dense shared-{rel_label} cluster"))
+                         f"part of a tightly-linked group sharing one {rel_label}"))
 
     # 2b) Deep SAD center-distance — SUPPLEMENTARY, not a fusion input. Only
     # shown when notably elevated (matches the narrative's 75th-pct cutoff).
     dsad = ev.get("deepsad") or {}
     if dsad.get("percentile") is not None and dsad["percentile"] >= 75.0:
-        rows.append(_bar(f"Deep SAD center-distance {_model_pill('deepsad')}",
+        rows.append(_bar(f"Second-opinion check {_model_pill('deepsad')}",
                          f"{dsad['percentile']:.1f}<span style='color:var(--faint)'>pct</span>",
                          dsad["percentile"], "linear-gradient(90deg,#5a189a,#9d4edd)",
-                         "supplementary signal — informative context, does not drive the fused score"))
+                         "a separate, independently-trained model agrees this looks unusual — supporting context, does not change the score"))
 
     # 2c) RGCN per-relation ablation — the production encoder's answer to
     # "which relation drove the neighbourhood-based expectation" (post-hoc;
@@ -492,12 +508,13 @@ def _signal_bars(card: dict) -> str:
         breakdown = ", ".join(
             f"{EDGE_LABELS.get(r, r).split()[0]} {d:.4f}"
             for r, d in sorted(positive.items(), key=lambda kv: -kv[1])
-        ) or "no relation improved fit on removal"
-        rows.append(_bar(f"Neighbourhood-expectation driver {_model_pill('hybrid')}",
+        ) or "no connection type improved fit on removal"
+        rows.append(_bar(f"Why the network looked off {_model_pill('hybrid')}",
                          f"{share_pct:.0f}<span style='color:var(--faint)'>% share</span>",
                          share_pct, "linear-gradient(90deg,#0d5c63,#4cc9f0)",
-                         f"removing {rel_label} links would improve reconstruction fit most "
-                         f"(Δ{abl.get('top_delta', 0.0):.4f}) — post-hoc ablation, not a fusion input · {breakdown}"))
+                         f"{rel_label} connections are the biggest reason this application's profile "
+                         f"looked unusual (fit improvement {abl.get('top_delta', 0.0):.4f} if set aside) "
+                         f"— context only, technical: relation-ablation check · {breakdown}"))
 
     # 3) fusion composition footer — max fusion (2026-07-22): shows each
     # detector's own normalised value, DRIVER marks the one that won.
@@ -511,11 +528,13 @@ def _signal_bars(card: dict) -> str:
             for lbl, v, c, drv in items
         )
         comp = (f"<div class='sig-note' style='margin-top:18px;padding-top:12px;"
-                f"border-top:1px solid var(--border)'><b style='color:var(--muted)'>Fusion "
-                f"composition:</b> {parts}. &nbsp;risk = minmax(max(subspace, dense-relational, hybrid)).</div>")
+                f"border-top:1px solid var(--border)'><b style='color:var(--muted)'>How the "
+                f"checks combine:</b> {parts} — whichever check is most suspicious sets the "
+                f"final score (technical: <code>risk = minmax(max(subspace, dense-relational, hybrid))</code>).</div>")
 
     intro = ("<p style='font-size:12px;color:var(--muted);margin:0 0 16px'>What is pushing this "
-             "application's score, by detector. The marker on a track is its EVT flag threshold.</p>")
+             "application's score, by check. Each bar is how unusual this application looks on that "
+             "one check, compared to every other applicant.</p>")
     return intro + "".join(rows) + comp
 
 
@@ -541,9 +560,9 @@ def _reason_codes(card: dict) -> str:
         rows.append(
             f"<div class='reason'><div class='rk'>{rank:02d}</div><div class='rc'>"
             f"<div class='rt'>{_esc(c['label']).capitalize()} {_model_pill(c.get('source_model'))}</div>"
-            f"<div class='rd'>Crossed its extreme-value threshold — observed "
-            f"<span class='num'>{c['observed']:.3f}</span> vs threshold "
-            f"<span class='num'>{c['threshold']:.3f}</span>.</div></div></div>")
+            f"<div class='rd'>Statistically rare — this application's value "
+            f"(<span class='num'>{c['observed']:.3f}</span>) is past the rarity cutoff "
+            f"(<span class='num'>{c['threshold']:.3f}</span>) fitted for this signal.</div></div></div>")
         rank += 1
     ip_conn = next((c for c in ev.get("graph_connections", [])
                     if c["edge_type"] == "shares_ip" and c.get("count", 0) > 0), None)
@@ -559,8 +578,8 @@ def _reason_codes(card: dict) -> str:
         rank += 1
     if not rows:
         rows.append("<div class='reason'><div class='rk'>—</div><div class='rc'>"
-                    "<div class='rt'>No extreme-value threshold crossed</div>"
-                    "<div class='rd'>Card provided for ranking context.</div></div></div>")
+                    "<div class='rt'>No statistical rarity threshold crossed</div>"
+                    "<div class='rd'>Nothing here is rare enough to auto-flag — card shown for ranking context only.</div></div></div>")
     return "".join(rows)
 
 
@@ -613,15 +632,26 @@ def _field_accordions(card: dict) -> str:
             vside = "left:50%" if val >= 0 else f"right:50%;left:auto"
             eside = "left:50%" if exp >= 0 else f"right:50%;left:auto"
             vcol = RISK_HIGH if abs(val) >= abs(exp) else RISK_MED
+            # Raw (pre-scaling) value when one exists (2026-07-23 readability pass)
+            # — bars still use the scaled val/exp for visual proportion (that's
+            # what the model actually compared), but the printed NUMBER prefers
+            # the human-meaningful one. "expected" stays in scaled space (no
+            # persisted raw-scale inverse for it), so a raw actual is paired with
+            # a qualitative "expected" note rather than a mismatched-unit number.
+            raw_value = f.get("raw_value")
+            raw_unit  = f.get("raw_unit")
+            have_raw  = raw_value is not None and raw_unit is not None
+            val_label = _fmt_raw(raw_value, raw_unit) if have_raw else f"{val:+.3f}"
+            exp_label = "different figure expected" if have_raw else f"{exp:+.3f}"
             cmp_html = f"""
             <div class="cmp-row"><span class="cmp-lab">declared</span>
               <div class="cmp-bar"><span class="cmp-mid"></span>
                 <i style="width:{vw:.0f}%;{vside};background:{vcol}"></i></div>
-              <span class="cmp-v" style="color:#ffbf85">{val:+.3f}</span></div>
+              <span class="cmp-v" style="color:#ffbf85">{val_label}</span></div>
             <div class="cmp-row"><span class="cmp-lab">expected</span>
               <div class="cmp-bar"><span class="cmp-mid"></span>
                 <i style="width:{ew:.0f}%;{eside};background:var(--low)"></i></div>
-              <span class="cmp-v" style="color:var(--low)">{exp:+.3f}</span></div>"""
+              <span class="cmp-v" style="color:var(--low)">{exp_label}</span></div>"""
             vp = f.get("value_percentile")
             med = f.get("population_median")
             stand = ""
@@ -634,12 +664,17 @@ def _field_accordions(card: dict) -> str:
             # population to rank against). Without it, drop the "declared value is
             # {stand}, while" lead-in entirely rather than leave a grammatical gap.
             lead = (f"the declared value is {stand}"
-                    + (f" (population median {med:+.3f})" if med is not None else "")
+                    + (f" (population median {med:+.3f})" if med is not None and not have_raw else "")
                     + ", while ") if stand else ""
+            expected_clause = (
+                f"expected a {direction.replace('above', 'higher').replace('below', 'lower')} figure here"
+                if have_raw else
+                f"expected about <span class='num'>{exp:+.3f}</span>; the declared value is "
+                f"<b>{direction}</b> expectation"
+            )
             why = (f"<div class='why'><b>What this means:</b> {lead}the model — reading the rest "
                    f"of the record and the application's network "
-                   f"context — expected about <span class='num'>{exp:+.3f}</span>; the declared value is "
-                   f"<b>{direction}</b> expectation"
+                   f"context — {expected_clause}"
                    + (f", and this miss is larger than <span class='num'>{ep:.1f}%</span> of all "
                       f"applications on this field" if ep is not None else "") + ".</div>")
         open_cls = " open" if i == 0 else ""
@@ -694,11 +729,11 @@ def _action(card: dict) -> str:
               "income certificate). Review IP-linked applications together before approval.")
     elif crossed:
         at, col = "Secondary verification", "#f4a261"
-        ab = ("Not auto-flagged (signal agreement below the promotion requirement), but a crossed "
-              "threshold warrants secondary verification before disbursement.")
+        ab = ("Not automatically flagged (fewer independent checks agreed than required for that), "
+              "but one check came back rare enough to warrant a second look before disbursement.")
     else:
         at, col = "No hold required", "#4ade80"
-        ab = "No statistical flag crossed — card provided for ranking context."
+        ab = "Nothing here is statistically rare enough to flag — card shown for ranking context only."
     bg = f"linear-gradient(180deg,{col}1a,{col}08)"
     default_type = _suggest_fraud_type(card)
     opts = "".join(
@@ -745,6 +780,8 @@ def _right_pane_preview(card: dict) -> str:
           f"Anomaly score <b class='num'>{score:.4f}</b> (higher = more anomalous)"
     headline = ("Highest-risk application in this cohort" if rank == 1
                 else "Elevated anomaly score" if score >= 0.5 else "Ranking context")
+    plain = card.get("plain_summary")
+    plain_html = f"<div class='sub' style='margin-top:4px;color:var(--fg2)'>{_esc(plain)}</div>" if plain else ""
     commit_note = (
         "<div class='action' style='background:linear-gradient(180deg,#4cc9f01a,#4cc9f008);"
         "border:1px solid #4cc9f047'>"
@@ -760,7 +797,7 @@ def _right_pane_preview(card: dict) -> str:
       <div class="riskhead">
         <div class="gauge" style="background:conic-gradient({gcol} {score*100:.0f}%,rgba(255,255,255,.07) 0)">
           <b>{score:.2f}</b></div>
-        <div class="rh-txt"><div class="big">{headline}</div><div class="sub">{sub}</div></div>
+        <div class="rh-txt"><div class="big">{headline}</div><div class="sub">{sub}</div>{plain_html}</div>
       </div>
       <div class="section-t">Why it flagged — ranked reason codes</div>
       {_reason_codes(card)}
@@ -788,12 +825,14 @@ def _right_pane(card: dict) -> str:
           f"Anomaly score <b class='num'>{score:.4f}</b> (higher = more anomalous)"
     headline = ("Highest-risk application in the batch" if rank == 1
                 else "Elevated fraud risk" if score >= 0.5 else "Ranking context")
+    plain = card.get("plain_summary")
+    plain_html = f"<div class='sub' style='margin-top:4px;color:var(--fg2)'>{_esc(plain)}</div>" if plain else ""
     return f"""
     <div class="card"><div class="card-b">
       <div class="riskhead">
         <div class="gauge" style="background:conic-gradient({gcol} {score*100:.0f}%,rgba(255,255,255,.07) 0)">
           <b>{score:.2f}</b></div>
-        <div class="rh-txt"><div class="big">{headline}</div><div class="sub">{sub}</div></div>
+        <div class="rh-txt"><div class="big">{headline}</div><div class="sub">{sub}</div>{plain_html}</div>
       </div>
       <div class="section-t">Why it flagged — ranked reason codes</div>
       {_reason_codes(card)}

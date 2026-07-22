@@ -36,6 +36,10 @@ mlflow.db
 # Ablation checkpoint backup scratch
 .ablation_backup/
 
+# Canonical-file snapshots from build_held_out_set.py's backup/restore cycle
+# (large, reproducible, ephemeral — same category as backup_68feat/ below)
+data/backups/
+
 # Pre-commit cache
 .pre-commit-cache/
 

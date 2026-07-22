@@ -339,9 +339,16 @@ re-absorbed by 120 epochs of unconstrained reconstruction.
 5. Compare predicted vs. declared: `feature_pred_error` = mean absolute error
    across all 44 features; `edge_pred_error` = binary cross-entropy between
    predicted and actual edge presence.
-6. `hybrid_anomaly_score = feature_pred_error + 0.3·edge_pred_error`. **A high
-   score means: given everything else about this applicant and their network,
-   the model didn't expect the values they declared.**
+6. `hybrid_anomaly_score = feature_pred_error + LAMBDA_EDGE_SCORE·edge_pred_error`,
+   with `LAMBDA_EDGE_SCORE = 0.0` since 2026-07-23 (was 0.3, i.e. effectively
+   `feature_pred_error` alone in the score today — `edge_pred_error` showed no
+   usable signal on any of its 3 designed relational categories and diluted a
+   real one, see `AGENTS.md` §1/§7 open decision 7; still computed and
+   available for XAI). **A high score means: given everything else about this
+   applicant and their network, the model didn't expect the values they
+   declared.** `LAMBDA_EDGE_SCORE` is distinct from `LAMBDA_EDGE` below — the
+   score weight and the training-loss weight were decoupled by this change,
+   not both zeroed.
 
 **Training (two stages, seed 42):**
 - **Stage 1 (80 epochs):** LOE pre-training against the synthetic exposure set —
@@ -350,6 +357,9 @@ re-absorbed by 120 epochs of unconstrained reconstruction.
   `L = feature_reconstruction + LAMBDA_EDGE(0.3) · edge_reconstruction +
   LAMBDA_EXPOSURE(1.0) · LOE_margin_loss + DeepSVDD compactness` (centroid =
   mean of the bottom-95 %-norm embeddings, `CENTROID_CLEAN_PERCENTILE`).
+  `LAMBDA_EDGE` here is the TRAINING loss weight, unchanged by the
+  2026-07-23 score-composition change above — the edge-prediction head
+  still trains at full weight.
 - LR 1e-3, batch 256, Adam.
 
 **Incremental fine-tune** (post-cycle CPU update): 10 epochs @ LR 1e-4, RGCN

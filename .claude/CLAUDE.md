@@ -114,11 +114,14 @@ applications (Postgres system of record; console CSV intake preserved)
   → 44 engineered features (MinMax, persisted params)
   → 5-relation identity graph (shares_mobile/ip/father_name/mother_name/pincode)
   → three detectors (ALL higher = more anomalous):
-      hybrid_anomaly_score = feature_pred_error + 0.3·edge_pred_error   (RGCN GraphMCM)
+      hybrid_anomaly_score = feature_pred_error + LAMBDA_EDGE_SCORE·edge_pred_error
+                              (RGCN GraphMCM; LAMBDA_EDGE_SCORE=0.0 since 2026-07-23 —
+                              edge_pred_error still trains, excluded from the score only)
       subspace_if_score                                                  (backbone)
       dense_block_ip                                                     (IP specialist)
   → EVT thresholds (the only thresholds allowed)
-  → LOCKED fusion: final_risk = minmax(1.0·subspace + 0.5·dense_ip + 0.3·hybrid)
+  → LOCKED fusion: final_risk = minmax(max(minmax(subspace), minmax(dense_ip), minmax(hybrid)))
+                    (unweighted max since 2026-07-22 — see Key Hyperparameters below)
   → human-gated self-training | XAI evidence cards
 ```
 
@@ -133,7 +136,8 @@ stale.
 | Model features | 44 (`N_FEATURES`; 24 nominal identifiers dropped, noid ablation 2026-07-15) |
 | Graph edge types / masks | 5 / 8 |
 | Graph hidden / emb dim | 128 / 64 · MLP hidden / Z dim 256 / 64 |
-| LOE margin / λ_edge / λ_exposure | data-derived (`_derive_loe_margin`, was fixed 2.0 — found ~3x too small for this embedding scale, changed 2026-07-22) / 0.3 / 1.0 · Stage 2 persistent LOE weight 0.15 (`LOE_STAGE2_WEIGHT`) |
+| LOE margin / λ_edge (training) / λ_exposure | data-derived (`_derive_loe_margin`, was fixed 2.0 — found ~3x too small for this embedding scale, changed 2026-07-22) / 0.3 (`LAMBDA_EDGE`, training-loss weight only) / 1.0 · Stage 2 persistent LOE weight 0.15 (`LOE_STAGE2_WEIGHT`) |
+| λ_edge_score (inference score) | `LAMBDA_EDGE_SCORE=0.0` since 2026-07-23 (decoupled from the training-loss `LAMBDA_EDGE` above) — `edge_pred_error` showed no usable signal on its 3 designed relational categories (stress-tested, replicated on 2 independently-seeded populations) and diluted `feature_pred_error`'s real MOBILE_CLUSTER signal; still trains, still computed for XAI, excluded from the ranking score only. Real-population reorder not yet ground-truth-validated — `AGENTS.md` §7 open decision 7 |
 | Stage 1 / Stage 2 epochs | 80 / 120 · LR 1e-3 · batch 256 · seed 42 (`V4_SEED`) |
 | Encoder | `rgcn`, `root_weight=False` since 2026-07-22 (HAN available; drop-in regresses −0.091, 3-seed) |
 | Incremental fine-tune | 10 epochs @ 1e-4, RGCN frozen |
