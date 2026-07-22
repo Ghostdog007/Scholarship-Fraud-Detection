@@ -196,12 +196,14 @@ EVAL_HELDOUT_SIZE_RANGE = (6, 40)    # T9b held-out topology size (structure dif
 # See README.md changelog (2026-07-22) and outputs/stress_testing_1_v2b_stats.json
 # for the full sweep. Redlined under explicit lead direction (sole author).
 DENSE_BLOCK_ENABLED   = _env("V4_DENSE_BLOCK", "1") == "1"   # default ON (architected component)
-DENSE_BLOCK_RELATIONS = [0, 1, 4]                             # shares_mobile, shares_ip, shares_pincode
+# Pincode dropped 2026-07-22 per lead direction: not a valid fraud signal on its
+# own (shared pincode reflects legitimate geographic clustering, not collusion) —
+# reverted to shares_mobile + shares_ip only.
+DENSE_BLOCK_RELATIONS = [0, 1]                                # shares_mobile, shares_ip
 # Priority weights applied to each relation's own min-max-normalised score BEFORE
 # the max-combine (DENSE_BLOCK_RELATIONS index -> weight). IP dominant by design —
-# most real fraud in this population runs through IP; mobile/pincode are boosts,
-# not equals. This is the "ip_priority_strong" setting from the ablation sweep.
-DENSE_BLOCK_RELATION_WEIGHTS = {0: 0.3, 1: 1.0, 4: 0.2}       # mobile, ip, pincode
+# most real fraud in this population runs through IP; mobile is a boost, not equal.
+DENSE_BLOCK_RELATION_WEIGHTS = {0: 0.3, 1: 1.0}               # mobile, ip
 DENSE_BLOCK_KCORE_PREFILTER = True                            # k-core narrows, then peel
 DENSE_BLOCK_CAMOUFLAGE_C    = 5.0                             # w = 1/log(deg + c)
 

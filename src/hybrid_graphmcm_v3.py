@@ -46,6 +46,7 @@ from src.config_v3 import (
     LR,
     MASK_NUM,
     MLP_HIDDEN,
+    EDGE_TYPES,
     N_EDGE_TYPES,
     N_FEATURES,
     RANDOM_SEED,
@@ -604,6 +605,77 @@ def score_only() -> None:
     scores = out_df["hybrid_anomaly_score"].values
     print(f"[hybrid] Scores saved -> {OUT_CSV}")
     print(f"[hybrid] hybrid_anomaly_score range: [{scores.min():.4f}, {scores.max():.4f}]")
+
+
+ABLATION_CSV = Path("outputs/relation_ablation_v3.csv")
+
+
+@torch.no_grad()
+def compute_relation_ablation() -> pd.DataFrame:
+    """
+    Post-hoc, per-relation neighbourhood-importance for the LOCKED RGCN
+    encoder. HAN has a true learned per-relation attention (encoder.last_beta_r,
+    model.top_alpha) but HAN is not production (regressed -0.091, 3-seed
+    ablation; see config_v3/README 2026-07-22) -- RGCN has no such mechanism,
+    so "expected this based on neighbours" had no way to say WHICH relation
+    drove that expectation. This fills that gap without touching the locked
+    architecture: for each of the N_EDGE_TYPES relations, re-run inference
+    with that relation's edges removed (masked via edge_type_tensor, not
+    edge_index_list position -- callers may pass only the non-empty relations,
+    so position r is NOT relation r) and compare feature_pred_error to the
+    full-graph baseline.
+
+    ablation_delta_<relation> = baseline_error - ablated_error, per node.
+    Positive: removing this relation's neighbours made the node fit BETTER
+    (looked more normal) -- i.e. that relation's neighbourhood context is why
+    the model's expectation for this node looked anomalous. Negative/zero:
+    that relation wasn't driving the anomaly (or its neighbours were making
+    the fit better, not worse).
+
+    5 extra full-graph forward passes total (once per relation, not once per
+    flagged application) -- cheap, no retraining. Only the scalar per-node
+    delta leaves the model (hard stop 2: no embeddings, ever).
+
+    Writes/returns: application_id, ablation_delta_<relation> for each of the
+    5 edge types -> outputs/relation_ablation_v3.csv.
+    """
+    print("[hybrid] compute_relation_ablation() starting ...")
+    model, x_all, edge_index_list, edge_type_tensor, isolated_mask, app_ids, features = load_model_and_inputs()
+    model.eval()
+    device = x_all.device
+
+    def _feature_pred_error(eil: list, ett: torch.Tensor, iso_mask: torch.Tensor) -> torch.Tensor:
+        pred_x, _, _, _ = model(x_all, eil, ett, iso_mask)
+        return (pred_x - x_all).abs().mean(dim=1)
+
+    edge_index_all = torch.cat(edge_index_list, dim=1) if edge_index_list else torch.zeros((2, 0), dtype=torch.long, device=device)
+    baseline_err = _feature_pred_error(edge_index_list, edge_type_tensor, isolated_mask)
+
+    out = {"application_id": app_ids}
+    for r, rel_name in enumerate(EDGE_TYPES):
+        if edge_type_tensor.numel() > 0:
+            keep = edge_type_tensor != r
+        else:
+            keep = torch.zeros(0, dtype=torch.bool, device=device)
+        ablated_ei  = edge_index_all[:, keep]
+        ablated_ett = edge_type_tensor[keep]
+        ablated_eil = [ablated_ei] if ablated_ei.shape[1] > 0 else []
+        ablated_iso = _compute_isolated_mask(ablated_eil, x_all.shape[0], device)
+        ablated_err = _feature_pred_error(ablated_eil, ablated_ett, ablated_iso)
+        delta = (baseline_err - ablated_err).cpu().numpy()
+        out[f"ablation_delta_{rel_name}"] = delta
+        print(f"[hybrid]   {rel_name}: mean delta={delta.mean():.6f}, "
+              f"{(delta > 0).sum()}/{len(delta)} nodes positively driven by this relation")
+
+    df = pd.DataFrame(out)
+    ABLATION_CSV.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(ABLATION_CSV, index=False)
+    print(f"[hybrid] Relation ablation saved -> {ABLATION_CSV}")
+    return df
+
+
+def run_relation_ablation() -> None:
+    compute_relation_ablation()
 
 
 # ---------------------------------------------------------------------------

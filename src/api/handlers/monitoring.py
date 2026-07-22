@@ -215,12 +215,54 @@ def evaluate_dataset(req: EvaluateDatasetRequest):
         dataset_ops.rebuild_features_and_graph()
 
         from src.api.inference import score_dataset_only
-        staged_df = score_dataset_only(app_ids_to_return=new_ids)
+        full_hybrid_df = score_dataset_only()  # every merged row (base + cohort)
+        staged_df = full_hybrid_df[full_hybrid_df["application_id"].isin(new_ids)].reset_index(drop=True)
 
         merged_features = pd.read_csv(dataset_ops.FINAL_CSV)
         staged_features = merged_features[
             merged_features["application_id"].astype(str).isin(new_ids)
         ]
+
+        # Signal-drivers preview: subspace IF + dense-block + closed-form fusion
+        # contributions, computed over the FULL merged population (base + cohort)
+        # via the SAME reusable functions the committed pipeline uses
+        # (subspace_if_v3.compute_subspace_if_scores, dense_block_detector_v3.
+        # dense_block_scores, fusion_classifier_v3.score_level_fusion,
+        # xai_layer_v3.build_fusion_contributions) -- no separate logic to drift
+        # out of sync. PREVIEW ONLY: this is NOT risk_score_v3 (that requires a
+        # committed pipeline run against the canonical population's own fixed
+        # normalisation) -- renormalised over base+cohort here, so values are
+        # comparable within this preview but not to the committed score.
+        import torch
+        from src.subspace_if_v3 import compute_subspace_if_scores
+        from src.dense_block_detector_v3 import dense_block_scores
+        from src.hybrid_graphmcm_v3 import _build_edge_index_and_types
+        from src.xai_layer_v3 import build_fusion_contributions
+
+        schema_features = set(json.loads(dataset_ops.SCHEMA_JSON.read_text())["features"])
+        subspace_full_df = compute_subspace_if_scores(merged_features, schema_features)
+
+        graph_data = torch.load(dataset_ops.GRAPH_PT, weights_only=False)
+        m_eil, m_ett = _build_edge_index_and_types(graph_data, torch.device("cpu"))
+        app_ids_merged = merged_features["application_id"].astype(str).values
+        dense_full_df = dense_block_scores(m_eil, m_ett, len(app_ids_merged), app_ids_merged)
+        dense_full_df["application_id"] = dense_full_df["application_id"].astype(str)
+        dense_map_full = dense_full_df.set_index("application_id").to_dict("index")
+
+        full_hybrid_df["application_id"] = full_hybrid_df["application_id"].astype(str)
+        subspace_full_df["application_id"] = subspace_full_df["application_id"].astype(str)
+        fusion_contrib_full = build_fusion_contributions(full_hybrid_df, subspace_full_df, dense_map_full)
+
+        # Fold the cohort's subset of these into staged_df so build_staged_card_html
+        # can read them straight off the CSV, same as every other staged column.
+        staged_df = (staged_df
+            .merge(subspace_full_df[["application_id", "subspace_if_score", "group_scores_json"]],
+                   on="application_id", how="left")
+            .merge(dense_full_df[["application_id", "dense_block_score_mobile",
+                                   "dense_block_score_ip", "dense_block_score_relational"]],
+                   on="application_id", how="left"))
+        staged_df["preview_fusion_contributions_json"] = staged_df["application_id"].map(
+            lambda a: json.dumps(fusion_contrib_full.get(a, {})))
 
         # Persist a cohort "bundle" so the read-only preview queue can render 3D
         # identity rings for these apps later. The merged graph (base 15k + this

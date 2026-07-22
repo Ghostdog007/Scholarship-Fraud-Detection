@@ -161,8 +161,8 @@ terminal or a headless server.
 
 | Endpoint | Returns | Cost |
 |---|---|---|
-| `GET /v3/monitoring/{app_id}/card` | Interactive reviewer card: risk placement, ranked reason codes, per-field declared-vs-model-expected breakdown, closed-form fusion attribution (max fusion — single argmax DRIVER + margin over the next-highest detector, not a proportional split), the **model-traceability trail** (which model drove the score + fired which trigger), a supplementary Deep SAD center-distance signal when elevated (does not drive the fused score), and a lightweight identity ego-graph | Cheap — reads pre-computed `explanation_cards_v3.json` |
-| `GET /v3/monitoring/{app_id}/ring` | Rotatable Plotly 3D identity ring (the deep-dive) | **Lazy** — the ring is computed only on this request (i.e. when the card's "Examine full ring in 3D" link is clicked), never in batch |
+| `GET /v3/monitoring/{app_id}/card` | Interactive reviewer card: risk placement, ranked reason codes, per-field declared-vs-model-expected breakdown, closed-form fusion attribution (max fusion — single argmax DRIVER + margin over the next-highest detector, not a proportional split), the **model-traceability trail** (which model drove the score + fired which trigger), a supplementary Deep SAD center-distance signal when elevated (does not drive the fused score), a **RGCN relation-ablation** signal ("Neighbourhood-expectation driver" — which relation's removal would most improve this node's reconstruction fit; post-hoc, XAI-only, added 2026-07-22), EVT trigger sentences with the measured flagged rate (not just the target rate), and a lightweight identity ego-graph | Cheap — reads pre-computed `explanation_cards_v3.json` |
+| `GET /v3/monitoring/{app_id}/ring` | Rotatable Plotly 3D identity ring (the deep-dive) — nodes coloured by risk, edges coloured/legend-grouped by relation with per-relation click-to-toggle / double-click-to-isolate (2026-07-22), gold diamond outline marking dense-block core members | **Lazy** — the ring is computed only on this request (i.e. when the card's "Examine full ring in 3D" link is clicked), never in batch |
 | `GET /v3/monitoring/{app_id}/export` | Zip bundle for one flagged application: `<id>_scorecard.csv` (flat audit row incl. model-traceability summary) + `<id>_card.html` + `<id>_evidence.json` | Cheap — projects `explanation_cards_v3.json` |
 | `GET /v3/monitoring/export/bulk` | Zip of **all** flagged applications: `manifest.csv` (one scorecard row each) + `cards/<id>.html` + `evidence/<id>.json` | Renders every card once — seconds for the top-N set |
 | `GET /v3/monitoring/export/selected?ids=a,b,c` | Zip of a **reviewer-chosen subset**: `manifest.csv` + `cards/<id>.html` + **`rings/<id>.html`** (interactive 3D ring) + `evidence/<id>.json`; unknown ids listed in `_skipped.txt` | Renders one lazy Plotly ring per id (~5 MB each) — cap 200 ids |
@@ -832,7 +832,11 @@ curl.exe -s http://localhost:8000/v3/monitoring/cohorts
 # Ranked staged rows (pre-fusion hybrid_anomaly_score, higher = more anomalous)
 curl.exe -s "http://localhost:8000/v3/monitoring/cohort/<name>/top-suspicious?n=50"
 
-# Lightweight PREVIEW reviewer card (HTML) for one staged app
+# Lightweight PREVIEW reviewer card (HTML) for one staged app -- Signal
+# drivers tab now shows subspace IF / dense-block / a preview fusion score
+# too (2026-07-22, computed over the cohort's merged population), not just
+# the raw hybrid score; still no EVT triggers (those need the canonical
+# population's fitted thresholds)
 curl.exe -s http://localhost:8000/v3/monitoring/cohort/<name>/<app_id>/card
 
 # 3D identity ring (HTML) rendered against the persisted merged base+cohort graph

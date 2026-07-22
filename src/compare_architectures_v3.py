@@ -18,7 +18,7 @@ Reports per seed / per category PR-AUC for:
   - locked_fusion        : the locked architecture (primary)
   - subspace_only        : raw subspace IF              (tabular backbone)
   - hybrid_only          : raw hybrid_anomaly            (RGCN relational)
-  - dense_relational_only: raw dense-block, mobile/IP/pincode IP-priority-weighted max
+  - dense_relational_only: raw dense-block, mobile/IP IP-priority-weighted max
 
 so the fusion can be read against each of its parts (mirrors H.8).
 
@@ -66,8 +66,9 @@ RELATION_MAP = {
 # all_eval_groups is a local inside evaluate(); rebuild the identical merge here.
 ALL_EVAL_GROUPS = {**SUBSPACE_GROUPS, **EVAL_EXTRA_GROUPS}
 
-# Dense-block relational column: IP-priority-weighted max across mobile/IP/pincode
-# (DENSE_BLOCK_RELATIONS=[0,1,4], DENSE_BLOCK_RELATION_WEIGHTS) — see config_v3.
+# Dense-block relational column: IP-priority-weighted max across mobile/IP
+# (DENSE_BLOCK_RELATIONS=[0,1], DENSE_BLOCK_RELATION_WEIGHTS) — see config_v3.
+# Pincode dropped 2026-07-22 -- not a valid fraud signal on its own.
 DENSE_RELATIONAL_COL = "dense_block_score_relational"
 
 MODES = ["locked_fusion", "subspace_only", "hybrid_only", "dense_relational_only"]
@@ -167,7 +168,7 @@ def _score_category(model, x_real, base_edge_index_list, base_edge_type_tensor,
     The three raw components are aligned by node order:
       - hybrid_anomaly_score            : compute_score_frame over the whole augmented graph
       - subspace_if_score               : _score_inject_and_real (real + injected, same scale)
-      - dense_block_score_relational    : dense_block_scores, mobile/IP/pincode IP-priority-weighted max
+      - dense_block_score_relational    : dense_block_scores, mobile/IP IP-priority-weighted max
     then fused via the LOCKED score_level_fusion.
     """
     n_real = x_real.shape[0]
@@ -190,7 +191,7 @@ def _score_category(model, x_real, base_edge_index_list, base_edge_type_tensor,
     )
     aug_score_df["subspace_if_score"] = np.concatenate([real_norm, inject_norm])
 
-    # Dense-block, relational (mobile/IP/pincode, IP-priority-weighted max).
+    # Dense-block, relational (mobile/IP, IP-priority-weighted max).
     # Merge to align by application_id.
     aug_dense_df = dense_block_scores(eval_ei_d, eval_et_d, x_all.shape[0], aug_app_ids)
     merged = aug_score_df.merge(aug_dense_df, on="application_id", how="left")

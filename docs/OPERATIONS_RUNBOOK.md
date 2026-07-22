@@ -82,12 +82,16 @@ This is the reviewer's main screen.
   the reviewer card uses the same identity-network tab, ranked reason codes,
   and expandable declared-vs-expected fields as the primary card, with a real
   network preview drawn from the cohort's own graph. **3D ring**, **ego-graph**,
-  and **export** (single / all / selected) all work on cohort apps too. What's
+  and **export** (single / all / selected) all work on cohort apps too. The
+  **Signal drivers** tab also works pre-commit (added 2026-07-22): subspace IF,
+  dense-block, and a preview fusion score are computed read-only over the
+  cohort's own merged population (`POST /evaluate-dataset`), so the same bars
+  and fusion-composition footer render as on a committed card. What's
   genuinely different pre-commit (labeled "PREVIEW · pre-fusion" on the card,
-  never silently hidden): no EVT-threshold reason codes or fusion-driver
-  attribution (subspace IF / dense-block / hybrid RGCN scores only exist
-  after a committed run — the fused score is the single highest of the
-  three, not a proportional split), and
+  never silently hidden): no EVT-threshold reason codes or model-traceability
+  margins (EVT thresholds are fitted against the canonical population, not
+  this cohort's preview — comparing a preview score to them would be
+  misleading), and
   no Confirm-fraud / Mark-false-positive buttons (that write to the committed
   features file, which doesn't have this app yet). Flag-for-LOE and
   label/retrain stay gated the same way — commit the cohort first (Decide →

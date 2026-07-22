@@ -62,10 +62,11 @@ def _fit_evt(scores: np.ndarray, score_name: str, u_percentile: int = U_PERCENTI
     if len(exceedances) < 10:
         print(f"[evt] WARNING: too few exceedances ({len(exceedances)}) for '{score_name}' -- percentile fallback")
         threshold = np.percentile(scores, 100 * (1 - Q))
+        n_flagged = int((scores >= threshold).sum())
         return {
             "u": float(u), "scale": None, "shape": None,
             "threshold": float(threshold), "method": "percentile_fallback",
-            "n_exceedances": len(exceedances),
+            "n_exceedances": len(exceedances), "n_flagged": n_flagged, "q": Q,
         }
 
     shape, _loc, scale = genpareto.fit(exceedances, floc=0)
@@ -76,10 +77,11 @@ def _fit_evt(scores: np.ndarray, score_name: str, u_percentile: int = U_PERCENTI
         print(f"[evt] WARNING: '{score_name}' GPD shape={shape:.4f} outside valid range "
               f"[{EVT_SHAPE_MIN}, {EVT_SHAPE_MAX}] — falling back to empirical quantile")
         threshold = np.percentile(scores, 100 * (1 - Q))
+        n_flagged = int((scores >= threshold).sum())
         return {
             "u": float(u), "scale": float(scale), "shape": float(shape),
             "threshold": float(threshold), "method": "empirical_fallback_bad_shape",
-            "n_exceedances": int(len(exceedances)),
+            "n_exceedances": int(len(exceedances)), "n_flagged": n_flagged, "q": Q,
         }
 
     n_total  = len(scores)

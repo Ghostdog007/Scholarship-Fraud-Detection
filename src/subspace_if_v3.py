@@ -21,13 +21,18 @@ SCHEMA_JSON = Path("data/processed/v3_feature_schema.json")
 OUT_CSV     = Path("outputs/subspace_if_scores_v3.csv")
 
 
-def run_subspace_if() -> None:
-    print("[subspace_if] run_subspace_if() starting ...")
+def compute_subspace_if_scores(df: pd.DataFrame, features: set[str] | None = None) -> pd.DataFrame:
+    """
+    Pure scoring function — single source of truth, refit on whatever `df`
+    is passed (the canonical population for run_subspace_if(), or a merged
+    base+cohort population for a read-only cohort preview; see
+    src/api/handlers/monitoring.py::evaluate_dataset()). No file I/O.
 
-    schema   = json.loads(SCHEMA_JSON.read_text())
-    features = set(schema["features"])
-
-    df = pd.read_csv(FINAL_CSV)
+    Returns: application_id, subspace_if_score, group_scores_json.
+    """
+    if features is None:
+        schema = json.loads(SCHEMA_JSON.read_text())
+        features = set(schema["features"])
 
     group_score_arrays = {}
     for group_name, group_cols in SUBSPACE_GROUPS.items():
@@ -69,16 +74,22 @@ def run_subspace_if() -> None:
         for i in range(len(df))
     ]
 
-    out_df = pd.DataFrame({
-        "application_id":   df["application_id"].values,
+    return pd.DataFrame({
+        "application_id":    df["application_id"].values,
         "subspace_if_score": subspace_if_score.astype(np.float32),
         "group_scores_json": group_scores_json,
     })
 
+
+def run_subspace_if() -> None:
+    print("[subspace_if] run_subspace_if() starting ...")
+    df = pd.read_csv(FINAL_CSV)
+    out_df = compute_subspace_if_scores(df)
+
     OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(OUT_CSV, index=False)
     print(f"[subspace_if] Saved {len(out_df)} scores -> {OUT_CSV}")
-    print(f"[subspace_if] Score range: [{subspace_if_score.min():.4f}, {subspace_if_score.max():.4f}]")
+    print(f"[subspace_if] Score range: [{out_df['subspace_if_score'].min():.4f}, {out_df['subspace_if_score'].max():.4f}]")
 
 
 if __name__ == "__main__":

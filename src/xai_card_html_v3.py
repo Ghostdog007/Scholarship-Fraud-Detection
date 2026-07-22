@@ -34,6 +34,7 @@ import pandas as pd
 
 CARDS_JSON = Path("outputs/explanation_cards_v3.json")
 RISK_CSV   = Path("outputs/risk_scores_v3.csv")
+DENSE_CSV  = Path("outputs/dense_block_scores_v3.csv")
 OUT_DIR    = Path("outputs/cards")
 
 # risk → colour bucket (semantic, separate from any brand accent)
@@ -452,12 +453,13 @@ def _signal_bars(card: dict) -> str:
                          f"{pct:.1f}<span style='color:var(--faint)'>pct</span>",
                          pct, fill, note))
 
-    # 2) dense-block-relational (mobile/IP/pincode, IP-priority weighted)
+    # 2) dense-block-relational (mobile/IP, IP-priority weighted; pincode dropped
+    # 2026-07-22 -- not a valid fraud signal on its own, see config_v3 comment)
     dib = ev.get("dense_block_relational", {})
     if dib.get("score", 0.0) > 0.0 and dib.get("percentile") is not None:
         by_rel = dib.get("by_relation", {})
         top_rel = max(by_rel.items(), key=lambda kv: kv[1])[0] if by_rel else None
-        rel_label = {"mobile": "mobile number", "ip": "IP address", "pincode": "pincode"}.get(top_rel, "identity value")
+        rel_label = {"mobile": "mobile number", "ip": "IP address"}.get(top_rel, "identity value")
         rows.append(_bar(f"Shared-identity dense-block {_model_pill('dense_relational')}",
                          f"{dib['percentile']:.1f}<span style='color:var(--faint)'>pct</span>",
                          dib["percentile"], "linear-gradient(90deg,#b5187f,#f72585)",
@@ -471,6 +473,31 @@ def _signal_bars(card: dict) -> str:
                          f"{dsad['percentile']:.1f}<span style='color:var(--faint)'>pct</span>",
                          dsad["percentile"], "linear-gradient(90deg,#5a189a,#9d4edd)",
                          "supplementary signal — informative context, does not drive the fused score"))
+
+    # 2c) RGCN per-relation ablation — the production encoder's answer to
+    # "which relation drove the neighbourhood-based expectation" (post-hoc;
+    # RGCN has no learned attention, unlike the rejected HAN path). Bar shows
+    # this relation's SHARE of total positive ablation deltas (how dominant
+    # it was among relations that actually worsened this node's fit) — not a
+    # population percentile, since ablation deltas aren't comparable across
+    # nodes the way normalised detector scores are.
+    abl = ev.get("relation_ablation") or {}
+    top_rel = abl.get("top_relation")
+    if top_rel:
+        by_rel = abl.get("by_relation", {})
+        positive = {r: d for r, d in by_rel.items() if d > 0.0}
+        total_pos = sum(positive.values())
+        share_pct = 100.0 * positive.get(top_rel, 0.0) / total_pos if total_pos > 0 else 0.0
+        rel_label = EDGE_LABELS.get(top_rel, top_rel.replace("shares_", "").replace("_", " "))
+        breakdown = ", ".join(
+            f"{EDGE_LABELS.get(r, r).split()[0]} {d:.4f}"
+            for r, d in sorted(positive.items(), key=lambda kv: -kv[1])
+        ) or "no relation improved fit on removal"
+        rows.append(_bar(f"Neighbourhood-expectation driver {_model_pill('hybrid')}",
+                         f"{share_pct:.0f}<span style='color:var(--faint)'>% share</span>",
+                         share_pct, "linear-gradient(90deg,#0d5c63,#4cc9f0)",
+                         f"removing {rel_label} links would improve reconstruction fit most "
+                         f"(Δ{abl.get('top_delta', 0.0):.4f}) — post-hoc ablation, not a fusion input · {breakdown}"))
 
     # 3) fusion composition footer — max fusion (2026-07-22): shows each
     # detector's own normalised value, DRIVER marks the one that won.
@@ -722,10 +749,12 @@ def _right_pane_preview(card: dict) -> str:
         "<div class='action' style='background:linear-gradient(180deg,#4cc9f01a,#4cc9f008);"
         "border:1px solid #4cc9f047'>"
         "<div class='at' style='color:#4cc9f0'>Pre-fusion preview</div>"
-        "<div class='ab'>This score is the raw hybrid-detector output for this uploaded cohort, "
-        "not the committed fused risk — subspace IF, dense-block, and EVT triggers only exist "
-        "after a committed pipeline run. Labeling, export, and the ego-graph unlock once this "
-        "cohort is committed (admin → Decide → Merge + incremental/full retrain).</div></div>")
+        "<div class='ab'>Subspace IF, dense-block, and a preview fusion score are shown above, "
+        "computed read-only over this cohort's merged population (see the Signal drivers tab) — "
+        "but this is still NOT the committed fused risk: EVT triggers (fitted against the "
+        "canonical population, not this preview) and model-traceability margins only exist after "
+        "a committed pipeline run. Labeling, export, and the ego-graph unlock once this cohort is "
+        "committed (admin → Decide → Merge + incremental/full retrain).</div></div>")
     return f"""
     <div class="card"><div class="card-b">
       <div class="riskhead">
@@ -738,10 +767,11 @@ def _right_pane_preview(card: dict) -> str:
       <div class="section-t">What's happening in each field — declared vs. model-expected</div>
       {_field_accordions(card)}
       {commit_note}
-      <div class="footnote">Pre-fusion preview card: the raw hybrid-detector reconstruction error
-        for this uploaded cohort, computed read-only against the current checkpoint. No hand-set
-        thresholds. Commit this cohort for the full fused-risk card with EVT triggers and
-        model-traceability breakdown.</div>
+      <div class="footnote">Pre-fusion preview card: subspace IF / dense-block / fusion are
+        computed read-only against this cohort's own merged population (not the canonical
+        population's fixed normalisation), so values are comparable within this preview but not
+        to the committed risk_score_v3. Commit this cohort for the fused-risk card with EVT
+        triggers and model-traceability margins.</div>
     </div></div>"""
 
 
@@ -834,7 +864,9 @@ def _ego_figure(app_id: str, app_ids, id_to_idx: dict, nidx: dict, rel_id: dict,
                 edges.append((local[g], local[v], rel_id.get(e["edge_type"], 0)))
     scores = np.array([float(risk_map.get(app_ids[g], 0.0)) for g in node_set], dtype=float)
     sg = {"node_ids": node_set, "scores": scores, "edges": edges}
-    fig = _figure_for_ring(sg, app_ids, 1)
+    core_ids = _dense_core_app_ids()
+    core_global_ids = {g for g in node_set if str(app_ids[g]) in core_ids} if core_ids else None
+    fig = _figure_for_ring(sg, app_ids, 1, core_global_ids=core_global_ids)
     n_edges = len(set((min(a, b), max(a, b)) for a, b, _ in edges))
     fig.update_layout(title=dict(text=(
         f"<b>Identity ring — {app_id}</b>"
@@ -852,6 +884,28 @@ def _ego_figure(app_id: str, app_ids, id_to_idx: dict, nidx: dict, rel_id: dict,
 # so both the default committed graph and any staged cohort graph are cached
 # independently and safely invalidate when their underlying file changes.
 _GRAPH_CTX_CACHE: dict = {}
+_DENSE_CORE_CACHE: dict = {"key": None, "ids": frozenset()}
+
+
+def _dense_core_app_ids() -> frozenset:
+    """application_ids where dense_block_score_relational > 0 -- i.e. the node
+    is part of the actual Charikar-peeled dense sub-block (see
+    dense_block_detector_v3.dense_block_scores), not just an incidental
+    shares_X link. Used only to VISUALLY mark which ring neighbours are the
+    real dense-core members; committed-graph rings only (staged cohort rings
+    degrade to no core marking, same as other cohort-preview gaps in this
+    module — genuinely absent pre-commit, never fabricated). mtime-cached like
+    _GRAPH_CTX_CACHE, same rationale."""
+    if not DENSE_CSV.exists():
+        return frozenset()
+    mtime = DENSE_CSV.stat().st_mtime
+    if _DENSE_CORE_CACHE["key"] == mtime:
+        return _DENSE_CORE_CACHE["ids"]
+    df = pd.read_csv(DENSE_CSV)
+    ids = frozenset(df.loc[df["dense_block_score_relational"] > 0.0, "application_id"].astype(str))
+    _DENSE_CORE_CACHE["key"] = mtime
+    _DENSE_CORE_CACHE["ids"] = ids
+    return ids
 
 
 def _graph_ctx(graph_pt: "Path | None" = None, nodeorder_csv: "Path | None" = None):
@@ -913,7 +967,9 @@ def _ring_fig_from_pg(app_id: str, risk_map: dict | None):
         risk_map = db_reads.risk_scores_for(node_ids)
     scores = np.array([float(risk_map.get(a, 0.0)) for a in node_ids], dtype=float)
     sg = {"node_ids": list(range(len(node_ids))), "scores": scores, "edges": edges}
-    fig = _figure_for_ring(sg, np.array(node_ids), 1)
+    core_ids = _dense_core_app_ids()
+    core_global_ids = {i for i, a in enumerate(node_ids) if a in core_ids} if core_ids else None
+    fig = _figure_for_ring(sg, np.array(node_ids), 1, core_global_ids=core_global_ids)
     n_edges = len(set((min(a, b), max(a, b)) for a, b, _ in edges))
     fig.update_layout(title=dict(text=(
         f"<b>Identity ring — {app_id}</b>"
@@ -980,6 +1036,7 @@ def build_staged_card_html(name: str, app_id: str) -> str | None:
 
     Returns None if the app isn't in the cohort's staged scores."""
     import json as _json
+    import numpy as np
     from src.xai_layer_v3 import _degree_counts_from_index, _top_features
 
     scores_path = Path(f"outputs/staged_scores_{name}.csv")
@@ -1040,13 +1097,58 @@ def build_staged_card_html(name: str, app_id: str) -> str | None:
     risk_rank = int((sdf["hybrid_anomaly_score"] > score).sum()) + 1
     risk_percentile = 100.0 * (sdf["hybrid_anomaly_score"] < score).sum() / max(len(sdf), 1)
 
+    # Signal-drivers preview: subspace IF / dense-block / fusion contributions,
+    # computed by evaluate_dataset() over the full merged (base+cohort)
+    # population (src/api/handlers/monitoring.py) using the SAME reusable
+    # functions the committed pipeline uses. Percentiles here are WITHIN THIS
+    # COHORT (the only population a pre-fusion preview has); EVT thresholds are
+    # the committed ones (population-level constants, still meaningful to
+    # compare a preview score against). Absent only for cohorts staged before
+    # this was added (stale bundle) -- degrades to empty, same as before.
+    from src.xai_layer_v3 import _pct_rank, EVT_JSON as _EVT_JSON, GROUP_LABELS as _GROUP_LABELS
+    evt = json.loads(_EVT_JSON.read_text()) if _EVT_JSON.exists() else {}
+
+    subspace_groups_ev: dict = {}
+    if "group_scores_json" in sdf.columns and pd.notna(row.get("group_scores_json")):
+        this_groups = _json.loads(row["group_scores_json"])
+        all_groups = [_json.loads(g) for g in sdf["group_scores_json"].dropna()]
+        for g, g_score in this_groups.items():
+            g_ev = {"score": round(float(g_score), 6), "source_model": "subspace"}
+            g_vals = np.array([d.get(g, 0.0) for d in all_groups], dtype=float)
+            if g_vals.size:
+                g_ev["percentile"] = round(_pct_rank(np.sort(g_vals), float(g_score)), 2)
+            thr = evt.get(f"subspace_if_{g}", {}).get("threshold")
+            if thr is not None:
+                g_ev["threshold"] = round(float(thr), 6)
+                g_ev["crossed"] = bool(float(g_score) >= float(thr))
+            subspace_groups_ev[g] = g_ev
+
+    dense_rel_ev: dict = {}
+    if "dense_block_score_relational" in sdf.columns and pd.notna(row.get("dense_block_score_relational")):
+        dense_rel_score = float(row["dense_block_score_relational"])
+        dense_rel_ev = {"score": round(dense_rel_score, 6), "source_model": "dense_relational",
+                         "by_relation": {
+                             rel: round(float(row[f"dense_block_score_{rel}"]), 6)
+                             for rel in ("mobile", "ip")
+                             if f"dense_block_score_{rel}" in sdf.columns and pd.notna(row.get(f"dense_block_score_{rel}"))
+                         }}
+        if dense_rel_score > 0.0:
+            dense_sorted = np.sort(sdf["dense_block_score_relational"].dropna().values.astype(float))
+            dense_rel_ev["percentile"] = round(_pct_rank(dense_sorted, dense_rel_score), 2)
+
+    fusion_contrib_ev: dict = {}
+    if "preview_fusion_contributions_json" in sdf.columns and pd.notna(row.get("preview_fusion_contributions_json")):
+        fusion_contrib_ev = _json.loads(row["preview_fusion_contributions_json"])
+
     pseudo_card = {
         "application_id": app_id,
         "risk_score_v3": score,
         "triggers": [],
         "top_feature_errors": top_feats,
         "evidence": {
-            "subspace_groups": {}, "dense_block_relational": {}, "fusion_contributions": {},
+            "subspace_groups": subspace_groups_ev,
+            "dense_block_relational": dense_rel_ev,
+            "fusion_contributions": fusion_contrib_ev,
             "graph_connections": graph_connections, "evt_crossings": [],
             "risk_percentile": risk_percentile, "risk_rank": risk_rank,
             "population_size": len(sdf), "label_source": "preview",

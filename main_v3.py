@@ -43,6 +43,7 @@ PIPELINE_STEPS = [
     "add_degree_features",
     "build_exposure_set",
     "train_hybrid",
+    "relation_ablation",
     "subspace_if",
     "dense_block",
     "deepsad",
@@ -207,6 +208,11 @@ def run_pipeline(steps: list[str] | None = None, smoke_test: bool = False, cycle
             print("\n[main] Step 5: Hybrid GraphMCM -- train()")
             from src.hybrid_graphmcm_v3 import train
             train(smoke_test=smoke_test)
+
+        if should_run("relation_ablation"):
+            print("\n[main] Step 5b: RGCN per-relation ablation (XAI-only) -- run_relation_ablation()")
+            from src.hybrid_graphmcm_v3 import run_relation_ablation
+            run_relation_ablation()
 
         if should_run("subspace_if"):
             print("\n[main] Step 6: Subspace IF -- run_subspace_if()")

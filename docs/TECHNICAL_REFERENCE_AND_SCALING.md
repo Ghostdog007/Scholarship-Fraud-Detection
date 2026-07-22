@@ -152,7 +152,7 @@ universe.
 >    pushdown at scale" / "hub-capped at scale", feeding into...
 > 3. **Detection** — three parallel boxes side by side: "Hybrid GraphMCM
 >    (RGCN, root_weight=False)", "Subspace Isolation Forest", "Dense-block
->    (mobile+IP+pincode, IP-weighted)", each with its one-line job description
+>    (mobile+IP, IP-weighted)", each with its one-line job description
 >    from §6, converging into a single diamond "Locked score-level fusion"
 >    with the formula `risk = minmax(max(subspace, dense_relational, hybrid))`
 >    printed beside it. A fourth, visually distinct box "Deep SAD
@@ -387,18 +387,22 @@ Reconstruction models **smooth over dense cliques** — a tight fraud ring
 reconstructs *easily*, weakening the relational signal (MAR critique). The
 dense-block detector attacks exactly that blind spot:
 
-- **Gated to `shares_mobile` + `shares_ip` + `shares_pincode`**
-  (`DENSE_BLOCK_RELATIONS = [0, 1, 4]`) since 2026-07-22 — was `shares_ip`
-  only. Extending to mobile+pincode was tested against `stress_testing_1`
-  after the IP-only gate was found to score mobile-sharing rings near zero
-  (PR-AUC 0.030); each relation is peeled **independently**, then
-  **IP-priority-weighted max-combined**: `DENSE_BLOCK_RELATION_WEIGHTS =
-  {mobile: 0.3, ip: 1.0, pincode: 0.2}` — IP stays dominant (the real
-  population's primary fraud vector) while mobile/pincode contribute as
-  boosts, not equals. Equal weighting was tried first and rejected: it
-  gained more in aggregate but let ordinary non-fraud density in
-  mobile/pincode outrank true IP rings (IP PR-AUC collapsed 0.220→0.067).
-  Output columns: `dense_block_score_mobile/ip/pincode` (per-relation, for
+- **Gated to `shares_mobile` + `shares_ip`** (`DENSE_BLOCK_RELATIONS =
+  [0, 1]`) — was `shares_ip` only. Extending to mobile+pincode was tested
+  against `stress_testing_1` after the IP-only gate was found to score
+  mobile-sharing rings near zero (PR-AUC 0.030); each relation is peeled
+  **independently**, then **IP-priority-weighted max-combined**:
+  `DENSE_BLOCK_RELATION_WEIGHTS = {mobile: 0.3, ip: 1.0}` — IP stays
+  dominant (the real population's primary fraud vector) while mobile
+  contributes as a boost, not an equal. Equal weighting was tried first and
+  rejected: it gained more in aggregate but let ordinary non-fraud density
+  in mobile/pincode outrank true IP rings (IP PR-AUC collapsed
+  0.220→0.067). Pincode was briefly added to the gate on 2026-07-22
+  (`DENSE_BLOCK_RELATIONS = [0, 1, 4]`, weight 0.2) and dropped the same
+  day per lead direction: shared pincode reflects legitimate geographic
+  clustering, not collusion, and is not a valid fraud signal on its own for
+  this detector — reverted to mobile+ip only.
+  Output columns: `dense_block_score_mobile/ip` (per-relation, for
   XAI transparency) + `dense_block_score_relational` (the weighted max,
   what fusion actually consumes).
 - k-core prefilter narrows candidates, then greedy peeling extracts dense
@@ -415,7 +419,7 @@ to how dense and camouflage-resistant that block is; the three per-relation
 scores are min-max normalised and combined via the IP-weighted max above.
 **A high `dense_block_score_relational` means: this application is part of a
 mathematically dense cluster of applications sharing one identity value**
-(mobile, IP, or pincode) — exactly the "many students, one internet
+(mobile or IP) — exactly the "many students, one internet
 connection / one phone" signature a reconstruction model alone would miss.
 
 ### 6.4 EVT scorer (`evt_scorer_v3.py`) — statistical thresholds, not policy
@@ -513,6 +517,56 @@ alpha-sensitivity result).
   SAD center-distance signal when elevated (>75th percentile, explicitly
   marked as not driving the fused score), EVT threshold context, and a
   `model_trace` (which checkpoint / component produced each line).
+- **RGCN per-relation ablation (2026-07-22)** — `hybrid_graphmcm_v3.
+  compute_relation_ablation()`: the production RGCN encoder has no learned
+  attention (unlike the rejected HAN path, whose `beta_r`/`top_alpha` stay
+  dormant), so "expected this based on neighbours" had no way to say WHICH
+  relation drove that expectation. Fills the gap post-hoc: 5 extra full-graph
+  forward passes (once per edge type, masked via `edge_type_tensor`, not
+  retrained), comparing each node's feature-reconstruction error with vs.
+  without that relation's edges. The relation whose removal improves the fit
+  most is narrated as the "Neighbourhood-expectation driver" and shown as a
+  bar on the Signal drivers tab — XAI-only, never feeds fusion or a threshold.
+- **EVT empirical-rate framing (2026-07-22)** — trigger sentences now cite the
+  actual measured flagged rate for THAT signal's fitted threshold (`n_flagged`
+  / population size, computed in every `evt_scorer_v3._fit_evt()` branch
+  including both fallbacks), not just the aspirational target `Q` the tail was
+  fit towards — a stronger, per-signal justification ("this pattern was this
+  extreme in 31 of 15,000 applications, ~0.21%") than one blanket target rate
+  for the whole card.
+- **Dense-block core highlighting on the 3D ring (2026-07-22)** — the ring
+  used to show every shares-X neighbour uniformly; a gold diamond outline now
+  marks nodes that are part of the actual Charikar-peeled dense core
+  (`dense_block_score_relational > 0`), distinguishing them from incidental
+  neighbours that share the same identity value but aren't part of the
+  anomalous structure. `xai_card_html_v3._dense_core_app_ids()`, mtime-cached
+  like the existing graph-context cache.
+- **Per-relation edge toggle on the 3D ring (2026-07-22)** — each relation is
+  its own Plotly trace with an explicit `itemclick="toggle"` /
+  `itemdoubleclick="toggleothers"` legend (previously relying on Plotly's
+  default, now made explicit), so a reviewer can hide/isolate relations to
+  declutter a dense clique. Fixed alongside a real rendering bug in the same
+  function: `_figure_for_ring` used to keep only the FIRST relation seen for a
+  node pair (`edge_rel.setdefault`), so a pair sharing e.g. both `shares_ip`
+  AND `shares_mother_name` only ever drew the IP edge — `shares_mother_name`
+  was silently shadowed for any pair where a lower-`EDGE_TYPES`-index relation
+  also connected the same two nodes. Fixed to track a SET of relations per
+  pair and draw one line per relation that actually connects it; this also
+  means the toggle above now works correctly for such pairs (previously
+  toggling the shadowing relation off would not have revealed the hidden one,
+  because it was never rendered).
+- **Cohort-preview signal drivers (2026-07-22)** — `POST /evaluate-dataset`
+  now also computes subspace IF (`subspace_if_v3.compute_subspace_if_scores`,
+  refactored out as a reusable pure function) and dense-block scores over the
+  batch's merged population, plus a preview fusion score via
+  `fusion_classifier_v3.score_level_fusion` /
+  `xai_layer_v3.build_fusion_contributions` (the SAME functions the committed
+  pipeline uses — no separate logic to drift out of sync). Previously a
+  staged cohort card's Signal drivers tab was empty by design (only the raw
+  hybrid score existed pre-commit); now the same bars and fusion-composition
+  footer render, renormalised over the cohort's own population — still
+  clearly labeled PREVIEW, still not `risk_score_v3`, still without EVT
+  triggers (fitted against the canonical population, not a moving cohort).
 - **Narration policy:** cards narrate only continuous features and
   network-DISAGREEMENT binaries; nominal identifiers are never spoken.
   Presentation-only — XAI never gates a score.
@@ -722,7 +776,8 @@ CREATE TABLE scores (
     dense_block_score_relational DOUBLE PRECISION,
     dense_block_score_mobile DOUBLE PRECISION,  -- per-relation, XAI transparency only
     dense_block_score_ip     DOUBLE PRECISION,
-    dense_block_score_pincode DOUBLE PRECISION,
+    -- (dense_block_score_pincode dropped 2026-07-22: pincode removed from
+    -- the dense-block gate — not a valid fraud signal on its own)
     center_dist_score    DOUBLE PRECISION,  -- Deep SAD, supplementary, NOT in final_risk_score
     final_risk_score     DOUBLE PRECISION, label_source TEXT,
     risk_bucket          TEXT CHECK (risk_bucket IN ('High', 'Medium', 'Low')),
@@ -875,7 +930,13 @@ cut-over):**
   `features`, and `scores` deliberately left empty** at this point (the
   lead-set ingestion contract: nothing is derived until an admin acts).
   Clicking **Evaluate** populates those three tables for that batch (tagged
-  with a preview `model_version`) as a read-only, pre-fusion scoring pass.
+  with a preview `model_version`) as a read-only, pre-fusion scoring pass —
+  the Postgres `scores` row stays hybrid-only. The file-based staged bundle
+  (`outputs/staged_scores_<name>.csv`) additionally carries a subspace IF /
+  dense-block / preview-fusion breakdown since 2026-07-22 (§6.7), computed
+  over the batch's merged population; that extra breakdown is what the
+  console's Signal drivers tab reads for a cohort — it is not yet dual-written
+  to Postgres.
   Clicking **Decide → Merge** flips `status='merged'` — permanent, and the
   only state from which training pulls data. A merged batch's rows can never
   be deleted through the console; only staged/evaluated batches can

@@ -20,7 +20,7 @@ risk_score_v3 = minmax( max( minmax(subspace_if_score),
 each component min-max normalised to [0,1] first, THEN maxed — no weights: max has
 no per-component weight to tune, it takes whichever raw signal is strongest for
 that application. No labels used in the combine (label-independent) — subspace is
-the tabular backbone, dense-block-relational the mobile/IP/pincode structural
+the tabular backbone, dense-block-relational the mobile/IP structural
 specialist (IP-priority weighted internally, see dense_block_detector_v3), RGCN the
 relational/topology signal. All scalar inputs only.
 

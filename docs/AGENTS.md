@@ -41,9 +41,13 @@ raw applications (PostgreSQL `applications` / today: data/raw CSV)
                                     = feature_pred_error + 0.3·edge_pred_error
        subspace_if_v3           : per-group IF (financial/identity/network)
        dense_block_detector_v3  : FRAUDAR-style peeling over shares_mobile +
-                                  shares_ip + shares_pincode (independently
-                                  peeled, IP-priority-weighted max-combined —
-                                  since 2026-07-22; was shares_ip only)
+                                  shares_ip (independently peeled,
+                                  IP-priority-weighted max-combined — was
+                                  shares_ip only, extended to mobile+ip+
+                                  pincode 2026-07-22, pincode dropped same
+                                  day per lead direction: shared pincode
+                                  reflects legitimate geographic clustering,
+                                  not collusion, on its own)
    → evt_scorer_v3              : GPD tail thresholds (the only thresholds allowed)
    → LOCKED fusion              : final_risk = minmax(max(minmax(subspace),
                                      minmax(dense_relational), minmax(hybrid)))
@@ -57,16 +61,30 @@ alongside but is NOT fused — tested directly as a 4th max-fusion input and
 rejected (2026-07-22: candidate 4-way scored 0.4181 vs the locked 3-way's
 0.4182 on stress_testing_1, noise-level). It reads into xai_layer_v3 only,
 as a supplementary XAI-card signal, never into final_risk_score.
+
+A post-hoc RGCN per-relation ablation (hybrid_graphmcm_v3.compute_relation_
+ablation, 2026-07-22) also runs alongside, XAI-only: re-scores the LOCKED
+checkpoint 5 extra times (once per edge type, masked out via edge_type_tensor)
+and reports, per node, which relation's removal improved feature-reconstruction
+fit the most — the RGCN's answer to "which relation drove the neighbourhood
+expectation," since RGCN (unlike the rejected HAN path) has no learned
+attention. Writes outputs/relation_ablation_v3.csv; never touches the
+checkpoint, fusion, or any threshold.
 ```
 
 Why each piece is locked (metrics in `HISTORY.md`, raw JSON in
 `outputs/ablation/locked_fusion_validation.json`):
 - **Subspace IF is the backbone** (3-seed mean connected PR-AUC 0.743).
 - **Dense-block extended beyond IP-only 2026-07-22** (shares_ip-only scored
-  mobile-sharing rings near zero, PR-AUC 0.030; extending to mobile+pincode
-  with IP-priority weighting — not equal weighting, which let ordinary
-  non-fraud density outrank true IP rings — fixed that while holding IP-ring
-  detection ~unchanged).
+  mobile-sharing rings near zero, PR-AUC 0.030; extending to mobile+ip
+  (briefly mobile+ip+pincode, same day) with IP-priority weighting — not
+  equal weighting, which let ordinary non-fraud density outrank true IP
+  rings — fixed that while holding IP-ring detection ~unchanged). Pincode
+  was dropped from the gate the same day, per lead direction: shared
+  pincode reflects legitimate geographic clustering, not collusion, and is
+  not a valid fraud signal on its own for this detector. Reverted to
+  `DENSE_BLOCK_RELATIONS = [0, 1]` (shares_mobile + shares_ip),
+  `DENSE_BLOCK_RELATION_WEIGHTS = {0: 0.3, 1: 1.0}`.
 - **RGCN stays, and its root_weight was fixed 2026-07-22** (retirement
   disproven; best generalisation to novel topology; the root_weight=False
   fix recovered signal the LOE-margin fix below had cost it).
@@ -123,8 +141,9 @@ One module per response. If a task spans two rows, stop and confirm scope.
 | Synthetic exposure | `src/synthetic_exposure_builder_v3.py` | features, promoted `loe_patterns` | exposure `.pt` artifacts |
 | Hybrid detector | `src/hybrid_graphmcm_v3.py` | features, graph, exposure | `hybrid_scores`, `models/hybrid_graphmcm_v3.pth` |
 | Subspace IF | `src/subspace_if_v3.py` | features | subspace scores |
-| Dense-block | `src/dense_block_detector_v3.py` | `shares_mobile`/`shares_ip`/`shares_pincode` edges | per-relation scores + `dense_block_score_relational` |
+| Dense-block | `src/dense_block_detector_v3.py` | `shares_mobile`/`shares_ip` edges (pincode dropped 2026-07-22) | per-relation scores + `dense_block_score_relational` |
 | Deep SAD (XAI-only, not fused) | `src/deepsad_detector_v3.py` | features, graph, exposure | `center_dist_score`, `models/deepsad_v3.pth` |
+| Relation ablation (XAI-only, not fused) | `src/hybrid_graphmcm_v3.py::compute_relation_ablation` | trained checkpoint, features, graph (5 re-scores, one edge type masked per pass) | `relation_ablation_v3.csv` (per-node, per-relation reconstruction-error delta) |
 | EVT | `src/evt_scorer_v3.py` | score vectors | `evt_thresholds` |
 | Self-training | `src/self_training_loop_v3.py` | scores, EVT, `confirmed_fraud` | `pseudo_labels` |
 | Fusion | `src/fusion_classifier_v3.py` | three score vectors | `final_risk_score` |

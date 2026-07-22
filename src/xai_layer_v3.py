@@ -47,6 +47,7 @@ PSEUDO_LABELS  = Path("outputs/pseudo_labels_v3.json")
 OUT_JSON       = Path("outputs/explanation_cards_v3.json")
 DENSE_CSV      = Path("outputs/dense_block_scores_v3.csv")
 DEEPSAD_CSV    = Path("outputs/deepsad_scores_v3.csv")
+ABLATION_CSV   = Path("outputs/relation_ablation_v3.csv")
 
 TOP_K_FEATURES  = 5
 TOP_K_NEIGHBORS = 3
@@ -192,18 +193,20 @@ DETECTOR_REGISTRY = {
     },
     "dense_relational": {
         "name":   "Shared-identity dense-block detector",
-        "what":   "FraudAR dense-subgraph peeling over shared-mobile, shared-IP, and "
-                  "shared-pincode edges independently, then max-combined with IP "
-                  "weighted dominant (mobile 0.3 / IP 1.0 / pincode 0.2 — IP is the "
-                  "dominant real fraud vector; mobile/pincode are boosts, not "
-                  "equals). Reads no features — pure graph structure. Flags "
-                  "coordinated rings that co-apply from one shared identity value.",
-        "reads":  "0 features — shared-mobile/IP/pincode graph structure only",
+        "what":   "FraudAR dense-subgraph peeling over shared-mobile and shared-IP "
+                  "edges independently, then max-combined with IP weighted dominant "
+                  "(mobile 0.3 / IP 1.0 — IP is the dominant real fraud vector; "
+                  "mobile is a boost, not equal). Reads no features — pure graph "
+                  "structure. Flags coordinated rings that co-apply from one shared "
+                  "identity value.",
+        "reads":  "0 features — shared-mobile/IP graph structure only",
         "catches":"Dense identity-sharing rings that reconstruct too easily for the "
                   "relational model to flag — the subspace detector's structural "
                   "blind spot. Extended from IP-only 2026-07-22 (README changelog) "
                   "after mobile-sharing rings were found to score near-zero under "
-                  "the IP-only gate.",
+                  "the IP-only gate; pincode was added the same day then dropped "
+                  "same day (shared pincode reflects legitimate geographic "
+                  "clustering, not collusion — not a valid fraud signal on its own).",
     },
     "hybrid": {
         "name":   "Hybrid GraphMCM (relational RGCN)",
@@ -631,11 +634,24 @@ def _narrative(card: dict) -> str:
             desc = TRIGGER_DESCRIPTIONS.get(t, t)
             sig  = evt_signals.get(t)
             if sig and sig.get("observed") is not None and sig.get("threshold") is not None:
-                flag_lines.append(f"{desc} (observed {sig['observed']:.3f} vs threshold {sig['threshold']:.3f})")
+                # Empirical rate actually measured at this threshold (n_flagged /
+                # scored population), not the aspirational target Q it was fit
+                # towards — a stronger, per-signal justification statement than a
+                # single blanket target rate for the whole card (Quantitative
+                # Claims Protocol: report the measured number, not the design one).
+                rate_str = ""
+                n_flagged = sig.get("n_flagged")
+                if n_flagged is not None and n_pop:
+                    rate_pct = 100.0 * n_flagged / n_pop
+                    rate_str = (f"; this pattern was this extreme in {n_flagged} of {n_pop:,} scored "
+                                f"applications (~{rate_pct:.2f}%)")
+                flag_lines.append(
+                    f"{desc} (observed {sig['observed']:.3f} vs threshold {sig['threshold']:.3f}{rate_str})"
+                )
             else:
                 flag_lines.append(desc)
         q = next((s.get("q") for s in evt_signals.values() if s.get("q")), None)
-        q_str = f", fitted to the score tails at a {q * 100:.1f}% target false-positive rate" if q else ""
+        q_str = f", each fitted to its own score tail at a {q * 100:.1f}% target false-positive rate" if q else ""
         plural = "s" if len(triggers) != 1 else ""
         parts.append(
             f"Crossed {len(triggers)} independent extreme-value threshold{plural}{q_str}: "
@@ -687,7 +703,7 @@ def _narrative(card: dict) -> str:
                 f"({driver['normalized']:.2f}){margin_str}. Other detectors: {others}."
             )
 
-    # 3c. Shared-identity dense-block: mobile/IP/pincode ring specialist. Only
+    # 3c. Shared-identity dense-block: mobile/IP ring specialist. Only
     #     surfaced when it actually fires. Per-relation breakdown shows WHICH
     #     shared identity value drove it, not just the combined score.
     dib = ev.get("dense_block_relational")
@@ -696,7 +712,7 @@ def _narrative(card: dict) -> str:
         pct_str = f", more concentrated than {_fmt_pct(pct)} of applicants" if pct is not None else ""
         rel_scores = dib.get("by_relation", {})
         top_rel = max(rel_scores.items(), key=lambda kv: kv[1])[0] if rel_scores else None
-        rel_label = {"mobile": "mobile number", "ip": "IP address", "pincode": "pincode"}.get(top_rel, top_rel)
+        rel_label = {"mobile": "mobile number", "ip": "IP address"}.get(top_rel, top_rel)
         via_str = f" — driven mainly by shared {rel_label}" if rel_label else ""
         parts.append(
             f"Shared-identity dense-block: this application sits inside a dense cluster of "
@@ -767,6 +783,24 @@ def _narrative(card: dict) -> str:
                 f"focusing on {n_edges} co-application(s)."
             )
 
+    # 5b. RGCN per-relation ablation — the production encoder's answer to the
+    #     same question the (dormant, HAN-only) attention block above answers:
+    #     which relation actually drove the model's neighbourhood-based
+    #     expectation for this node. Only narrated when ablation found a
+    #     relation whose removal genuinely improved the fit (top_delta > 0) —
+    #     a zero/negative top_delta means no relation was actively worsening
+    #     this node's reconstruction, so there is nothing honest to report.
+    ablation = ev.get("relation_ablation")
+    if ablation and ablation.get("top_relation"):
+        top_rel_label = EDGE_TYPE_LABELS.get(ablation["top_relation"],
+                                              ablation["top_relation"].replace("_", " "))
+        parts.append(
+            f"Neighbourhood-expectation check: removing this application's {top_rel_label} links "
+            f"(re-scoring with that relation masked out) would have improved its feature-reconstruction "
+            f"fit by {ablation['top_delta']:.4f} — the largest such shift of any relation — meaning that "
+            f"relation's neighbours are the main reason the model's expectation for this application looked off."
+        )
+
     # 6. Recommended action — driven by label state and EVT crossings,
     #    not a hand-set score cut
     label_source = ev.get("label_source")
@@ -809,7 +843,7 @@ _CTX_CACHE: dict = {"key": None, "ctx": None}
 
 
 def _ctx_cache_key() -> tuple:
-    paths = [HYBRID_CSV, RISK_CSV, DENSE_CSV, DEEPSAD_CSV, FEATURES_CSV, SUBSPACE_CSV,
+    paths = [HYBRID_CSV, RISK_CSV, DENSE_CSV, DEEPSAD_CSV, ABLATION_CSV, FEATURES_CSV, SUBSPACE_CSV,
              GRAPH_PT, EVT_JSON, PSEUDO_LABELS, SCHEMA_JSON]
     return tuple(p.stat().st_mtime if p.exists() else None for p in paths)
 
@@ -828,9 +862,9 @@ def _build_xai_context() -> dict:
         print("[xai] WARNING: per_feature_predicted_json not in hybrid scores — "
               "expected-vs-actual evidence unavailable; re-run scoring for full narratives.")
 
-    # Dense-block relational scores (V4.1 mobile/IP/pincode specialist, IP-priority
-    # weighted, max-combined into dense_block_score_relational). Consumed for the
-    # closed-form fusion breakdown and as narrative evidence.
+    # Dense-block relational scores (mobile/IP specialist, IP-priority weighted,
+    # max-combined into dense_block_score_relational; pincode dropped 2026-07-22).
+    # Consumed for the closed-form fusion breakdown and as narrative evidence.
     dense_map: dict = {}
     dense_relational_sorted = np.array([])
     if DENSE_CSV.exists():
@@ -855,6 +889,19 @@ def _build_xai_context() -> dict:
         deepsad_sorted = np.sort(deepsad_df["center_dist_score"].values.astype(float))
     else:
         print(f"[xai] WARNING: {DEEPSAD_CSV} not found — Deep SAD panel omitted from cards.")
+
+    # RGCN per-relation ablation (V4.3, 2026-07-22) — post-hoc, XAI-only.
+    # hybrid_graphmcm_v3.compute_relation_ablation() answers "which relation
+    # drove the model's neighbourhood-based expectation" for the LOCKED RGCN
+    # encoder, which (unlike the rejected HAN path) has no learned attention.
+    ablation_map: dict = {}
+    if ABLATION_CSV.exists():
+        ablation_df = pd.read_csv(ABLATION_CSV)
+        delta_cols = [c for c in ablation_df.columns if c.startswith("ablation_delta_")]
+        for _, r in ablation_df.iterrows():
+            ablation_map[r["application_id"]] = {c: float(r[c]) for c in delta_cols}
+    else:
+        print(f"[xai] WARNING: {ABLATION_CSV} not found — relation-ablation evidence omitted.")
 
     # Actual (scaled) feature values per application
     feat_df = pd.read_csv(FEATURES_CSV)
@@ -933,6 +980,7 @@ def _build_xai_context() -> dict:
         "dense_relational_sorted": dense_relational_sorted,
         "deepsad_map": deepsad_map,
         "deepsad_sorted": deepsad_sorted,
+        "ablation_map": ablation_map,
         "feat_value_map": feat_value_map,
         "subspace_map": subspace_map,
         "fusion_contrib": fusion_contrib,
@@ -1024,9 +1072,10 @@ def _assemble_card(app_id: str, ctx: dict) -> dict | None:
             # Graph structure is a raw fact, not a model output — so it is
             # tagged with the model(s) that CONSUME it. The RGCN graph stream
             # reads every edge type; the shared-identity dense-block additionally
-            # reads shares_mobile/shares_ip/shares_pincode (extended 2026-07-22).
+            # reads shares_mobile/shares_ip only (pincode added 2026-07-22, then
+            # dropped same day — not a valid fraud signal on its own).
             "consumed_by": (["hybrid", "dense_relational"]
-                             if et in ("shares_mobile", "shares_ip", "shares_pincode")
+                             if et in ("shares_mobile", "shares_ip")
                              else ["hybrid"]),
         }
         if et in stats.get("degree_sorted", {}):
@@ -1088,6 +1137,7 @@ def _assemble_card(app_id: str, ctx: dict) -> dict | None:
             "observed":  round(float(observed), 6) if observed is not None else None,
             "threshold": round(float(sig["threshold"]), 6) if "threshold" in sig else None,
             "q":         sig.get("q"),
+            "n_flagged": sig.get("n_flagged"),
             "source_model": TRIGGER_MODEL.get(t),
         }
 
@@ -1163,7 +1213,8 @@ def _assemble_card(app_id: str, ctx: dict) -> dict | None:
         for k, c in sorted(contrib.items(), key=lambda kv: kv[1].get("normalized", 0.0), reverse=True)
     ]
 
-    # Dense-block-relational membership evidence (mobile/IP/pincode specialist).
+    # Dense-block-relational membership evidence (mobile/IP specialist; pincode
+    # dropped 2026-07-22 -- not a valid fraud signal on its own).
     # by_relation carries each relation's own raw score so the card can name
     # WHICH shared identity value actually drove it, not just the combined max.
     dense_scores = dense_map.get(app_id, {})
@@ -1173,7 +1224,7 @@ def _assemble_card(app_id: str, ctx: dict) -> dict | None:
         "source_model": "dense_relational",
         "by_relation": {
             rel: round(dense_scores[f"dense_block_score_{rel}"], 6)
-            for rel in ("mobile", "ip", "pincode")
+            for rel in ("mobile", "ip")
             if f"dense_block_score_{rel}" in dense_scores
         },
     }
@@ -1194,6 +1245,24 @@ def _assemble_card(app_id: str, ctx: dict) -> dict | None:
         if ctx["deepsad_sorted"].size:
             deepsad_ev["percentile"] = round(_pct_rank(ctx["deepsad_sorted"], float(deepsad_score)), 2)
     evidence["deepsad"] = deepsad_ev
+
+    # RGCN per-relation ablation (V4.3, 2026-07-22) — post-hoc answer to "which
+    # relation drove the model's neighbourhood-based expectation", since the
+    # production RGCN encoder (unlike the rejected HAN path) has no learned
+    # attention. delta = baseline_error - ablated_error per relation; positive
+    # means removing that relation's neighbours made this node fit BETTER
+    # (i.e. that relation's context is why the model's expectation looked off).
+    ablation_deltas = ctx["ablation_map"].get(app_id, {})
+    ablation_ev = None
+    if ablation_deltas:
+        by_rel = {c.replace("ablation_delta_", ""): round(v, 6) for c, v in ablation_deltas.items()}
+        top_rel, top_delta = max(by_rel.items(), key=lambda kv: kv[1])
+        ablation_ev = {
+            "by_relation": by_rel,
+            "top_relation": top_rel if top_delta > 0.0 else None,
+            "top_delta": round(top_delta, 6) if top_delta > 0.0 else 0.0,
+        }
+    evidence["relation_ablation"] = ablation_ev
 
     # Model-traceability trail: for each fused model, what it is / reads, its
     # own normalised value for THIS application, whether it was the ARGMAX

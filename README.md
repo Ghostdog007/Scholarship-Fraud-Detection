@@ -590,6 +590,86 @@ screen-by-screen operator walkthrough see `docs/OPERATIONS_RUNBOOK.md`.
 
 ## Changelog
 
+### 2026-07-22 — Explainability build-out: RGCN relation ablation, EVT empirical rates, ring fixes, cohort-preview signal drivers
+
+Same-day follow-up: three requested explainability enhancements, plus two
+real bugs found and fixed while verifying them live via Playwright against
+the rebuilt Docker API.
+
+- **RGCN per-relation ablation (new, XAI-only)** —
+  `hybrid_graphmcm_v3.compute_relation_ablation()`: the production RGCN
+  encoder has no learned attention (unlike the rejected HAN path, whose
+  `beta_r`/`top_alpha` stay dormant), so "expected this based on neighbours"
+  couldn't say WHICH relation drove that expectation. Re-scores the locked
+  checkpoint 5 extra times (once per edge type, masked via
+  `edge_type_tensor`, no retraining) and reports, per node, which relation's
+  removal improved feature-reconstruction fit the most. New pipeline step
+  `relation_ablation` (`main_v3.py`, between `train_hybrid` and
+  `subspace_if`); writes `outputs/relation_ablation_v3.csv`; narrated as
+  "Neighbourhood-expectation driver" on cards and shown as a bar on the
+  Signal drivers tab. Never feeds fusion or any threshold.
+- **EVT empirical-rate framing** — every `evt_scorer_v3._fit_evt()` branch
+  (POT-GPD and both fallbacks) now returns `n_flagged`; trigger sentences
+  cite the actual measured flagged rate for that signal ("this pattern was
+  this extreme in 31 of 15,000 applications, ~0.21%") instead of only the
+  aspirational target `Q` the tail was fit towards.
+- **Dense-block core highlighting on the 3D ring** — a gold diamond outline
+  now marks nodes that are part of the actual Charikar-peeled dense core
+  (`dense_block_score_relational > 0`), distinguishing real ring members
+  from incidental shares-X neighbours. `xai_card_html_v3._dense_core_app_ids()`.
+- **Per-relation edge toggle on the ring** — each relation's legend entry now
+  explicitly supports click-to-hide / double-click-to-isolate
+  (`itemclick="toggle"`, `itemdoubleclick="toggleothers"`), for decluttering
+  dense identity cliques.
+- **Bug fix: `shares_mother_name` (and any relation) could be silently
+  dropped from the ring.** `graph_viz_v3._figure_for_ring` used to keep only
+  the FIRST relation seen for a node pair (`edge_rel.setdefault`), so a pair
+  sharing both e.g. `shares_ip` and `shares_mother_name` only ever drew the
+  IP edge. Fixed to track every relation connecting a pair and draw one line
+  per relation — this also means the new edge-toggle now works correctly
+  for such pairs (previously, toggling the shadowing relation off did not
+  reveal the hidden one, because it was never rendered in the first place).
+- **Cohort-preview Signal drivers were empty; now populated.**
+  `POST /evaluate-dataset` now also computes subspace IF
+  (`subspace_if_v3.compute_subspace_if_scores`, refactored out as a reusable
+  pure function shared with `run_subspace_if()`) and dense-block scores over
+  the batch's merged population, plus a preview fusion score via the SAME
+  `fusion_classifier_v3.score_level_fusion()` /
+  `xai_layer_v3.build_fusion_contributions()` the committed pipeline uses.
+  `build_staged_card_html()` now reads these into `subspace_groups` /
+  `dense_block_relational` / `fusion_contributions` instead of hardcoded
+  empty dicts. Still clearly labeled PREVIEW, still not `risk_score_v3`
+  (renormalised over the cohort's own population, not the canonical one's
+  fixed scale), still without EVT triggers or model-traceability margins.
+  Verified live via Playwright against the rebuilt `nic-api` image on the
+  `stress_testing_1` cohort — bars, fusion-composition footer, and the
+  corrected preview-note text all render correctly.
+
+### 2026-07-22 — Dense-block pincode gate reverted (redlined, sole-author lead direction)
+
+Same-day follow-up to the dense-block relational extension below: pincode
+**removed** from the dense-block gate per lead direction. Shared pincode
+reflects legitimate geographic clustering, not collusion — it is not a
+valid fraud signal **on its own** for this detector (the RGCN/hybrid
+detector still consumes `shares_pincode` edges as part of the unchanged
+5-relation identity graph; this only affects the dense-block specialist's
+own gate).
+
+- **`DENSE_BLOCK_RELATIONS` reverted from `[0, 1, 4]` (mobile+ip+pincode) to
+  `[0, 1]` (mobile+ip only)**; `DENSE_BLOCK_RELATION_WEIGHTS` reverted from
+  `{0: 0.3, 1: 1.0, 4: 0.2}` to `{0: 0.3, 1: 1.0}` (mobile: 0.3, ip: 1.0).
+  `src/config_v3.py`.
+- `src/dense_block_detector_v3.py` no longer emits `dense_block_score_pincode`
+  — output columns are `dense_block_score_mobile`/`dense_block_score_ip` +
+  `dense_block_score_relational`.
+- `src/xai_layer_v3.py`, `src/xai_card_html_v3.py`, `src/fusion_classifier_v3.py`,
+  `src/compare_architectures_v3.py` updated to match — the dense-block
+  evidence section on XAI cards now names only mobile/IP as the shared
+  identity value that can drive a dense-block flag.
+- History: dense-block was `shares_ip`-only → extended to
+  mobile + ip + pincode earlier 2026-07-22 (see the entry below) → pincode
+  dropped same day, reverted to mobile + ip.
+
 ### 2026-07-22 — RGCN root_weight fix + Deep SAD supplementary signal (XAI cards)
 
 Two real architecture changes, both prototyped on `stress_testing_1` before
@@ -745,7 +825,8 @@ file.
   (the argmax) + `margin_over_next` (how clearly it won). Cards show a
   DRIVER badge on the winning detector instead of a percentage-share bar;
   the dense-block evidence section now names WHICH shared identity value
-  (mobile/IP/pincode) actually drove the flag. `src/xai_layer_v3.py`,
+  (mobile/IP — pincode was briefly included here, dropped later the same
+  day, see the entry above) actually drove the flag. `src/xai_layer_v3.py`,
   `src/xai_card_html_v3.py`, `src/export_v3.py` (scorecard columns renamed
   `subspace_normalized`/`dense_relational_normalized`/`hybrid_normalized` +
   `driving_margin`, replacing the old `*_share` columns).
