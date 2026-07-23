@@ -9,6 +9,20 @@ _BFP = "S2FuaXNoayBTaGFybWEgfCBOU1VUIHwgQmF0Y2ggMjAyNyB8IHNvbGUgYXV0aG9yLCBOSUMg
 # override lets the ablation harness reconstruct the old 68-feature control.
 N_FEATURES      = int(os.environ.get("V4_N_FEATURES", "44"))
 
+# Training data source for main_v3.py's build_base/build_graph steps (step 4
+# cut-over switch, hard stop 13): "file" is the default, unchanged path —
+# raw CSV + file-based feature/graph builders. "postgres" switches to
+# build_base_pg()/build_graph_pg() (src/db/features.py), reading every
+# MERGED batch (primary + any admin-merged cohorts) instead of just the
+# original raw CSV, writing to the SAME canonical file paths so every
+# downstream step (add_degree_features, train, ...) is unaffected. Gate 4
+# already demonstrated bit-exact parity on the 15k primary population — this
+# flag is how an operator (or the API) opts a given run into reading Postgres
+# without changing the default for anyone else. Set via NIC_DATA_SOURCE=postgres.
+DATA_SOURCE = os.environ.get("NIC_DATA_SOURCE", "file")
+if DATA_SOURCE not in ("file", "postgres"):
+    raise ValueError(f"NIC_DATA_SOURCE must be 'file' or 'postgres', got '{DATA_SOURCE}'")
+
 # Nominal identifier / code features dropped from the MODEL feature set (single
 # source of truth — consumed by tabular_feature_engine_v3 to shrink the schema and
 # by xai_layer_v3 as the never-narrated set). Their sharing signal is preserved by

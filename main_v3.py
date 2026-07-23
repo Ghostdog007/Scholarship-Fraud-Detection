@@ -177,15 +177,26 @@ def run_pipeline(steps: list[str] | None = None, smoke_test: bool = False, cycle
     t0 = time.time()
 
     def _pipeline_body():
+        import src.config_v3 as cfg
         if should_run("build_base"):
-            print("\n[main] Step 1: Feature engine -- build_base()")
-            from src.tabular_feature_engine_v3 import build_base
-            build_base()
+            if cfg.DATA_SOURCE == "postgres":
+                print("\n[main] Step 1: Feature engine -- build_base_pg() [NIC_DATA_SOURCE=postgres]")
+                from src.tabular_feature_engine_v3 import build_base_pg, NODEG_CSV
+                build_base_pg(out_csv=NODEG_CSV)
+            else:
+                print("\n[main] Step 1: Feature engine -- build_base()")
+                from src.tabular_feature_engine_v3 import build_base
+                build_base()
 
         if should_run("build_graph"):
-            print("\n[main] Step 2: Graph builder -- build_graph()")
-            from src.graph_builder_v3 import build_graph
-            build_graph()
+            if cfg.DATA_SOURCE == "postgres":
+                print("\n[main] Step 2: Graph builder -- build_graph_pg() [NIC_DATA_SOURCE=postgres]")
+                from src.graph_builder_v3 import build_graph_pg, GRAPH_PT, DEGREE_CSV
+                build_graph_pg(out_graph=GRAPH_PT, out_degree=DEGREE_CSV)
+            else:
+                print("\n[main] Step 2: Graph builder -- build_graph()")
+                from src.graph_builder_v3 import build_graph
+                build_graph()
 
         if should_run("add_degree_features"):
             print("\n[main] Step 3: Feature engine -- add_degree_features()")

@@ -331,16 +331,23 @@ Invoke-RestMethod -Method POST "http://localhost:8000/v3/training/incremental?cy
 Runs `main_v3.py` end-to-end (feature engineering → scoring → EVT → self-training → LightGBM → XAI). Takes 2–4 hours on CPU. Only needed when drift requires a full retrain.
 
 ```powershell
-# Full run
+# Full run (reads data/raw/data_for_ml_model.csv — the default, unchanged)
 Invoke-RestMethod -Method POST "http://localhost:8000/v3/training/full"
 
 # Smoke test first (strongly recommended before committing hours)
 Invoke-RestMethod -Method POST "http://localhost:8000/v3/training/full?smoke_test=true"
+
+# Read straight from Postgres instead of the CSV (added 2026-07-23) — every
+# MERGED batch (primary + any admin-merged cohorts/patterns), no CSV file
+# needed. Data must already be staged + merged first (Intake -> Evaluate ->
+# Decide, or Pattern queue -> Promote) — this only controls where the
+# retrain reads FROM.
+Invoke-RestMethod -Method POST "http://localhost:8000/v3/training/full?data_source=postgres"
 ```
 
 **Expected:**
 ```json
-{"job_id": "xxxxxxxx-...", "status": "pending", "message": "Full pipeline queued"}
+{"job_id": "xxxxxxxx-...", "status": "pending", "message": "Full pipeline queued (source=file)"}
 ```
 
 ---
@@ -808,6 +815,38 @@ is far outside the training distribution, so the KS test is maximally
 confident. A p-value that small on real production data would itself be a
 signal worth double-checking (e.g. a schema mismatch), not just "very
 strong drift" — see §9.6.
+
+### 9.1b Push a dataset in without going through the console (CSV-free portal/ETL path, added 2026-07-23)
+
+`POST /v3/monitoring/push-dataset` is the scale-oriented alternative to
+uploading through the browser: it takes a **server-side file path**, not an
+inline row payload — deliberately, since 3-4M rows as JSON in a request body
+doesn't hold up, but a path to a CSV a portal/ETL job already wrote into the
+shared `data/` volume does. It schema-checks the same way as the console's
+upload, stages the batch in Postgres, and — if the schema passes — dispatches
+Evaluate as a **background Celery job** instead of blocking the request:
+
+```powershell
+Invoke-RestMethod -Method POST "http://localhost:8000/v3/monitoring/push-dataset" `
+  -ContentType "application/json" `
+  -Body '{"dataset_path": "data/uploads/new_cohort_2026.csv", "name": "portal_batch_2026_07_23"}'
+```
+
+**Expected (job dispatched immediately, doesn't wait for Evaluate to finish):**
+```json
+{"dataset_path": "data/uploads/new_cohort_2026.csv", "name": "portal_batch_2026_07_23",
+ "n_rows": 600, "n_cols": 136, "schema_ok": true, "missing_columns": [], "extra_columns": [],
+ "duplicate_ids": [], "staged_batch": {"batch_id": 7, "name": "portal_batch_2026_07_23", "status": "staged", "n_rows": 600, "n_id_conflicts": 0},
+ "job_id": "xxxxxxxx-...", "message": "Staged and queued for auto-evaluate"}
+```
+
+Poll `job_id` the same way as any training job
+(`GET /v3/training/jobs/{job_id}`). Once it completes, the batch is
+reviewable in the console's cohort dataset switcher exactly like a
+console-uploaded cohort — **nothing merges or retrains automatically**;
+Merge/retrain still goes through `POST /v3/training/decision` (§9.3)
+same as today. If `schema_ok` is `false`, `job_id` is `null` and nothing was
+staged — fix the CSV and re-push.
 
 ### 9.2 Review XAI on the staged (not-yet-committed) data
 

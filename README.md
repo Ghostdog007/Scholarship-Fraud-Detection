@@ -595,6 +595,62 @@ screen-by-screen operator walkthrough see `docs/OPERATIONS_RUNBOOK.md`.
 
 ## Changelog
 
+### 2026-07-23 — CSV-free portal/ETL push endpoint (auto-preprocess, no auto-merge/retrain)
+
+`POST /v3/monitoring/push-dataset` (new, `src/api/handlers/monitoring.py`):
+a portal/ETL job names a raw-schema CSV it already wrote to the shared
+`data/` volume (mounted into both `nic-api` and `nic-worker`) — no inline
+JSON row payload, deliberately, since 3-4M rows in a request body doesn't
+hold up at scale where a file path does. Schema-checked the same way as the
+console's `upload-dataset`; on pass, stages the batch in Postgres
+(`stage_raw_csv()`, unchanged) and dispatches Evaluate as a background
+Celery task, returning a `job_id` immediately instead of blocking the
+request for however long feature/graph rebuild + scoring takes.
+
+Refactored `evaluate_dataset()`'s body into `_run_evaluate()` so the
+console's synchronous route and the new async task run the *identical*
+tested code path — no duplicated logic to drift out of sync. Concurrency
+safety needed no new locking: `worker_concurrency=1` (hard stop 16,
+`celeryconfig.py`) already serializes every Celery task, so an
+auto-triggered Evaluate can't collide with another training/evaluate job's
+canonical-file backup/restore.
+
+**Deliberately scoped to auto-preprocess only** — Merge (into the base data)
+and retrain dispatch stay separate, human-gated calls
+(`POST /v3/training/decision`), exactly as for a console-uploaded cohort.
+See `docs/OPERATIONS_RUNBOOK.md` §5c for the operator/integrator steps.
+
+### 2026-07-23 — Opt-in Postgres-sourced full retrain via API (no CSV required)
+
+`POST /v3/training/full` gained a `data_source` query param (`"file"`
+default, unchanged; `"postgres"` new) that lets a full retrain read every
+**merged** batch straight from Postgres (`src/db/features.py
+fetch_raw_frame()`/`edge_groups()`) instead of `data/raw/data_for_ml_model.csv`
+— no CSV round-trip needed once data is already staged + merged. Wired via
+`config_v3.DATA_SOURCE` (`NIC_DATA_SOURCE` env), which `main_v3.py`'s
+`build_base`/`build_graph` steps branch on to call `build_base_pg()`/
+`build_graph_pg()` (already built and gate-4-verified bit-exact, step 4 of
+the V4-Scale migration) writing to the same canonical file paths the rest
+of the pipeline expects — every downstream step is unaffected either way.
+See `docs/OPERATIONS_RUNBOOK.md` §5a for the operator steps.
+
+Fixed en route: `fetch_raw_frame()` previously derived its row set/order
+from the raw CSV's own `application_id` list (a known gap called out in its
+own docstring), so any batch merged into Postgres *after* the primary 15k
+would have been silently dropped from a Postgres-sourced read. It now reads
+row set/order entirely from Postgres (every `status='merged'` batch); only
+the static 136-column header still comes from the file (schema names, not
+row data). Re-verified bit-exact against the canonical
+`engineered_features_v3_nodeg.csv` after the fix, aligned by
+`application_id` (max abs diff 0.0).
+
+**Still file-based, not yet closed:** this is an opt-in read-path switch,
+not a default flip — nothing about hard stop 13 ("authoritative only after
+demonstrated parity") changes by default. Also, landing raw rows in
+Postgres in the first place still requires a CSV via `stage_raw_csv()` — a
+CSV-free *ingestion* entry point (portal/DB push -> auto-preprocess) is
+separate, not-yet-scoped work (see `docs/IMPLEMENTATION.md`, "After step 5").
+
 ### 2026-07-23 — hybrid_anomaly_score drops edge_pred_error's contribution (redlined, lead direction)
 
 `LAMBDA_EDGE_SCORE` (new, `config_v3.py`) decouples the inference-time score

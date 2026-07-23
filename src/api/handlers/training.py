@@ -48,14 +48,23 @@ def start_incremental(cycle: str = "unknown", smoke_test: bool = False):
 
 
 @router.post("/full", response_model=JobResponse)
-def start_full_pipeline(smoke_test: bool = False):
+def start_full_pipeline(smoke_test: bool = False, data_source: str = "file"):
+    """Trigger a full retrain with no CSV required when data_source='postgres':
+    reads every MERGED batch straight from Postgres (src/db/features.py
+    fetch_raw_frame/edge_groups) instead of data/raw/data_for_ml_model.csv.
+    Data must already be staged + merged (Intake -> Evaluate -> Decide, or
+    Pattern queue -> Promote) — this endpoint only controls where the
+    retrain reads FROM, it does not itself merge or preprocess anything."""
+    if data_source not in ("file", "postgres"):
+        raise HTTPException(status_code=422, detail="data_source must be 'file' or 'postgres'")
     from src.api.tasks import run_full_pipeline_task
-    task = run_full_pipeline_task.delay(smoke_test=smoke_test)
-    log.info("training.full.queued", job_id=task.id, smoke_test=smoke_test)
+    task = run_full_pipeline_task.delay(smoke_test=smoke_test, data_source=data_source)
+    log.info("training.full.queued", job_id=task.id, smoke_test=smoke_test, data_source=data_source)
     return JobResponse(
         job_id=task.id,
         status="pending",
-        message="Full pipeline queued" + (" (smoke test — 2 epochs)" if smoke_test else ""),
+        message=f"Full pipeline queued (source={data_source})"
+                + (" (smoke test — 2 epochs)" if smoke_test else ""),
     )
 
 

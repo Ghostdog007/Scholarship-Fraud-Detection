@@ -248,3 +248,44 @@ Cut-over review with the lead: retire dual-writes (JSON stores become
 read-only archives), update `OPERATIONS_RUNBOOK.md` and `deploy/README.md`
 for the Postgres-backed stack, and schedule the first real 3.5M ingest plus
 the K_CAP profiling query (open decision #1).
+
+**2026-07-23 — opt-in Postgres-sourced full retrain (pre-cut-over, proposed pending lead review):**
+`main_v3.py`'s `build_base`/`build_graph` steps now branch on
+`config_v3.DATA_SOURCE` (`NIC_DATA_SOURCE` env, default unchanged: `"file"`)
+to call `build_base_pg()`/`build_graph_pg()` writing to the SAME canonical
+paths, instead of the file-based builders — opt-in only, default behavior
+for every existing caller is untouched. `POST /v3/training/full` gained a
+`data_source` query param (default `"file"`) that threads through the Celery
+task to the env var, so a full retrain can be dispatched via API reading
+straight from Postgres, with no CSV involved, once data is staged + merged
+(Intake -> Evaluate -> Decide, or Pattern queue -> Promote).
+
+Fixed en route: `src/db/features.py:fetch_raw_frame()` previously sourced
+its row set/order from the raw CSV's `application_id` list (a leftover
+noted in its own docstring — "until cut-over adds an ingest_seq"), so any
+batch merged into Postgres *after* the primary 15k would have been silently
+dropped from a Postgres-sourced retrain. It now sources rows/order entirely
+from Postgres (`ORDER BY batch_id, application_id` over every `status='merged'`
+batch); only the static 136-column header still comes from the file (schema
+names, not row data). Re-verified bit-exact against the canonical
+`engineered_features_v3_nodeg.csv` on the 15k after the fix (`fetch_raw_frame`
+row content identical when aligned on `application_id`; `build_base_pg()`
+output max abs diff 0.0 aligned the same way — row order differs from the
+file's, which is why alignment matters, but content does not).
+
+**Not yet done — flagging, not closing hard stop 13:** this is opt-in, not a
+default flip, and the `applications` staging path (`stage_raw_csv`) still
+requires a CSV to land the raw rows in Postgres in the first place. A
+CSV-free *ingestion* entry point (portal/DB push -> auto-preprocess) is a
+separate, not-yet-scoped piece of work — this change only fixes the *read*
+side (retrain sourcing) once data is already merged.
+
+**2026-07-23, same day — the CSV-free ingestion entry point above is now
+built:** `POST /v3/monitoring/push-dataset` — names a server-side CSV path
+(not an inline row payload; deliberately, for scale), stages it in Postgres,
+and auto-dispatches Evaluate as a background Celery task. Auto-preprocess
+only, as scoped: Merge/retrain remain a separate, human-gated
+`POST /v3/training/decision` call. See `README.md` changelog and
+`docs/OPERATIONS_RUNBOOK.md` §5c for the operator/integrator steps. Still
+requires *some* process to write the CSV to the shared `data/` volume —
+this endpoint removes the console/browser step, not the file-write step.

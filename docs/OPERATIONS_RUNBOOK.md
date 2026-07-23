@@ -1,5 +1,5 @@
 # NIC Fraud Detection V3 — Operations Runbook
-<!-- VERSION: 2.1 | OWNER: Project Lead | DATE: 2026-07-21 -->
+<!-- VERSION: 2.4 | OWNER: Project Lead | DATE: 2026-07-23 -->
 <!-- Audience: Supervisor / reviewer operating the console -->
 <!-- Companion: deploy/README.md (full local+k8s deploy), docs/AGENTS.md (architecture) -->
 
@@ -238,6 +238,118 @@ retrain is recommended before the next incremental update.
 4. **Watch** — the dispatched job's id auto-fills here; status polls
    automatically, or paste any job id and **Poll status**.
 
+### 5a. Committing new data to the model — step by step
+
+Use this whenever you have a new batch of applications (a cohort CSV) that
+should actually become part of what the model is trained/scored on, not just
+previewed. This is the **Merge** path through the deployment loop above.
+
+1. **Intake** — Admin → Intake → pick **"New cohort to score"** → drop the CSV
+   (full 136-column raw schema, fresh `application_id`s). Fix any schema
+   mismatch before continuing.
+2. **Evaluate** — click **Evaluate**. This scores the cohort read-only
+   (pre-fusion `hybrid_anomaly_score`) and reports a drift p-value; it also
+   persists a cohort bundle so you can review it in the Review queue's
+   **Dataset** switcher (§3) before deciding anything.
+3. **Review the cohort (recommended)** — switch to the cohort in the Review
+   queue, sanity-check the flagged applications, rings, and signal drivers.
+   Nothing is committed yet — this step is still read-only.
+4. **Decide** — Admin → Decide, then pick one:
+   - **Log "no action"** — discard; nothing is committed.
+   - **Merge + incremental update** — permanently adds the cohort's rows to
+     the base data and dispatches a human-gated incremental fine-tune
+     (10 epochs, RGCN frozen). Use for routine batches.
+   - **Merge + full retrain** — permanently adds the cohort and dispatches a
+     full retrain. Use when the drift explanation (§5) recommends it, or
+     after several incremental merges have accumulated.
+   Either merge option requires confirming the on-screen warning — this is
+   the point of no return; the rows become part of the scored population and
+   the model's training data.
+5. **Watch** — the job id auto-fills in step 4 of the deployment loop; status
+   polls automatically. Wait for it to finish before treating the cohort as
+   live.
+6. **Verify** — Admin → status strip → **↻ Refresh** to confirm the scored-
+   population count grew and a new entry appears in **Run history** with the
+   checkpoint size/metrics for this merge. The merged applications now also
+   show up in the primary Review queue (no longer under the cohort dataset
+   switcher, since they're part of the primary population).
+
+To commit a brand-new **fraud ring** (not a scoring cohort) instead, use
+Intake → **"New fraud pattern (relational LOE)"** — see step 1's second bullet
+above — or promote an already-flagged ring via **Pattern queue → Promote
+selected patterns** (§4); both of those commit directly without a separate
+Decide step.
+
+### 5b. Triggering a full retrain straight from Postgres (no CSV) — added 2026-07-23
+
+Once data is merged (§5a steps 1–4 above, by any route — cohort Merge, LOE
+pattern Ingest/Promote), a full retrain can be dispatched via the API so it
+reads every merged batch **directly from Postgres**, with no CSV file
+involved at all — useful for scripted/portal-triggered retrains that don't
+go through the console's Decide button.
+
+There is no console button for this yet — it's API-only:
+
+```bash
+curl -X POST "http://localhost:8080/v3/training/full?data_source=postgres"
+```
+
+(swap `localhost:8080` for wherever the console is reachable; add
+`&smoke_test=true` for a fast dry run first). This returns a `job_id` —
+poll it the same way as any other training job (`GET
+/v3/training/jobs/{job_id}`, or Admin → Watch, pasting the job id in).
+
+**What this does and doesn't do:**
+- It only changes **where the retrain reads its raw data from** — Postgres
+  instead of `data/raw/data_for_ml_model.csv`. It does **not** merge,
+  preprocess, or stage anything by itself. If nothing has been merged since
+  the last file-based retrain, a `postgres`-sourced retrain sees the same
+  population as the primary 15k (plus whatever cohorts/patterns are already
+  merged) — it is not a way to skip Evaluate/Decide.
+- Omit `data_source` (or pass `data_source=file`, the default) to keep
+  today's behavior — reads the CSV, exactly as before. Nothing changes for
+  existing callers.
+- Every downstream pipeline step (graph build, training, EVT, fusion, XAI)
+  is unaffected either way — the switch only touches the first two pipeline
+  steps (feature engineering + graph build), and both paths write to the
+  same canonical files those downstream steps already read.
+
+### 5c. Getting data in without the console at all — CSV-free portal/ETL push (added 2026-07-23)
+
+For a portal or ETL job that needs to hand off a batch of applications
+without a person clicking through Intake, `POST /v3/monitoring/push-dataset`
+does the Intake + Evaluate half of §5a automatically — **Decide/Merge/retrain
+still require a separate, human-gated call**, same as every other path in
+this runbook.
+
+1. **The sender writes a raw-schema CSV** (same full 136-column contract as
+   §6) to a path both `nic-api` and `nic-worker` can read — the `data/`
+   folder already mounted into both containers (e.g. `data/uploads/`, same
+   place the console's browser upload lands). This is a file-system drop,
+   not an HTTP upload — no inline JSON row payload, since a multi-million-row
+   JSON body doesn't hold up at scale; a file path does.
+2. **Call the push endpoint:**
+   ```bash
+   curl -X POST "http://localhost:8080/v3/monitoring/push-dataset" \
+     -H "Content-Type: application/json" \
+     -d '{"dataset_path": "data/uploads/portal_batch.csv", "name": "portal_batch_2026_07_23"}'
+   ```
+   This runs the same schema check as a console upload (missing/extra
+   columns, duplicate IDs). If it fails, the response says so and nothing is
+   staged — fix the file and re-push. If it passes, the batch is staged in
+   Postgres immediately and a `job_id` comes back right away — the
+   preprocessing (feature engineering + graph rebuild + scoring) runs in the
+   background, it does not block the request.
+3. **Poll the job** the same way as any other training job:
+   `GET /v3/training/jobs/{job_id}`.
+4. **Review it like any other cohort** once the job completes — it shows up
+   in the Review queue's **Dataset** switcher (§3) exactly as if someone had
+   uploaded it through Intake and clicked Evaluate.
+5. **Decide is still separate and still manual** — nothing here merges the
+   batch into the base data or retrains anything. Use Admin → Decide (§5a
+   step 4) or `POST /v3/training/decision` to Merge + incremental/full
+   retrain when you're ready, exactly as with a console-uploaded cohort.
+
 **Run history**: every training run and checkpoint swap (newest first) — when,
 type, cycle, metrics, checkpoint size. This is the audit trail.
 
@@ -307,7 +419,10 @@ Columns that actually drive detection (get these right first):
 | Confirm / clear a label | Buttons inside the reviewer card |
 | Turn a pattern into training signal | Pattern queue → **Promote** |
 | Score a new cohort | Admin → Intake → Evaluate |
+| Commit new data to the model | Admin → Intake → Evaluate → Decide → Merge + incremental/full retrain (§5a) |
 | Retrain the model | Admin → Decide |
+| Full retrain reading straight from Postgres (no CSV) | `POST /v3/training/full?data_source=postgres` (§5b) |
+| Push data in without the console (portal/ETL, no browser upload) | `POST /v3/monitoring/push-dataset` (§5c) |
 | See model metrics / history | Admin → status strip + Run history |
 | Install a GPU-laptop-trained model | Admin → Install pretrained checkpoint |
 | Undo a bad checkpoint | Admin → Rollback |

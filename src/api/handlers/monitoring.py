@@ -4,6 +4,9 @@ Monitoring endpoints — ADR-005 (+ drift-simulation extension).
 GET  /v3/monitoring/drift
 GET  /v3/monitoring/fraud-store-summary
 POST /v3/monitoring/evaluate-dataset   — score a new/unseen dataset read-only, check drift
+POST /v3/monitoring/push-dataset       — CSV-free portal/ETL intake: names a server-side
+                                          CSV path, stages it in Postgres, auto-evaluates
+                                          as a background job (added 2026-07-23)
 GET  /v3/monitoring/dataset-xai        — XAI preview for the top-N staged rows
 GET  /v3/monitoring/top-suspicious     — top-N suspicious apps from the last full run
 GET  /v3/monitoring/{app_id}/topology  — interactive topology view (HTML)
@@ -21,6 +24,8 @@ from src.api.schemas import (
     EvaluateDatasetRequest,
     EvaluateDatasetResponse,
     FraudStoreSummaryResponse,
+    PushDatasetRequest,
+    PushDatasetResponse,
 )
 from src.config_v3 import DRIFT_KS_THRESHOLD
 
@@ -188,13 +193,18 @@ def fraud_store_summary():
     )
 
 
-@router.post("/evaluate-dataset", response_model=EvaluateDatasetResponse)
-def evaluate_dataset(req: EvaluateDatasetRequest):
-    """
-    Read-only: temporarily merges dataset_path into the raw CSV, rebuilds
+def _run_evaluate(dataset_path: Path) -> dict:
+    """Core of Evaluate, callable synchronously (the console's
+    POST /evaluate-dataset, below) or from a Celery task (the CSV-free
+    push-dataset endpoint's auto-evaluate). Read-only against the canonical
+    population: temporarily merges dataset_path into the raw CSV, rebuilds
     features + graph, scores the new rows with the CURRENT checkpoint (no
     training), then restores the canonical files. Leaves no lasting change —
-    safe to call repeatedly. Writes a staged preview to outputs/staged_scores_*.
+    safe to call repeatedly, and safe to run as a Celery task since
+    worker_concurrency=1 (hard stop 16) already serializes it against any
+    other training/evaluate job. Writes a staged preview to
+    outputs/staged_scores_*. Returns the same fields EvaluateDatasetResponse
+    needs, as a plain dict.
     """
     import numpy as np
     import shutil
@@ -202,9 +212,8 @@ def evaluate_dataset(req: EvaluateDatasetRequest):
 
     from src.api import dataset_ops
 
-    dataset_path = Path(req.dataset_path)
     if not dataset_path.exists():
-        raise HTTPException(status_code=422, detail=f"dataset_path not found: {req.dataset_path}")
+        raise ValueError(f"dataset_path not found: {dataset_path}")
 
     new_df  = pd.read_csv(dataset_path, low_memory=False)
     new_ids = set(new_df["application_id"].astype(str))
@@ -274,8 +283,6 @@ def evaluate_dataset(req: EvaluateDatasetRequest):
         shutil.copy2(dataset_ops.GRAPH_PT, Path(f"outputs/staged_graph_{name}.pt"))
         merged_features[["application_id"]].to_csv(
             Path(f"outputs/staged_nodeorder_{name}.csv"), index=False)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
     finally:
         dataset_ops.restore_canonical_files(backup_dir)
         shutil.rmtree(backup_dir, ignore_errors=True)
@@ -313,13 +320,100 @@ def evaluate_dataset(req: EvaluateDatasetRequest):
 
     log.info("monitoring.evaluate_dataset", **meta)
 
-    return EvaluateDatasetResponse(
+    return {
+        "dataset_path": str(dataset_path),
+        "n_rows": len(staged_df),
+        "p_value": float(p),
+        "recommendation": recommendation,
+        "drift_detected": drift_detected,
+        "staged_scores_path": str(staged_scores_path),
+    }
+
+
+@router.post("/evaluate-dataset", response_model=EvaluateDatasetResponse)
+def evaluate_dataset(req: EvaluateDatasetRequest):
+    """Console/synchronous entry point — unchanged behavior, now backed by
+    _run_evaluate() so the push-dataset auto-evaluate path (below) runs the
+    identical, already-tested logic."""
+    dataset_path = Path(req.dataset_path)
+    try:
+        result = _run_evaluate(dataset_path)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return EvaluateDatasetResponse(**result)
+
+
+@router.post("/push-dataset", response_model=PushDatasetResponse)
+def push_dataset(req: PushDatasetRequest):
+    """CSV-free ingestion entry point for a portal/ETL job at scale: names a
+    raw-schema CSV the sender already wrote to a server-reachable path — the
+    same data/ volume already mounted into both nic-api and nic-worker
+    (docker-compose.yml / deploy/k8s), e.g. under data/uploads/ alongside
+    console uploads. No inline row payload, since 3-4M rows as JSON in a
+    request body doesn't hold up at scale. Schema-checked exactly like the console's
+    upload-dataset; if it passes, stages the batch in Postgres (same
+    stage_raw_csv() the console path uses) and dispatches Evaluate as a
+    background Celery job — auto-preprocess only. Nothing is merged into
+    the base data or retrained here; that stays the human-gated Decide step
+    (POST /v3/training/decision) exactly as today, reviewable in the console
+    same as any console-uploaded cohort once the job completes.
+    """
+    from src.api import dataset_ops
+
+    dataset_path = Path(req.dataset_path)
+    if not dataset_path.exists():
+        raise HTTPException(status_code=422, detail=f"dataset_path not found: {req.dataset_path}")
+    if not dataset_ops.RAW_CSV.exists():
+        raise HTTPException(status_code=500, detail=f"Canonical raw schema not found: {dataset_ops.RAW_CSV}")
+
+    name = req.name or dataset_path.stem
+
+    try:
+        base_cols = list(pd.read_csv(dataset_ops.RAW_CSV, nrows=0).columns)
+        new_df    = pd.read_csv(dataset_path, low_memory=False)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not read CSV: {e}")
+
+    base_set, new_set = set(base_cols), set(new_df.columns)
+    missing = sorted(base_set - new_set)
+    extra   = sorted(new_set - base_set)
+
+    duplicate_ids: list[str] = []
+    if "application_id" in new_df.columns and "application_id" in base_cols:
+        base_ids = set(pd.read_csv(dataset_ops.RAW_CSV, usecols=["application_id"])["application_id"].astype(str))
+        duplicate_ids = sorted(set(new_df["application_id"].astype(str)) & base_ids)[:10]
+
+    schema_ok = not missing
+    staged_batch = None
+    job_id = None
+    message = ""
+
+    if schema_ok:
+        from src.db.ingest import stage_raw_csv
+        staged_batch = stage_raw_csv(dataset_path, name=name, source="portal_sync")
+
+        from src.api.tasks import run_evaluate_dataset_task
+        task = run_evaluate_dataset_task.delay(str(dataset_path))
+        job_id = task.id
+        message = "Staged and queued for auto-evaluate"
+    else:
+        message = f"Schema check failed — missing {len(missing)} required column(s), not staged"
+
+    log.info("monitoring.push_dataset", dataset_path=str(dataset_path), name=name,
+             n_rows=len(new_df), schema_ok=schema_ok, job_id=job_id)
+
+    return PushDatasetResponse(
         dataset_path=str(dataset_path),
-        n_rows=len(staged_df),
-        p_value=float(p),
-        recommendation=recommendation,
-        drift_detected=drift_detected,
-        staged_scores_path=str(staged_scores_path),
+        name=name,
+        n_rows=int(len(new_df)),
+        n_cols=int(new_df.shape[1]),
+        schema_ok=schema_ok,
+        missing_columns=missing,
+        extra_columns=extra,
+        duplicate_ids=duplicate_ids,
+        staged_batch=staged_batch,
+        job_id=job_id,
+        message=message,
     )
 
 

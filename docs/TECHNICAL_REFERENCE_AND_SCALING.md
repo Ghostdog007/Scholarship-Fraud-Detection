@@ -633,8 +633,8 @@ output paths; two workers would corrupt each other).
 | Supervisor labels | `POST /confirm-fraud`, `/mark-false-positive`, `/clear-label`, `/confirm-batch` (batch label + optional retrain) |
 | LOE patterns | `GET /patterns`, `/patterns/all`, `/patterns/coverage/{app_id}` (dedup banner), `POST /patterns/confirm`, `/patterns/promote`, `/patterns/delete` |
 | Pattern CSV intake | `POST /pattern/test` (read-only scoring of an uploaded ring), `POST /pattern/ingest` (permanent ingest + topology-exposure + fine-tune) |
-| Dataset intake | `POST /upload-dataset`, `POST /evaluate-dataset` (read-only cohort scoring + drift p-value), `POST /decision` (merge / retrain, human-gated) |
-| Training | `POST /incremental`, `/full`, `GET /jobs/{job_id}` |
+| Dataset intake | `POST /upload-dataset`, `POST /evaluate-dataset` (read-only cohort scoring + drift p-value), `POST /push-dataset` (2026-07-23: CSV-free portal/ETL intake — server-side path, not inline rows, stages + auto-evaluates async, no merge/retrain), `POST /decision` (merge / retrain, human-gated) |
+| Training | `POST /incremental`, `/full` (`data_source=file\|postgres` param added 2026-07-23 — `postgres` reads every merged batch straight from Postgres, no CSV), `GET /jobs/{job_id}` |
 | Model lifecycle | `GET /checkpoint-info`, `/registry`, `POST /upload-checkpoint` (external GPU model ingestion — Part II §11.5), `/pull-checkpoint`, `/rollback` |
 | Monitoring | `GET /drift` (KS on score distribution, alert at p < 0.01), `/drift-explain` (feature-level KS over the 44 model features), `/fraud-store-summary`, `/stats`, `/dataset-xai`, `GET /health`, `/ready` |
 

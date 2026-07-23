@@ -21,32 +21,42 @@ from src.db.connection import get_connection
 
 RAW_CSV = Path("data/raw/data_for_ml_model.csv")
 
-_MERGED = "SELECT a.application_id, a.raw FROM applications a JOIN batches b ON a.batch_id = b.batch_id WHERE b.status = 'merged'"
+_MERGED_ORDERED = (
+    "SELECT a.application_id, a.raw FROM applications a JOIN batches b ON a.batch_id = b.batch_id"
+    " WHERE b.status = 'merged' ORDER BY b.batch_id, a.application_id"
+)
 
 
 def fetch_raw_frame() -> pd.DataFrame:
     """Reconstruct the raw dataframe from Postgres with IDENTICAL dtype
     inference to pd.read_csv on the file: rows are re-serialised to CSV text
-    and re-parsed. Column order and row order follow the canonical raw CSV
-    (until cut-over adds an ingest_seq; the file remains authoritative)."""
+    and re-parsed. Column list comes from the raw CSV header (static 136-col
+    raw schema, not row data — safe to read once). Row set and order come
+    from Postgres itself (every MERGED batch, ordered by batch then id) —
+    NOT from the raw CSV's id list, so any batch merged after the primary
+    15k (Decide -> Merge, or Pattern-queue Promote) is included here too.
+    This is what lets a Postgres-sourced full retrain (NIC_DATA_SOURCE=
+    postgres, config_v3.DATA_SOURCE) actually see newly merged data without
+    a CSV round-trip."""
     columns = list(pd.read_csv(RAW_CSV, nrows=0).columns)
-    id_order = pd.read_csv(RAW_CSV, usecols=["application_id"])["application_id"].astype(str).tolist()
 
     with get_connection() as conn:
-        rows = {r[0]: r[1] for r in conn.execute(_MERGED).fetchall()}
+        fetched = conn.execute(_MERGED_ORDERED).fetchall()
 
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(columns)
-    n_missing = 0
-    for app_id in id_order:
-        raw = rows.get(app_id)
-        if raw is None:
-            n_missing += 1
-            continue
-        w.writerow(["" if raw.get(c) is None else raw.get(c) for c in columns])
-    if n_missing:
-        print(f"[db.features] WARNING: {n_missing} raw-CSV ids missing from Postgres")
+    n_extra_cols = 0
+    for _app_id, raw in fetched:
+        row = ["" if raw.get(c) is None else raw.get(c) for c in columns]
+        extra = set(raw.keys()) - set(columns)
+        if extra:
+            n_extra_cols += 1
+        w.writerow(row)
+    if n_extra_cols:
+        print(f"[db.features] NOTE: {n_extra_cols} rows carried columns outside the "
+              f"canonical raw schema (ignored, schema check should have blocked these)")
+    print(f"[db.features] fetch_raw_frame(): {len(fetched)} rows from all merged batches")
     buf.seek(0)
     return pd.read_csv(buf, low_memory=False)
 

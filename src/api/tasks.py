@@ -19,6 +19,19 @@ celery_app = Celery("nic_fraud")
 celery_app.config_from_object(celeryconfig)
 
 
+@celery_app.task(bind=True, name="tasks.run_evaluate_dataset")
+def run_evaluate_dataset_task(self, dataset_path: str):
+    """Auto-preprocess for the CSV-free push-dataset endpoint (monitoring.py
+    push_dataset): runs the same Evaluate logic the console's synchronous
+    POST /evaluate-dataset uses (src.api.handlers.monitoring._run_evaluate),
+    just dispatched async so a portal push doesn't hold an HTTP connection
+    open for however long feature/graph rebuild + scoring takes. Merge/
+    retrain are NOT part of this — those stay the human-gated Decide step."""
+    from src.api.handlers.monitoring import _run_evaluate
+    result = _run_evaluate(Path(dataset_path))
+    return {"status": "complete", **result}
+
+
 @celery_app.task(bind=True, name="tasks.run_incremental")
 def run_incremental_task(self, cycle: str = "unknown", smoke_test: bool = False):
     from src.retraining_orchestrator import run_incremental_update
@@ -27,11 +40,15 @@ def run_incremental_task(self, cycle: str = "unknown", smoke_test: bool = False)
 
 
 @celery_app.task(bind=True, name="tasks.run_full_pipeline")
-def run_full_pipeline_task(self, smoke_test: bool = False):
+def run_full_pipeline_task(self, smoke_test: bool = False, data_source: str = "file"):
+    import os
+    if data_source not in ("file", "postgres"):
+        raise ValueError(f"data_source must be 'file' or 'postgres', got '{data_source}'")
     args = [sys.executable, "main_v3.py"]
     if smoke_test:
         args.append("--smoke")
-    result = subprocess.run(args, capture_output=True, text=True)
+    env = {**os.environ, "NIC_DATA_SOURCE": data_source}
+    result = subprocess.run(args, capture_output=True, text=True, env=env)
     if result.returncode != 0:
         raise RuntimeError(
             f"Pipeline failed (rc={result.returncode}): {result.stderr[-1000:]}"
@@ -44,6 +61,7 @@ def run_full_pipeline_task(self, smoke_test: bool = False):
         "full",
         cycle="full_pipeline",
         smoke_test=smoke_test,
+        params={"data_source": data_source},
         checkpoint={
             "path":    str(ckpt),
             "size_mb": round(ckpt.stat().st_size / 1e6, 2) if ckpt.exists() else None,
@@ -51,6 +69,7 @@ def run_full_pipeline_task(self, smoke_test: bool = False):
     )
     return {
         "status": "complete",
+        "data_source": data_source,
         "smoke_test": smoke_test,
         "stdout_tail": result.stdout[-2000:],
     }
