@@ -3,19 +3,22 @@ compare_architectures_v3.py
 
 LOCKED-fusion validation harness (score-level, LightGBM removed).
 
-Validates the settled V4 architecture — the weighted SCORE-LEVEL fusion
-(`1.0*subspace + 0.5*dense_ip + 0.3*hybrid`, see fusion_classifier_v3.score_level_fusion)
-— on the connected-cluster harness (T1) and the held-out star/bipartite harness (T9b),
+Validates the settled V4.1 architecture — the max SCORE-LEVEL fusion
+(`max(minmax(subspace), minmax(dense_relational), minmax(hybrid))`, see
+fusion_classifier_v3.score_level_fusion; changed 2026-07-22 from the additive
+weighted-sum after the stress_testing_1 ablation showed the sum diluting
+whichever detector actually found the fraud — see README changelog) — on the
+connected-cluster harness (T1) and the held-out star/bipartite harness (T9b),
 using the PRETRAINED per-seed detectors (models/hybrid_v3_seed{seed}.pth), frozen and
 never retrained. The 14-positive LightGBM combiner was removed (it destroyed the raw
 signals, docs/AGENTS.md H.8); there is no label fit set here — the fusion is
 label-independent.
 
 Reports per seed / per category PR-AUC for:
-  - locked_fusion : the locked architecture (primary)
-  - subspace_only : raw subspace IF        (tabular backbone)
-  - hybrid_only   : raw hybrid_anomaly     (RGCN relational)
-  - dense_ip_only : raw dense-block on IP  (IP specialist)
+  - locked_fusion        : the locked architecture (primary)
+  - subspace_only        : raw subspace IF              (tabular backbone)
+  - hybrid_only          : raw hybrid_anomaly            (RGCN relational)
+  - dense_relational_only: raw dense-block, mobile/IP IP-priority-weighted max
 
 so the fusion can be read against each of its parts (mirrors H.8).
 
@@ -38,7 +41,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 from src.config_v3 import (
     COMPARE_SEEDS, EVAL_HELDOUT_SIZE_RANGE, EVAL_CONNECTED_N_CLUSTERS,
     EVAL_CONNECTED_SIZE_RANGE, SUBSPACE_GROUPS, DENSE_BLOCK_RELATIONS, EDGE_TYPES,
-    FUSION_W_SUBSPACE, FUSION_W_DENSE_IP, FUSION_W_HYBRID,
+    DENSE_BLOCK_RELATION_WEIGHTS,
 )
 from src.evaluate_model_v3 import (
     INJECTION_FNS, CATEGORY_PRIMARY_GROUP, EVAL_EXTRA_GROUPS,
@@ -63,10 +66,12 @@ RELATION_MAP = {
 # all_eval_groups is a local inside evaluate(); rebuild the identical merge here.
 ALL_EVAL_GROUPS = {**SUBSPACE_GROUPS, **EVAL_EXTRA_GROUPS}
 
-# IP-gated dense-block column name (DENSE_BLOCK_RELATIONS=[1] -> shares_ip).
-DENSE_IP_COL = f"dense_block_score_{EDGE_TYPES[DENSE_BLOCK_RELATIONS[0]].replace('shares_', '')}"
+# Dense-block relational column: IP-priority-weighted max across mobile/IP
+# (DENSE_BLOCK_RELATIONS=[0,1], DENSE_BLOCK_RELATION_WEIGHTS) — see config_v3.
+# Pincode dropped 2026-07-22 -- not a valid fraud signal on its own.
+DENSE_RELATIONAL_COL = "dense_block_score_relational"
 
-MODES = ["locked_fusion", "subspace_only", "hybrid_only", "dense_ip_only"]
+MODES = ["locked_fusion", "subspace_only", "hybrid_only", "dense_relational_only"]
 
 ABLATION_DIR = Path("outputs/ablation")
 JSON_OUT = ABLATION_DIR / "locked_fusion_validation.json"
@@ -161,9 +166,9 @@ def _score_category(model, x_real, base_edge_index_list, base_edge_type_tensor,
     {mode: preds_in_node_order} plus the binary labels (injected = 1).
 
     The three raw components are aligned by node order:
-      - hybrid_anomaly_score : compute_score_frame over the whole augmented graph
-      - subspace_if_score    : _score_inject_and_real (real + injected, same scale)
-      - dense_block_score_ip : dense_block_scores, IP-gated (DENSE_BLOCK_RELATIONS=[1])
+      - hybrid_anomaly_score            : compute_score_frame over the whole augmented graph
+      - subspace_if_score               : _score_inject_and_real (real + injected, same scale)
+      - dense_block_score_relational    : dense_block_scores, mobile/IP IP-priority-weighted max
     then fused via the LOCKED score_level_fusion.
     """
     n_real = x_real.shape[0]
@@ -186,22 +191,23 @@ def _score_category(model, x_real, base_edge_index_list, base_edge_type_tensor,
     )
     aug_score_df["subspace_if_score"] = np.concatenate([real_norm, inject_norm])
 
-    # Dense-block, IP-gated (deterministic). Merge to align by application_id.
+    # Dense-block, relational (mobile/IP, IP-priority-weighted max).
+    # Merge to align by application_id.
     aug_dense_df = dense_block_scores(eval_ei_d, eval_et_d, x_all.shape[0], aug_app_ids)
     merged = aug_score_df.merge(aug_dense_df, on="application_id", how="left")
-    if DENSE_IP_COL not in merged.columns:
-        merged[DENSE_IP_COL] = 0.0
-    merged[DENSE_IP_COL] = merged[DENSE_IP_COL].fillna(0.0)
+    if DENSE_RELATIONAL_COL not in merged.columns:
+        merged[DENSE_RELATIONAL_COL] = 0.0
+    merged[DENSE_RELATIONAL_COL] = merged[DENSE_RELATIONAL_COL].fillna(0.0)
 
     subspace = merged["subspace_if_score"].values
     hybrid = merged["hybrid_anomaly_score"].values
-    dense_ip = merged[DENSE_IP_COL].values
+    dense_relational = merged[DENSE_RELATIONAL_COL].values
 
     preds = {
-        "locked_fusion": score_level_fusion(subspace, dense_ip, hybrid),
+        "locked_fusion": score_level_fusion(subspace, dense_relational, hybrid),
         "subspace_only": subspace,
         "hybrid_only": hybrid,
-        "dense_ip_only": dense_ip,
+        "dense_relational_only": dense_relational,
     }
 
     labels = np.zeros(x_all.shape[0])
@@ -215,9 +221,10 @@ def _score_category(model, x_real, base_edge_index_list, base_edge_type_tensor,
 def run_comparison():
     ABLATION_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"[validate] LOCKED score-level fusion "
-          f"(subspace={FUSION_W_SUBSPACE}, dense_ip={FUSION_W_DENSE_IP}, hybrid={FUSION_W_HYBRID})")
-    print(f"[validate] IP-gated dense-block relation -> '{DENSE_IP_COL}'")
+    print("[validate] LOCKED max score-level fusion "
+          "(risk = minmax(max(minmax(subspace), minmax(dense_relational), minmax(hybrid))))")
+    print(f"[validate] Dense-block relations -> {DENSE_BLOCK_RELATIONS} "
+          f"weights={DENSE_BLOCK_RELATION_WEIGHTS} -> '{DENSE_RELATIONAL_COL}'")
     print(f"[validate] seeds: {list(COMPARE_SEEDS)}  (frozen pretrained detectors, no retraining)")
 
     # Load real data once
@@ -264,7 +271,7 @@ def run_comparison():
             print(f"  {cat:<24} | locked={out_json[str(seed)]['locked_fusion'][f'conn_pr_auc_{cat}']:.4f}"
                   f"  sub={out_json[str(seed)]['subspace_only'][f'conn_pr_auc_{cat}']:.4f}"
                   f"  hyb={out_json[str(seed)]['hybrid_only'][f'conn_pr_auc_{cat}']:.4f}"
-                  f"  ip={out_json[str(seed)]['dense_ip_only'][f'conn_pr_auc_{cat}']:.4f}")
+                  f"  rel={out_json[str(seed)]['dense_relational_only'][f'conn_pr_auc_{cat}']:.4f}")
 
         for m in MODES:
             vals = list(out_json[str(seed)][m].values())
@@ -301,12 +308,14 @@ def run_comparison():
         print(f"  {cat:<24} | locked={out_json['heldout'][f'{cat}_locked_fusion']:.4f}"
               f"  sub={out_json['heldout'][f'{cat}_subspace_only']:.4f}"
               f"  hyb={out_json['heldout'][f'{cat}_hybrid_only']:.4f}"
-              f"  ip={out_json['heldout'][f'{cat}_dense_ip_only']:.4f}")
+              f"  rel={out_json['heldout'][f'{cat}_dense_relational_only']:.4f}")
 
     out_json["_meta"] = {
-        "harness": "locked score-level fusion (LightGBM removed)",
-        "weights": {"subspace": FUSION_W_SUBSPACE, "dense_ip": FUSION_W_DENSE_IP, "hybrid": FUSION_W_HYBRID},
-        "dense_block_relation": DENSE_IP_COL,
+        "harness": "locked max score-level fusion (LightGBM removed)",
+        "combine": "max(minmax(subspace), minmax(dense_relational), minmax(hybrid))",
+        "dense_block_relations": DENSE_BLOCK_RELATIONS,
+        "dense_block_relation_weights": DENSE_BLOCK_RELATION_WEIGHTS,
+        "dense_block_column": DENSE_RELATIONAL_COL,
         "seeds": list(COMPARE_SEEDS),
         "detectors": "frozen pretrained models/hybrid_v3_seed{seed}.pth",
         "note": f"{len(COMPARE_SEEDS)} seeds; H.6 formal gate wants >3 — treat as proposed, pending a 4th seed.",

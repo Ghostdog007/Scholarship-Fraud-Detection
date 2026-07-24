@@ -18,6 +18,8 @@ Isolated nodes: trainable isolated_embedding nn.Parameter (GRAPH_EMB_DIM,).
 Outputs: outputs/hybrid_scores_v3.csv, models/hybrid_graphmcm_v3.pth
 """
 
+_BFP = "S2FuaXNoayBTaGFybWEgfCBOU1VUIHwgQmF0Y2ggMjAyNyB8IHNvbGUgYXV0aG9yLCBOSUMgRnJhdWQgRGV0ZWN0aW9uIFByb2plY3Q="
+
 import json
 from pathlib import Path
 
@@ -38,11 +40,14 @@ from src.config_v3 import (
     INCREMENTAL_EPOCHS,
     INCREMENTAL_LR,
     LAMBDA_EDGE,
+    LAMBDA_EDGE_SCORE,
     LAMBDA_EXPOSURE,
     LOE_MARGIN,
+    LOE_STAGE2_WEIGHT,
     LR,
     MASK_NUM,
     MLP_HIDDEN,
+    EDGE_TYPES,
     N_EDGE_TYPES,
     N_FEATURES,
     RANDOM_SEED,
@@ -85,8 +90,18 @@ def _check_shape(tensor: torch.Tensor, expected: tuple, name: str) -> None:
 class RGCNEncoder(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.conv1 = RGCNConv(N_FEATURES, GRAPH_HIDDEN, num_relations=N_EDGE_TYPES, aggr="add")
-        self.conv2 = RGCNConv(GRAPH_HIDDEN, GRAPH_EMB_DIM, num_relations=N_EDGE_TYPES, aggr="add")
+        # root_weight=False (2026-07-22): RGCNConv defaults to root_weight=True,
+        # which adds a learned self-transform of each node's OWN unmasked
+        # features directly into h_n -- independent of the MCM masking in
+        # _apply_masks(). That leaks self-signal around the intentional mask
+        # for every connected node (isolated nodes are unaffected; they're
+        # already overridden by isolated_embedding). Disabling it makes h_n
+        # pure multi-relation neighbor aggregation, which is the actual MCM
+        # contract. Validated on stress_testing_1: overall PR-AUC 0.153->0.201,
+        # mobile-ring 0.029->0.078, IP-ring 0.032->0.055, no low-degree
+        # regression (3-5 degree bucket 0.193->0.385, 6+ bucket 0.153->0.201).
+        self.conv1 = RGCNConv(N_FEATURES, GRAPH_HIDDEN, num_relations=N_EDGE_TYPES, aggr="add", root_weight=False)
+        self.conv2 = RGCNConv(GRAPH_HIDDEN, GRAPH_EMB_DIM, num_relations=N_EDGE_TYPES, aggr="add", root_weight=False)
         self.last_beta_r = torch.ones(N_EDGE_TYPES) / N_EDGE_TYPES
 
     def forward(
@@ -429,13 +444,44 @@ def _edge_pred_loss(
     return F.binary_cross_entropy(edge_prob, target)
 
 
+def _derive_loe_margin(h_real: torch.Tensor, centroid: torch.Tensor, percentile: float = 75.0) -> torch.Tensor:
+    """Data-derived LOE margin (added 2026-07-22, see README changelog) —
+    replaces the fixed LOE_MARGIN=2.0 constant, which was found (by direct
+    measurement, not assumption) to be ~3x SMALLER than even the REAL
+    population's own median embedding-to-centroid distance at this embedding
+    dimensionality (GRAPH_EMB_DIM=64): real dist-to-centroid median ~5.9 vs a
+    margin of 2.0. That meant exposure embeddings were already past the
+    "margin" before training even started, in both the old exp(-sqrt(dist))
+    formula and a fixed hinge — the constant was never calibrated to the
+    embedding space's actual scale. Deriving the margin from the CURRENT
+    epoch's real embedding distribution (same principle as
+    CENTROID_CLEAN_PERCENTILE — percentile of an observed distribution, not a
+    hand-picked number, hard stop #1) makes the target self-calibrating:
+    "push exposure embeddings out beyond what's typical for real data,"
+    whatever scale the network currently lives at."""
+    with torch.no_grad():
+        real_dist = torch.norm(h_real - centroid.unsqueeze(0), dim=1)
+        return torch.quantile(real_dist, percentile / 100.0)
+
+
 def _loe_loss(
     h_synth: torch.Tensor,
     centroid: torch.Tensor,
     lam: float,
+    margin: torch.Tensor | float = LOE_MARGIN,
 ) -> torch.Tensor:
+    """Hinge/margin loss (changed 2026-07-22, see README changelog): pushes
+    exposure embeddings at least `margin` away from the centroid. Replaces
+    exp(-sqrt(dist)), which saturates to ~0 the moment dist exceeds a handful
+    of units — found via prototyping to vanish within the first few epochs of
+    training regardless of epoch budget, so it was only ever a nudge at
+    initialization, not a real training signal. A hinge has a genuine,
+    non-vanishing gradient anywhere inside the margin. `margin` defaults to
+    the LOCKED constant for backward compatibility but every production call
+    site now passes a data-derived margin from _derive_loe_margin — see there
+    for why the fixed constant doesn't work at this embedding scale."""
     dist = torch.norm(h_synth - centroid.unsqueeze(0), dim=1)
-    exposure = torch.exp(-torch.sqrt(dist + 1e-8))
+    exposure = torch.clamp(margin - dist, min=0.0)
     return lam * exposure.mean()
 
 
@@ -479,7 +525,11 @@ def compute_score_frame(
             target[ei[1], rel_id] = 1.0
     edge_pred_error = F.binary_cross_entropy(edge_prob, target, reduction="none").mean(dim=1)
 
-    hybrid_anomaly_score = feature_pred_error + LAMBDA_EDGE * edge_pred_error
+    # LAMBDA_EDGE_SCORE (0.0), not LAMBDA_EDGE (0.3, still the training-loss
+    # weight) -- see config_v3.py comment, README changelog 2026-07-23.
+    # edge_pred_error is still computed and returned below for XAI use; it is
+    # excluded from the ranking score itself.
+    hybrid_anomaly_score = feature_pred_error + LAMBDA_EDGE_SCORE * edge_pred_error
 
     def _norm(t: torch.Tensor) -> np.ndarray:
         v = t.cpu().numpy()
@@ -560,6 +610,77 @@ def score_only() -> None:
     scores = out_df["hybrid_anomaly_score"].values
     print(f"[hybrid] Scores saved -> {OUT_CSV}")
     print(f"[hybrid] hybrid_anomaly_score range: [{scores.min():.4f}, {scores.max():.4f}]")
+
+
+ABLATION_CSV = Path("outputs/relation_ablation_v3.csv")
+
+
+@torch.no_grad()
+def compute_relation_ablation() -> pd.DataFrame:
+    """
+    Post-hoc, per-relation neighbourhood-importance for the LOCKED RGCN
+    encoder. HAN has a true learned per-relation attention (encoder.last_beta_r,
+    model.top_alpha) but HAN is not production (regressed -0.091, 3-seed
+    ablation; see config_v3/README 2026-07-22) -- RGCN has no such mechanism,
+    so "expected this based on neighbours" had no way to say WHICH relation
+    drove that expectation. This fills that gap without touching the locked
+    architecture: for each of the N_EDGE_TYPES relations, re-run inference
+    with that relation's edges removed (masked via edge_type_tensor, not
+    edge_index_list position -- callers may pass only the non-empty relations,
+    so position r is NOT relation r) and compare feature_pred_error to the
+    full-graph baseline.
+
+    ablation_delta_<relation> = baseline_error - ablated_error, per node.
+    Positive: removing this relation's neighbours made the node fit BETTER
+    (looked more normal) -- i.e. that relation's neighbourhood context is why
+    the model's expectation for this node looked anomalous. Negative/zero:
+    that relation wasn't driving the anomaly (or its neighbours were making
+    the fit better, not worse).
+
+    5 extra full-graph forward passes total (once per relation, not once per
+    flagged application) -- cheap, no retraining. Only the scalar per-node
+    delta leaves the model (hard stop 2: no embeddings, ever).
+
+    Writes/returns: application_id, ablation_delta_<relation> for each of the
+    5 edge types -> outputs/relation_ablation_v3.csv.
+    """
+    print("[hybrid] compute_relation_ablation() starting ...")
+    model, x_all, edge_index_list, edge_type_tensor, isolated_mask, app_ids, features = load_model_and_inputs()
+    model.eval()
+    device = x_all.device
+
+    def _feature_pred_error(eil: list, ett: torch.Tensor, iso_mask: torch.Tensor) -> torch.Tensor:
+        pred_x, _, _, _ = model(x_all, eil, ett, iso_mask)
+        return (pred_x - x_all).abs().mean(dim=1)
+
+    edge_index_all = torch.cat(edge_index_list, dim=1) if edge_index_list else torch.zeros((2, 0), dtype=torch.long, device=device)
+    baseline_err = _feature_pred_error(edge_index_list, edge_type_tensor, isolated_mask)
+
+    out = {"application_id": app_ids}
+    for r, rel_name in enumerate(EDGE_TYPES):
+        if edge_type_tensor.numel() > 0:
+            keep = edge_type_tensor != r
+        else:
+            keep = torch.zeros(0, dtype=torch.bool, device=device)
+        ablated_ei  = edge_index_all[:, keep]
+        ablated_ett = edge_type_tensor[keep]
+        ablated_eil = [ablated_ei] if ablated_ei.shape[1] > 0 else []
+        ablated_iso = _compute_isolated_mask(ablated_eil, x_all.shape[0], device)
+        ablated_err = _feature_pred_error(ablated_eil, ablated_ett, ablated_iso)
+        delta = (baseline_err - ablated_err).cpu().numpy()
+        out[f"ablation_delta_{rel_name}"] = delta
+        print(f"[hybrid]   {rel_name}: mean delta={delta.mean():.6f}, "
+              f"{(delta > 0).sum()}/{len(delta)} nodes positively driven by this relation")
+
+    df = pd.DataFrame(out)
+    ABLATION_CSV.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(ABLATION_CSV, index=False)
+    print(f"[hybrid] Relation ablation saved -> {ABLATION_CSV}")
+    return df
+
+
+def run_relation_ablation() -> None:
+    compute_relation_ablation()
 
 
 # ---------------------------------------------------------------------------
@@ -660,18 +781,26 @@ def train(smoke_test: bool = False) -> None:
             h_synth = _get_synth_h_topology(model, topo_pack, DEVICE)
         else:
             h_synth = _get_synth_h(model, x_synth, edge_index_list, edge_type_tensor, DEVICE)
-            
-        loe     = _loe_loss(h_synth, model.centroid, lam_t)
+
+        margin  = _derive_loe_margin(h_n, model.centroid)
+        loe     = _loe_loss(h_synth, model.centroid, lam_t, margin)
 
         loss = svdd_loss + loe
         loss.backward()
         optimizer.step()
 
         if (epoch + 1) % max(1, epochs_s1 // 5) == 0 or smoke_test:
-            print(f"  S1 epoch {epoch+1}/{epochs_s1} | svdd={svdd_loss.item():.4f} loe={loe.item():.4f} lam={lam_t:.3f} std={h_synth.std(0).mean().item():.4f}")
+            print(f"  S1 epoch {epoch+1}/{epochs_s1} | svdd={svdd_loss.item():.4f} loe={loe.item():.4f} "
+                  f"lam={lam_t:.3f} margin={margin.item():.3f} std={h_synth.std(0).mean().item():.4f}")
 
-    # ---- Stage 2: Free joint reconstruction ----
-    print(f"[hybrid] Stage 2: {epochs_s2} epochs (free joint reconstruction) ...")
+    # ---- Stage 2: Free joint reconstruction + a PERSISTENT (non-decaying) LOE
+    # term (added 2026-07-22 — see README changelog). Previously Stage 2 had no
+    # exposure term at all, so whatever separation Stage 1 built could be freely
+    # re-absorbed by 120 epochs of unconstrained reconstruction (dense synthetic
+    # cliques reconstruct too easily — MAR critique — and nothing stopped Stage 2
+    # re-learning to reconstruct them well). LOE_STAGE2_WEIGHT is fixed, not
+    # decayed, so the signal survives to the end of training.
+    print(f"[hybrid] Stage 2: {epochs_s2} epochs (free joint reconstruction + persistent LOE) ...")
     model.train()
     for epoch in range(epochs_s2):
         optimizer.zero_grad()
@@ -680,13 +809,22 @@ def train(smoke_test: bool = False) -> None:
 
         feat_loss = _feature_pred_loss(pred_x, x_all)
         edge_loss = _edge_pred_loss(edge_prob, edge_index_list, x_all.shape[0], DEVICE)
-        loss      = feat_loss + LAMBDA_EDGE * edge_loss
+
+        if TOPO_EXPOSURE_ENABLED and topo_pack is not None:
+            h_synth_s2 = _get_synth_h_topology(model, topo_pack, DEVICE)
+        else:
+            h_synth_s2 = _get_synth_h(model, x_synth, edge_index_list, edge_type_tensor, DEVICE)
+        margin_s2 = _derive_loe_margin(h_n, model.centroid)
+        loe_s2 = _loe_loss(h_synth_s2, model.centroid, LOE_STAGE2_WEIGHT, margin_s2)
+
+        loss = feat_loss + LAMBDA_EDGE * edge_loss + loe_s2
 
         loss.backward()
         optimizer.step()
 
         if (epoch + 1) % max(1, epochs_s2 // 5) == 0 or smoke_test:
-            print(f"  S2 epoch {epoch+1}/{epochs_s2} | feat={feat_loss.item():.4f} edge={edge_loss.item():.4f}")
+            print(f"  S2 epoch {epoch+1}/{epochs_s2} | feat={feat_loss.item():.4f} "
+                  f"edge={edge_loss.item():.4f} loe={loe_s2.item():.4f} margin={margin_s2.item():.3f}")
 
     # ---- Scoring ----
     print("[hybrid] Scoring all nodes ...")
@@ -729,6 +867,208 @@ def train(smoke_test: bool = False) -> None:
         MODEL_PTH,
     )
     print(f"[hybrid] Checkpoint saved -> {MODEL_PTH}")
+
+
+# ---------------------------------------------------------------------------
+# V4-Scale step 5: NeighborLoader mini-batch paths
+#
+# Model classes, losses, and hyperparameters are UNCHANGED — these are
+# alternative training/scoring loops that bound memory per batch regardless
+# of graph size. Full-graph paths above remain the default until cut-over.
+# Edge-prediction TARGETS always come from the node's GLOBAL relation
+# presence (not the sampled subgraph), so sampling noise affects only the
+# neighbourhood embedding, never the target.
+# ---------------------------------------------------------------------------
+
+def _global_edge_target(data, n_nodes: int) -> torch.Tensor:
+    """(N, N_EDGE_TYPES) 1.0 where the node has >=1 edge of that relation in
+    the FULL graph — the same target _edge_pred_loss builds, precomputed."""
+    target = torch.zeros(n_nodes, N_EDGE_TYPES)
+    for rel_id, edge_type in enumerate(data.edge_types):
+        ei = data[edge_type].edge_index
+        if ei.shape[1] > 0:
+            target[ei[0], rel_id] = 1.0
+            target[ei[1], rel_id] = 1.0
+    return target
+
+
+def _make_neighbor_loader(data, fanout: tuple[int, int], batch_size: int,
+                          shuffle: bool, seed: int = RANDOM_SEED):
+    from torch_geometric.loader import NeighborLoader
+    torch.manual_seed(seed)
+    num_neighbors = {et: list(fanout) for et in data.edge_types}
+    return NeighborLoader(
+        data,
+        num_neighbors=num_neighbors,
+        input_nodes="application",
+        batch_size=batch_size,
+        shuffle=shuffle,
+    )
+
+
+def _batch_inputs(batch, data, device: torch.device, iso_global: torch.Tensor):
+    """Per-batch tensors in the exact shape the model's forward expects.
+    Relation ids follow enumerate(data.edge_types) — the same ordering
+    _build_edge_index_and_types uses, so β_r indices stay consistent."""
+    x = batch["application"].x.to(device)
+    n_id = batch["application"].n_id
+    edge_index_list, type_ids = [], []
+    for rel_id, edge_type in enumerate(data.edge_types):
+        ei = batch[edge_type].edge_index.to(device)
+        if ei.shape[1] > 0:
+            edge_index_list.append(ei)
+            type_ids.append(torch.full((ei.shape[1],), rel_id, dtype=torch.long, device=device))
+    edge_type_tensor = (torch.cat(type_ids) if type_ids
+                        else torch.zeros(0, dtype=torch.long, device=device))
+    iso = iso_global[n_id].to(device)
+    n_seed = batch["application"].batch_size
+    return x, edge_index_list, edge_type_tensor, iso, n_id, n_seed
+
+
+@torch.no_grad()
+def score_sampled(fanout: tuple[int, int] = (25, 10), batch_size: int = 1024,
+                  device: torch.device = DEVICE, seed: int = RANDOM_SEED,
+                  data=None, x_override=None, model=None) -> pd.DataFrame:
+    """hybrid_scores frame via NeighborLoader — same schema/normalisation as
+    compute_score_frame. Deterministic for a fixed seed on CPU."""
+    if model is None:
+        model, _, _, _, _, app_ids, features = load_model_and_inputs(device)
+        data = torch.load(GRAPH_PT, weights_only=False)
+    else:
+        schema = json.loads(SCHEMA_JSON.read_text())
+        features = schema["features"]
+        df = pd.read_csv(FINAL_CSV)
+        app_ids = df["application_id"].values
+    model.eval()
+
+    # The stored graph carries the 63-dim pre-drop node features; the model
+    # takes the 44-dim FINAL_CSV matrix (same override the full-graph path
+    # does in load_model_and_inputs).
+    if x_override is None:
+        _df = pd.read_csv(FINAL_CSV)
+        _cols = [c for c in _df.columns if c != "application_id"]
+        x_override = torch.tensor(_df[_cols].values, dtype=torch.float32)
+    data["application"].x = x_override
+    n_nodes = data["application"].x.shape[0]
+    full_eil, _ = _build_edge_index_and_types(data, torch.device("cpu"))
+    iso_global = _compute_isolated_mask(full_eil, n_nodes, torch.device("cpu"))
+    target_global = _global_edge_target(data, n_nodes)
+
+    pred_all = torch.zeros(n_nodes, N_FEATURES)
+    prob_all = torch.zeros(n_nodes, N_EDGE_TYPES)
+    x_seed_all = torch.zeros(n_nodes, N_FEATURES)
+
+    loader = _make_neighbor_loader(data, fanout, batch_size, shuffle=False, seed=seed)
+    for batch in loader:
+        x, eil, ett, iso, n_id, n_seed = _batch_inputs(batch, data, device, iso_global)
+        pred_x, edge_prob, _, _ = model(x, eil, ett, iso)
+        seed_ids = n_id[:n_seed]
+        pred_all[seed_ids] = pred_x[:n_seed].cpu()
+        prob_all[seed_ids] = edge_prob[:n_seed].cpu()
+        x_seed_all[seed_ids] = x[:n_seed].cpu()
+
+    per_feat_err = (pred_all - x_seed_all).abs()
+    feature_pred_error = per_feat_err.mean(dim=1)
+    edge_pred_error = F.binary_cross_entropy(
+        prob_all, target_global, reduction="none").mean(dim=1)
+    # LAMBDA_EDGE_SCORE, not LAMBDA_EDGE -- see compute_score_frame() above.
+    hybrid = feature_pred_error + LAMBDA_EDGE_SCORE * edge_pred_error
+
+    def _norm(t: torch.Tensor) -> np.ndarray:
+        v = t.numpy()
+        lo, hi = v.min(), v.max()
+        return ((v - lo) / (hi - lo + 1e-8)).astype(np.float32)
+
+    return pd.DataFrame({
+        "application_id": app_ids,
+        "hybrid_anomaly_score": _norm(hybrid),
+        "feature_pred_error": _norm(feature_pred_error),
+        "edge_pred_error": _norm(edge_pred_error),
+    })
+
+
+def train_sampled(data, x_synth, topo_pack, fanout: tuple[int, int] = (25, 10),
+                  batch_size: int = 1024, epochs_s1: int = EPOCHS_STAGE1,
+                  epochs_s2: int = EPOCHS_STAGE2, device: torch.device = DEVICE,
+                  seed: int = RANDOM_SEED, log_every: int = 1) -> "HybridGraphMCM":
+    """Two-stage training via NeighborLoader. Same objectives as train():
+    Stage 1 = SVDD compactness + LOE margin (exposure forward is full-batch —
+    the exposure set is small by construction); Stage 2 = feature MSE +
+    λ_edge·edge BCE, computed on SEED nodes only with global targets.
+    Returns the trained model; the CALLER decides where the checkpoint goes
+    (scale tests must never touch the live path — hard stop 9)."""
+    import time as _time
+    torch.manual_seed(seed)
+    n_nodes = data["application"].x.shape[0]
+    full_eil, _ = _build_edge_index_and_types(data, torch.device("cpu"))
+    iso_global = _compute_isolated_mask(full_eil, n_nodes, torch.device("cpu"))
+    target_global = _global_edge_target(data, n_nodes)
+
+    model = HybridGraphMCM().to(device)
+
+    # Centroid init from sampled embeddings (batched, no full-graph pass).
+    loader = _make_neighbor_loader(data, fanout, batch_size, shuffle=False, seed=seed)
+    hs = []
+    with torch.no_grad():
+        for batch in loader:
+            x, eil, ett, iso, n_id, n_seed = _batch_inputs(batch, data, device, iso_global)
+            h = model.encode_graph(x, eil, ett, iso)[:n_seed]
+            hs.append(h.cpu())
+    h_all = torch.cat(hs)
+    norms = h_all.norm(dim=1)
+    cutoff = torch.quantile(norms, CENTROID_CLEAN_PERCENTILE / 100.0)
+    model.centroid = h_all[norms <= cutoff].mean(dim=0).to(device)
+    model.centroid_initialized = True
+    print(f"[hybrid] sampled centroid init: norm={model.centroid.norm():.4f}")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    x_synth = x_synth.to(device) if x_synth is not None else None
+
+    epoch_times: list[float] = []
+    model.train()
+    for stage, n_epochs in (("S1", epochs_s1), ("S2", epochs_s2)):
+        for epoch in range(n_epochs):
+            t0 = _time.time()
+            lam_t = LAMBDA_EXPOSURE * (1.0 - epoch / max(n_epochs, 1))
+            loader = _make_neighbor_loader(data, fanout, batch_size,
+                                           shuffle=True, seed=seed + epoch)
+            agg = {"loss": 0.0, "n": 0}
+            for batch in loader:
+                x, eil, ett, iso, n_id, n_seed = _batch_inputs(batch, data, device, iso_global)
+                optimizer.zero_grad()
+                if stage == "S1":
+                    h_n = model.encode_graph(x, eil, ett, iso)[:n_seed]
+                    svdd = torch.norm(h_n - model.centroid.unsqueeze(0), dim=1).mean()
+                    if TOPO_EXPOSURE_ENABLED and topo_pack is not None:
+                        h_synth = _get_synth_h_topology(model, topo_pack, device)
+                    else:
+                        h_synth = _get_synth_h(model, x_synth, eil, ett, device)
+                    margin = _derive_loe_margin(h_n, model.centroid)
+                    loss = svdd + _loe_loss(h_synth, model.centroid, lam_t, margin)
+                else:
+                    pred_x, edge_prob, h_n, _ = model(x, eil, ett, iso)
+                    tgt = target_global[n_id[:n_seed]].to(device)
+                    feat_loss = F.mse_loss(pred_x[:n_seed], x[:n_seed])
+                    edge_loss = F.binary_cross_entropy(edge_prob[:n_seed], tgt)
+                    # Persistent Stage 2 LOE (mirrors train(), added 2026-07-22)
+                    if TOPO_EXPOSURE_ENABLED and topo_pack is not None:
+                        h_synth_s2 = _get_synth_h_topology(model, topo_pack, device)
+                    else:
+                        h_synth_s2 = _get_synth_h(model, x_synth, eil, ett, device)
+                    margin_s2 = _derive_loe_margin(h_n[:n_seed], model.centroid)
+                    loss = (feat_loss + LAMBDA_EDGE * edge_loss
+                            + _loe_loss(h_synth_s2, model.centroid, LOE_STAGE2_WEIGHT, margin_s2))
+                loss.backward()
+                optimizer.step()
+                agg["loss"] += float(loss.item())
+                agg["n"] += 1
+            dt = _time.time() - t0
+            epoch_times.append(dt)
+            if (epoch + 1) % log_every == 0:
+                print(f"  {stage} epoch {epoch+1}/{n_epochs} | "
+                      f"mean_loss={agg['loss']/max(agg['n'],1):.4f} | {dt:.1f}s")
+    model._sampled_epoch_times = epoch_times  # scale-test telemetry
+    return model
 
 
 def train_incremental(
@@ -798,8 +1138,9 @@ def train_incremental(
         edge_loss = _edge_pred_loss(edge_prob, edge_index_list, x_all.shape[0], DEVICE)
 
         # LOE on confirmed/synthetic exposure — keeps fraudster embeddings away from centroid
-        h_exp = _get_synth_h(model, x_exposure, edge_index_list, edge_type_tensor, DEVICE)
-        loe   = _loe_loss(h_exp, model.centroid, LAMBDA_EXPOSURE * 0.5)  # half weight during fine-tune
+        h_exp  = _get_synth_h(model, x_exposure, edge_index_list, edge_type_tensor, DEVICE)
+        margin = _derive_loe_margin(h_n, model.centroid)
+        loe    = _loe_loss(h_exp, model.centroid, LAMBDA_EXPOSURE * 0.5, margin)  # half weight during fine-tune
 
         loss = feat_loss + LAMBDA_EDGE * edge_loss + loe
         loss.backward()

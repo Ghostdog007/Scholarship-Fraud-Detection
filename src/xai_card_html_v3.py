@@ -32,16 +32,22 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.xai_layer_v3 import _trigger_description, _fmt_raw
+
 CARDS_JSON = Path("outputs/explanation_cards_v3.json")
 RISK_CSV   = Path("outputs/risk_scores_v3.csv")
+DENSE_CSV  = Path("outputs/dense_block_scores_v3.csv")
 OUT_DIR    = Path("outputs/cards")
 
 # risk → colour bucket (semantic, separate from any brand accent)
 RISK_LOW, RISK_MED, RISK_HIGH = "#2c7da0", "#f4a261", "#e5383b"
+# Plain-language labels (2026-07-23 readability pass), matching xai_layer_v3.py's
+# DETECTOR_LABELS — technical name kept in the hover tooltip (_model_pill's title=),
+# not the visible pill text.
 DETECTOR_ORDER = [
-    ("subspace", "Tabular subspace", "#e5383b"),
-    ("dense_ip", "Shared-IP dense-block", "#f72585"),
-    ("hybrid",   "Relational RGCN", "#4cc9f0"),
+    ("subspace",         "Profile pattern", "#e5383b"),
+    ("dense_relational", "Shared-identity cluster", "#f72585"),
+    ("hybrid",           "Network pattern", "#4cc9f0"),
 ]
 GROUP_LABELS = {"financial": "Financial", "identity": "Identity", "network": "Network"}
 EDGE_LABELS = {
@@ -58,6 +64,21 @@ def _risk_color(v: float) -> str:
 # key -> (short label, colour) for the model-traceability pills. Same keys and
 # colours as DETECTOR_ORDER so pills match the fusion-composition footer.
 DETECTOR_PILL = {k: (lbl, col) for k, lbl, col in DETECTOR_ORDER}
+# Deep SAD (V4.2) is SUPPLEMENTARY, not a fusion driver — deliberately NOT added
+# to DETECTOR_ORDER (that list drives the fusion-composition footer, which must
+# stay exactly the 3 locked fusion inputs). It still gets its own pill colour so
+# its evidence line can be visually distinguished from the fused-score drivers.
+DETECTOR_PILL["deepsad"] = ("Second opinion (supplementary)", "#9d4edd")
+
+# Technical model name, shown only in the pill's hover tooltip (2026-07-23
+# readability pass) — visible pill text stays plain, precise name is one
+# hover away for anyone who wants it.
+DETECTOR_TECH_NAME = {
+    "subspace":         "tabular subspace Isolation Forest",
+    "dense_relational":  "FRAUDAR-style dense-block detector",
+    "hybrid":           "Hybrid GraphMCM (RGCN)",
+    "deepsad":          "Deep SAD",
+}
 
 
 def _model_pill(key: str | None) -> str:
@@ -65,20 +86,31 @@ def _model_pill(key: str | None) -> str:
     if key not in DETECTOR_PILL:
         return ""
     lbl, col = DETECTOR_PILL[key]
+    tech = DETECTOR_TECH_NAME.get(key, lbl)
     return (f"<span class='mpill' style='color:{col};border-color:{col}55;"
-            f"background:{col}1a' title='source model: {lbl}'>{lbl}</span>")
+            f"background:{col}1a' title='source model: {lbl} (technical: {tech})'>{lbl}</span>")
 
 
 def _model_trace(card: dict) -> str:
     """Render the 'How this score was produced' traceability section from the
-    pre-computed evidence.model_trace block. Adds no numbers of its own."""
+    pre-computed evidence.model_trace block. Adds no numbers of its own.
+
+    Max fusion (changed 2026-07-22): exactly one detector's own normalised
+    value IS the fused score's source — there is no "% share of a blend" any
+    more, so each bar shows the detector's own value (0-1) with a WON DRIVER
+    badge on whichever one is the max, plus how far it led the runner-up."""
     mt = card.get("evidence", {}).get("model_trace")
     if not mt or not mt.get("models"):
         return ""
     rows = []
     for m in mt["models"]:
         lbl, col = DETECTOR_PILL.get(m["key"], (m.get("name", m["key"]), "#8b949e"))
-        share = float(m.get("share", 0.0)) * 100
+        normalized = float(m.get("normalized", 0.0)) * 100
+        is_driver = bool(m.get("drove_score"))
+        margin = m.get("margin_over_next")
+        driver_badge = (f" <span class='flagchip' style='background:{col}22;color:{col};"
+                        f"border-color:{col}55'>DRIVER"
+                        + (f" · led by {margin:.2f}" if margin is not None else "") + "</span>") if is_driver else ""
         fired = m.get("fired_triggers", [])
         if fired:
             meta_tail = " · fired " + ", ".join(f"<span class='num'>{_esc(t)}</span>" for t in fired)
@@ -91,17 +123,17 @@ def _model_trace(card: dict) -> str:
             <div class="mtrace-h">
               <span class="mpill" style="color:{col};border-color:{col}55;background:{col}1a">{_esc(lbl)}</span>
               <span class="mtrace-name">{_esc(m['name'])}</span>
-              <span class="mtrace-share num" style="color:{col}">{share:.0f}%</span>
+              <span class="mtrace-share num" style="color:{col}">{normalized:.0f}</span>{driver_badge}
             </div>
-            <div class="mtrace-track"><div style="width:{max(0.0, min(100.0, share)):.0f}%;background:{col}"></div></div>
+            <div class="mtrace-track"><div style="width:{max(0.0, min(100.0, normalized)):.0f}%;background:{col}"></div></div>
             <div class="mtrace-what">{_esc(m['what'])}</div>
             <div class="mtrace-meta"><b>Reads:</b> {_esc(m['reads'])}{meta_tail}</div>
           </div>""")
     return (
         "<div class='section-t'>How this score was produced — model traceability</div>"
-        "<div class='mtrace-intro'>Score-level fusion of three independent models. Each "
-        "percentage is this application's exact contribution from the closed-form fusion "
-        f"(<code>{_esc(mt.get('fusion_formula', ''))}</code>).</div>"
+        "<div class='mtrace-intro'>Max fusion of three independent models — the fused score IS "
+        "the single highest normalised detector value below, marked DRIVER; the others are shown "
+        f"for context (<code>{_esc(mt.get('fusion_formula', ''))}</code>).</div>"
         + "".join(rows)
     )
 
@@ -429,35 +461,80 @@ def _signal_bars(card: dict) -> str:
         thr_pct = 100.0 * float(d["threshold"]) if False else None  # thresholds are score-space
         fill = f"linear-gradient(90deg,#e5383b,#ff6d70)" if crossed else \
                f"linear-gradient(90deg,#f4a261,#ffbf85)"
-        chip = " &nbsp;<span class='flagchip'>THRESHOLD CROSSED</span>" if crossed else ""
-        note = (f"observed <span class='num'>{d['score']:.3f}</span> vs EVT threshold "
-                f"<span class='num'>{d['threshold']:.3f}</span>{chip}") if "threshold" in d else \
-               "below its EVT threshold"
-        rows.append(_bar(f"{GROUP_LABELS.get(g, g)} subspace detector {_model_pill('subspace')}",
+        chip = " &nbsp;<span class='flagchip'>RARE — AUTO-FLAGGED</span>" if crossed else ""
+        note = (f"this value ({d['score']:.3f}) is past the rarity cutoff "
+                f"({d['threshold']:.3f}) for this check{chip}") if "threshold" in d else \
+               "not yet rare enough to auto-flag"
+        rows.append(_bar(f"{GROUP_LABELS.get(g, g)} profile check {_model_pill('subspace')}",
                          f"{pct:.1f}<span style='color:var(--faint)'>pct</span>",
                          pct, fill, note))
 
-    # 2) dense-block-IP
-    dib = ev.get("dense_block_ip", {})
+    # 2) dense-block-relational (mobile/IP, IP-priority weighted; pincode dropped
+    # 2026-07-22 -- not a valid fraud signal on its own, see config_v3 comment)
+    dib = ev.get("dense_block_relational", {})
     if dib.get("score", 0.0) > 0.0 and dib.get("percentile") is not None:
-        rows.append(_bar(f"Shared-IP dense-block {_model_pill('dense_ip')}",
+        by_rel = dib.get("by_relation", {})
+        top_rel = max(by_rel.items(), key=lambda kv: kv[1])[0] if by_rel else None
+        rel_label = {"mobile": "mobile number", "ip": "IP address"}.get(top_rel, "identity value")
+        rows.append(_bar(f"Shared-identity cluster check {_model_pill('dense_relational')}",
                          f"{dib['percentile']:.1f}<span style='color:var(--faint)'>pct</span>",
                          dib["percentile"], "linear-gradient(90deg,#b5187f,#f72585)",
-                         "member of a dense shared-IP cluster — the IP specialist"))
+                         f"part of a tightly-linked group sharing one {rel_label}"))
 
-    # 3) fusion composition footer
+    # 2b) Deep SAD center-distance — SUPPLEMENTARY, not a fusion input. Only
+    # shown when notably elevated (matches the narrative's 75th-pct cutoff).
+    dsad = ev.get("deepsad") or {}
+    if dsad.get("percentile") is not None and dsad["percentile"] >= 75.0:
+        rows.append(_bar(f"Second-opinion check {_model_pill('deepsad')}",
+                         f"{dsad['percentile']:.1f}<span style='color:var(--faint)'>pct</span>",
+                         dsad["percentile"], "linear-gradient(90deg,#5a189a,#9d4edd)",
+                         "a separate, independently-trained model agrees this looks unusual — supporting context, does not change the score"))
+
+    # 2c) RGCN per-relation ablation — the production encoder's answer to
+    # "which relation drove the neighbourhood-based expectation" (post-hoc;
+    # RGCN has no learned attention, unlike the rejected HAN path). Bar shows
+    # this relation's SHARE of total positive ablation deltas (how dominant
+    # it was among relations that actually worsened this node's fit) — not a
+    # population percentile, since ablation deltas aren't comparable across
+    # nodes the way normalised detector scores are.
+    abl = ev.get("relation_ablation") or {}
+    top_rel = abl.get("top_relation")
+    if top_rel:
+        by_rel = abl.get("by_relation", {})
+        positive = {r: d for r, d in by_rel.items() if d > 0.0}
+        total_pos = sum(positive.values())
+        share_pct = 100.0 * positive.get(top_rel, 0.0) / total_pos if total_pos > 0 else 0.0
+        rel_label = EDGE_LABELS.get(top_rel, top_rel.replace("shares_", "").replace("_", " "))
+        breakdown = ", ".join(
+            f"{EDGE_LABELS.get(r, r).split()[0]} {d:.4f}"
+            for r, d in sorted(positive.items(), key=lambda kv: -kv[1])
+        ) or "no connection type improved fit on removal"
+        rows.append(_bar(f"Why the network looked off {_model_pill('hybrid')}",
+                         f"{share_pct:.0f}<span style='color:var(--faint)'>% share</span>",
+                         share_pct, "linear-gradient(90deg,#0d5c63,#4cc9f0)",
+                         f"{rel_label} connections are the biggest reason this application's profile "
+                         f"looked unusual (fit improvement {abl.get('top_delta', 0.0):.4f} if set aside) "
+                         f"— context only, technical: relation-ablation check · {breakdown}"))
+
+    # 3) fusion composition footer — max fusion (2026-07-22): shows each
+    # detector's own normalised value, DRIVER marks the one that won.
     fc = ev.get("fusion_contributions", {})
     comp = ""
     if fc:
-        items = [(lbl, fc[k]["share"] * 100, col)
-                 for k, lbl, col in DETECTOR_ORDER if k in fc and fc[k]["share"] > 0.005]
-        parts = " · ".join(f"<span style='color:{c}'>{lbl} {v:.0f}%</span>" for lbl, v, c in items)
+        items = [(lbl, fc[k]["normalized"] * 100, col, fc[k].get("is_driver"))
+                 for k, lbl, col in DETECTOR_ORDER if k in fc]
+        parts = " · ".join(
+            f"<span style='color:{c}'>{lbl} {v:.0f}{' <b>(DRIVER)</b>' if drv else ''}</span>"
+            for lbl, v, c, drv in items
+        )
         comp = (f"<div class='sig-note' style='margin-top:18px;padding-top:12px;"
-                f"border-top:1px solid var(--border)'><b style='color:var(--muted)'>Fusion "
-                f"composition:</b> {parts}. &nbsp;risk = minmax(1.0·subspace + 0.5·dense-IP + 0.3·hybrid).</div>")
+                f"border-top:1px solid var(--border)'><b style='color:var(--muted)'>How the "
+                f"checks combine:</b> {parts} — whichever check is most suspicious sets the "
+                f"final score (technical: <code>risk = minmax(max(subspace, dense-relational, hybrid))</code>).</div>")
 
     intro = ("<p style='font-size:12px;color:var(--muted);margin:0 0 16px'>What is pushing this "
-             "application's score, by detector. The marker on a track is its EVT flag threshold.</p>")
+             "application's score, by check. Each bar is how unusual this application looks on that "
+             "one check, compared to every other applicant.</p>")
     return intro + "".join(rows) + comp
 
 
@@ -483,9 +560,9 @@ def _reason_codes(card: dict) -> str:
         rows.append(
             f"<div class='reason'><div class='rk'>{rank:02d}</div><div class='rc'>"
             f"<div class='rt'>{_esc(c['label']).capitalize()} {_model_pill(c.get('source_model'))}</div>"
-            f"<div class='rd'>Crossed its extreme-value threshold — observed "
-            f"<span class='num'>{c['observed']:.3f}</span> vs threshold "
-            f"<span class='num'>{c['threshold']:.3f}</span>.</div></div></div>")
+            f"<div class='rd'>Statistically rare — this application's value "
+            f"(<span class='num'>{c['observed']:.3f}</span>) is past the rarity cutoff "
+            f"(<span class='num'>{c['threshold']:.3f}</span>) fitted for this signal.</div></div></div>")
         rank += 1
     ip_conn = next((c for c in ev.get("graph_connections", [])
                     if c["edge_type"] == "shares_ip" and c.get("count", 0) > 0), None)
@@ -495,14 +572,14 @@ def _reason_codes(card: dict) -> str:
                 if pct is not None else "")
         rows.append(
             f"<div class='reason'><div class='rk'>{rank:02d}</div><div class='rc'>"
-            f"<div class='rt'>Shared-IP concentration {_model_pill('dense_ip')}</div>"
+            f"<div class='rt'>Shared-IP concentration {_model_pill('dense_relational')}</div>"
             f"<div class='rd'>Shares one IP with <span class='num'>{ip_conn['count']}</span> "
             f"other application(s){pstr}.</div></div></div>")
         rank += 1
     if not rows:
         rows.append("<div class='reason'><div class='rk'>—</div><div class='rc'>"
-                    "<div class='rt'>No extreme-value threshold crossed</div>"
-                    "<div class='rd'>Card provided for ranking context.</div></div></div>")
+                    "<div class='rt'>No statistical rarity threshold crossed</div>"
+                    "<div class='rd'>Nothing here is rare enough to auto-flag — card shown for ranking context only.</div></div></div>")
     return "".join(rows)
 
 
@@ -555,15 +632,26 @@ def _field_accordions(card: dict) -> str:
             vside = "left:50%" if val >= 0 else f"right:50%;left:auto"
             eside = "left:50%" if exp >= 0 else f"right:50%;left:auto"
             vcol = RISK_HIGH if abs(val) >= abs(exp) else RISK_MED
+            # Raw (pre-scaling) value when one exists (2026-07-23 readability pass)
+            # — bars still use the scaled val/exp for visual proportion (that's
+            # what the model actually compared), but the printed NUMBER prefers
+            # the human-meaningful one. "expected" stays in scaled space (no
+            # persisted raw-scale inverse for it), so a raw actual is paired with
+            # a qualitative "expected" note rather than a mismatched-unit number.
+            raw_value = f.get("raw_value")
+            raw_unit  = f.get("raw_unit")
+            have_raw  = raw_value is not None and raw_unit is not None
+            val_label = _fmt_raw(raw_value, raw_unit) if have_raw else f"{val:+.3f}"
+            exp_label = "different figure expected" if have_raw else f"{exp:+.3f}"
             cmp_html = f"""
             <div class="cmp-row"><span class="cmp-lab">declared</span>
               <div class="cmp-bar"><span class="cmp-mid"></span>
                 <i style="width:{vw:.0f}%;{vside};background:{vcol}"></i></div>
-              <span class="cmp-v" style="color:#ffbf85">{val:+.3f}</span></div>
+              <span class="cmp-v" style="color:#ffbf85">{val_label}</span></div>
             <div class="cmp-row"><span class="cmp-lab">expected</span>
               <div class="cmp-bar"><span class="cmp-mid"></span>
                 <i style="width:{ew:.0f}%;{eside};background:var(--low)"></i></div>
-              <span class="cmp-v" style="color:var(--low)">{exp:+.3f}</span></div>"""
+              <span class="cmp-v" style="color:var(--low)">{exp_label}</span></div>"""
             vp = f.get("value_percentile")
             med = f.get("population_median")
             stand = ""
@@ -571,11 +659,22 @@ def _field_accordions(card: dict) -> str:
                 stand = (f"higher than <span class='num'>{vp:.1f}%</span>" if vp >= 50
                          else f"lower than <span class='num'>{100 - vp:.1f}%</span>") + " of applicants"
             direction = "above" if (val > exp) else "below"
-            why = (f"<div class='why'><b>What this means:</b> the declared value is {stand}"
-                   + (f" (population median {med:+.3f})" if med is not None else "")
-                   + f", while the model — reading the rest of the record and the application's network "
-                   f"context — expected about <span class='num'>{exp:+.3f}</span>; the declared value is "
-                   f"<b>{direction}</b> expectation"
+            # "stand" (value_percentile) is only known when population stats were
+            # passed to _top_features — absent for a cohort preview (no committed
+            # population to rank against). Without it, drop the "declared value is
+            # {stand}, while" lead-in entirely rather than leave a grammatical gap.
+            lead = (f"the declared value is {stand}"
+                    + (f" (population median {med:+.3f})" if med is not None and not have_raw else "")
+                    + ", while ") if stand else ""
+            expected_clause = (
+                f"expected a {direction.replace('above', 'higher').replace('below', 'lower')} figure here"
+                if have_raw else
+                f"expected about <span class='num'>{exp:+.3f}</span>; the declared value is "
+                f"<b>{direction}</b> expectation"
+            )
+            why = (f"<div class='why'><b>What this means:</b> {lead}the model — reading the rest "
+                   f"of the record and the application's network "
+                   f"context — {expected_clause}"
                    + (f", and this miss is larger than <span class='num'>{ep:.1f}%</span> of all "
                       f"applications on this field" if ep is not None else "") + ".</div>")
         open_cls = " open" if i == 0 else ""
@@ -600,7 +699,7 @@ def _suggest_fraud_type(card: dict) -> str:
     """Pre-select the most likely fraud type from the card's own evidence, so the
     reviewer usually just clicks Confirm. Heuristic only — fully overridable."""
     ev = card["evidence"]
-    if ev.get("dense_block_ip", {}).get("score", 0.0) > 0.0:
+    if ev.get("dense_block_relational", {}).get("score", 0.0) > 0.0:
         return "IP_CLUSTER"
     ip_conn = next((c for c in ev.get("graph_connections", [])
                     if c["edge_type"] == "shares_ip" and c.get("count", 0) > 0), None)
@@ -630,11 +729,11 @@ def _action(card: dict) -> str:
               "income certificate). Review IP-linked applications together before approval.")
     elif crossed:
         at, col = "Secondary verification", "#f4a261"
-        ab = ("Not auto-flagged (signal agreement below the promotion requirement), but a crossed "
-              "threshold warrants secondary verification before disbursement.")
+        ab = ("Not automatically flagged (fewer independent checks agreed than required for that), "
+              "but one check came back rare enough to warrant a second look before disbursement.")
     else:
         at, col = "No hold required", "#4ade80"
-        ab = "No statistical flag crossed — card provided for ranking context."
+        ab = "Nothing here is statistically rare enough to flag — card shown for ranking context only."
     bg = f"linear-gradient(180deg,{col}1a,{col}08)"
     default_type = _suggest_fraud_type(card)
     opts = "".join(
@@ -662,6 +761,57 @@ def _action(card: dict) -> str:
       </div>"""
 
 
+def _right_pane_preview(card: dict) -> str:
+    """Right pane for a pre-fusion cohort PREVIEW card. Reuses _reason_codes and
+    _field_accordions verbatim (both already degrade gracefully on empty
+    evt_crossings/graph_connections) — omits _action (reviewer decision form),
+    since confirm-fraud requires the app to exist in the committed features
+    file (confirmed_fraud_store.add_confirmed reads engineered_features_v3.csv),
+    which a staged-but-uncommitted cohort app is not in."""
+    ev = card["evidence"]
+    score = float(card.get("risk_score_v3", 0.0))
+    pct = ev.get("risk_percentile")
+    rank = ev.get("risk_rank")
+    n = ev.get("population_size")
+    gcol = _risk_color(score)
+    sub = (f"Anomaly score <b class='num'>{score:.4f}</b> — higher than "
+           f"<b class='num'>{pct:.2f}%</b> of <b class='num'>{n}</b> cohort application(s)"
+           + (f" · <b>rank {rank}</b>" if rank else "")) if pct is not None and n else \
+          f"Anomaly score <b class='num'>{score:.4f}</b> (higher = more anomalous)"
+    headline = ("Highest-risk application in this cohort" if rank == 1
+                else "Elevated anomaly score" if score >= 0.5 else "Ranking context")
+    plain = card.get("plain_summary")
+    plain_html = f"<div class='sub' style='margin-top:4px;color:var(--fg2)'>{_esc(plain)}</div>" if plain else ""
+    commit_note = (
+        "<div class='action' style='background:linear-gradient(180deg,#4cc9f01a,#4cc9f008);"
+        "border:1px solid #4cc9f047'>"
+        "<div class='at' style='color:#4cc9f0'>Pre-fusion preview</div>"
+        "<div class='ab'>Subspace IF, dense-block, and a preview fusion score are shown above, "
+        "computed read-only over this cohort's merged population (see the Signal drivers tab) — "
+        "but this is still NOT the committed fused risk: EVT triggers (fitted against the "
+        "canonical population, not this preview) and model-traceability margins only exist after "
+        "a committed pipeline run. Labeling, export, and the ego-graph unlock once this cohort is "
+        "committed (admin → Decide → Merge + incremental/full retrain).</div></div>")
+    return f"""
+    <div class="card"><div class="card-b">
+      <div class="riskhead">
+        <div class="gauge" style="background:conic-gradient({gcol} {score*100:.0f}%,rgba(255,255,255,.07) 0)">
+          <b>{score:.2f}</b></div>
+        <div class="rh-txt"><div class="big">{headline}</div><div class="sub">{sub}</div>{plain_html}</div>
+      </div>
+      <div class="section-t">Why it flagged — ranked reason codes</div>
+      {_reason_codes(card)}
+      <div class="section-t">What's happening in each field — declared vs. model-expected</div>
+      {_field_accordions(card)}
+      {commit_note}
+      <div class="footnote">Pre-fusion preview card: subspace IF / dense-block / fusion are
+        computed read-only against this cohort's own merged population (not the canonical
+        population's fixed normalisation), so values are comparable within this preview but not
+        to the committed risk_score_v3. Commit this cohort for the fused-risk card with EVT
+        triggers and model-traceability margins.</div>
+    </div></div>"""
+
+
 def _right_pane(card: dict) -> str:
     ev = card["evidence"]
     score = float(card.get("risk_score_v3", 0.0))
@@ -675,12 +825,14 @@ def _right_pane(card: dict) -> str:
           f"Anomaly score <b class='num'>{score:.4f}</b> (higher = more anomalous)"
     headline = ("Highest-risk application in the batch" if rank == 1
                 else "Elevated fraud risk" if score >= 0.5 else "Ranking context")
+    plain = card.get("plain_summary")
+    plain_html = f"<div class='sub' style='margin-top:4px;color:var(--fg2)'>{_esc(plain)}</div>" if plain else ""
     return f"""
     <div class="card"><div class="card-b">
       <div class="riskhead">
         <div class="gauge" style="background:conic-gradient({gcol} {score*100:.0f}%,rgba(255,255,255,.07) 0)">
           <b>{score:.2f}</b></div>
-        <div class="rh-txt"><div class="big">{headline}</div><div class="sub">{sub}</div></div>
+        <div class="rh-txt"><div class="big">{headline}</div><div class="sub">{sub}</div>{plain_html}</div>
       </div>
       <div class="section-t">Why it flagged — ranked reason codes</div>
       {_reason_codes(card)}
@@ -691,7 +843,8 @@ def _right_pane(card: dict) -> str:
       <div class="footnote">Every number on this card traces to
         <code>explanation_cards_v3.json</code> — no hand-set thresholds; the only numeric gates
         quoted are EVT-derived. Signal bars show each detector's population percentile; the fusion
-        composition is the closed-form score-level split.</div>
+        composition shows each detector's own normalised value, with the single argmax DRIVER marked
+        (max fusion, changed 2026-07-22 — see README changelog).</div>
     </div></div>"""
 
 
@@ -750,7 +903,9 @@ def _ego_figure(app_id: str, app_ids, id_to_idx: dict, nidx: dict, rel_id: dict,
                 edges.append((local[g], local[v], rel_id.get(e["edge_type"], 0)))
     scores = np.array([float(risk_map.get(app_ids[g], 0.0)) for g in node_set], dtype=float)
     sg = {"node_ids": node_set, "scores": scores, "edges": edges}
-    fig = _figure_for_ring(sg, app_ids, 1)
+    core_ids = _dense_core_app_ids()
+    core_global_ids = {g for g in node_set if str(app_ids[g]) in core_ids} if core_ids else None
+    fig = _figure_for_ring(sg, app_ids, 1, core_global_ids=core_global_ids)
     n_edges = len(set((min(a, b), max(a, b)) for a, b, _ in edges))
     fig.update_layout(title=dict(text=(
         f"<b>Identity ring — {app_id}</b>"
@@ -759,8 +914,43 @@ def _ego_figure(app_id: str, app_ids, id_to_idx: dict, nidx: dict, rel_id: dict,
     return fig
 
 
+# mtime-keyed cache (added 2026-07-22, same pattern as confirmed_fraud_graph_store.py's
+# _ip_cache) — this is the .pt GRAPH FALLBACK path only (used when Postgres is
+# unavailable; the ring's primary path is already PG-indexed and needs none of
+# this). Rebuilding the whole graph's neighbor index from scratch on every
+# fallback ring request is the kind of full-population rescan the rest of this
+# change is trying to eliminate; keyed by (graph path, mtime, ids path, mtime)
+# so both the default committed graph and any staged cohort graph are cached
+# independently and safely invalidate when their underlying file changes.
+_GRAPH_CTX_CACHE: dict = {}
+_DENSE_CORE_CACHE: dict = {"key": None, "ids": frozenset()}
+
+
+def _dense_core_app_ids() -> frozenset:
+    """application_ids where dense_block_score_relational > 0 -- i.e. the node
+    is part of the actual Charikar-peeled dense sub-block (see
+    dense_block_detector_v3.dense_block_scores), not just an incidental
+    shares_X link. Used only to VISUALLY mark which ring neighbours are the
+    real dense-core members; committed-graph rings only (staged cohort rings
+    degrade to no core marking, same as other cohort-preview gaps in this
+    module — genuinely absent pre-commit, never fabricated). mtime-cached like
+    _GRAPH_CTX_CACHE, same rationale."""
+    if not DENSE_CSV.exists():
+        return frozenset()
+    mtime = DENSE_CSV.stat().st_mtime
+    if _DENSE_CORE_CACHE["key"] == mtime:
+        return _DENSE_CORE_CACHE["ids"]
+    df = pd.read_csv(DENSE_CSV)
+    ids = frozenset(df.loc[df["dense_block_score_relational"] > 0.0, "application_id"].astype(str))
+    _DENSE_CORE_CACHE["key"] = mtime
+    _DENSE_CORE_CACHE["ids"] = ids
+    return ids
+
+
 def _graph_ctx(graph_pt: "Path | None" = None, nodeorder_csv: "Path | None" = None):
-    """Load the graph neighbour index + id mapping once (shared by batch + API).
+    """Load the graph neighbour index + id mapping once (shared by batch + API),
+    cached by file identity + mtime so a repeated fallback request doesn't
+    rebuild the whole graph's neighbor index from scratch.
 
     Defaults to the committed graph + features. Pass graph_pt + nodeorder_csv to
     render against a STAGED cohort graph instead (the merged base+cohort graph
@@ -775,11 +965,56 @@ def _graph_ctx(graph_pt: "Path | None" = None, nodeorder_csv: "Path | None" = No
     ids_csv  = Path(nodeorder_csv) if nodeorder_csv else FINAL_CSV
     if not graph_pt.exists() or not ids_csv.exists():
         return None
+
+    cache_key = (str(graph_pt), graph_pt.stat().st_mtime, str(ids_csv), ids_csv.stat().st_mtime)
+    cached = _GRAPH_CTX_CACHE.get(str(graph_pt))
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+
     app_ids = pd.read_csv(ids_csv)["application_id"].values
     id_to_idx = {a: i for i, a in enumerate(app_ids)}
     nidx = _build_neighbor_index(graph_pt)
     rel_id = {name: i for i, name in enumerate(EDGE_TYPES)}
-    return app_ids, id_to_idx, nidx, rel_id
+    ctx = (app_ids, id_to_idx, nidx, rel_id)
+    _GRAPH_CTX_CACHE[str(graph_pt)] = (cache_key, ctx)
+    return ctx
+
+
+def _ring_fig_from_pg(app_id: str, risk_map: dict | None):
+    """Cut-over path: build the ring figure from indexed Postgres queries
+    (ego_neighbors + induced_subgraph_edges) — no .pt graph load. Node and
+    edge SETS are identical to the graph path (Gate 2 + the render-parity
+    check); node ordering is sorted, so layout is deterministic."""
+    import numpy as np
+    from src.config_v3 import EDGE_TYPES
+    from src.db import reads as db_reads
+    from src.graph_viz_v3 import _figure_for_ring
+
+    if not db_reads.identity_row_exists(str(app_id)):
+        return None  # unknown application — same as "not in the graph"
+    nbrs = db_reads.ego_neighbors(str(app_id))
+    neighbor_ids = sorted(set().union(*nbrs.values())) if nbrs else []
+    node_ids = [str(app_id)] + [n for n in neighbor_ids if n != str(app_id)]
+    # isolated-but-known apps render a 1-node ring, like the graph path
+    local = {a: i for i, a in enumerate(node_ids)}
+    rel_id = {name: i for i, name in enumerate(EDGE_TYPES)}
+    edges = []
+    for a, b, rel in db_reads.induced_subgraph_edges(node_ids):
+        if a in local and b in local:
+            edges.append((local[a], local[b], rel_id.get(rel, 0)))
+    if risk_map is None:
+        risk_map = db_reads.risk_scores_for(node_ids)
+    scores = np.array([float(risk_map.get(a, 0.0)) for a in node_ids], dtype=float)
+    sg = {"node_ids": list(range(len(node_ids))), "scores": scores, "edges": edges}
+    core_ids = _dense_core_app_ids()
+    core_global_ids = {i for i, a in enumerate(node_ids) if a in core_ids} if core_ids else None
+    fig = _figure_for_ring(sg, np.array(node_ids), 1, core_global_ids=core_global_ids)
+    n_edges = len(set((min(a, b), max(a, b)) for a, b, _ in edges))
+    fig.update_layout(title=dict(text=(
+        f"<b>Identity ring — {app_id}</b>"
+        f"<span style='color:#8b949e'>    {len(node_ids)} nodes · {n_edges} edges · "
+        f"risk {float(scores[0]):.3f}</span>")))
+    return fig
 
 
 def build_ring_html(app_id: str, risk_map: dict | None = None,
@@ -789,7 +1024,23 @@ def build_ring_html(app_id: str, risk_map: dict | None = None,
     on demand (this is what the API's /ring endpoint calls when a link is
     clicked). plotly.js is embedded inline so the response is self-contained.
     Returns None if the application is not in the graph. Pass graph_pt +
-    nodeorder_csv to render against a staged cohort graph (see _graph_ctx)."""
+    nodeorder_csv to render against a staged cohort graph (see _graph_ctx).
+
+    Committed-graph requests are served from Postgres (indexed 1-hop +
+    induced-edge queries) when NIC_READS_FROM_PG allows, falling back to the
+    .pt graph on any failure. Staged-cohort requests (graph_pt passed) always
+    use the staged bundle."""
+    if graph_pt is None:
+        try:
+            from src.db.reads import reads_from_pg
+            if reads_from_pg():
+                fig = _ring_fig_from_pg(app_id, risk_map)
+                if fig is not None:
+                    return fig.to_html(include_plotlyjs=True, full_html=True)
+                return None
+        except Exception as e:  # noqa: BLE001 — PG outage must not kill rings
+            print(f"[xai_card_html] WARNING: PG ring path failed, falling back to graph: {e}")
+
     ctx = _graph_ctx(graph_pt, nodeorder_csv)
     if ctx is None:
         return None
@@ -806,21 +1057,34 @@ def build_ring_html(app_id: str, risk_map: dict | None = None,
 
 
 def build_staged_card_html(name: str, app_id: str) -> str | None:
-    """Lightweight PREVIEW reviewer card for a staged cohort application (scored
-    read-only by evaluate-dataset). Pre-fusion: shows the hybrid_anomaly_score and
-    the top interpretable feature drivers (declared-vs-model-expected where
-    available) plus the narrative — NOT the committed fused risk_score_v3 or EVT
-    triggers (those need a committed pipeline run). Returns None if the app isn't
-    in the cohort's staged scores."""
+    """PREVIEW reviewer card for a staged cohort application (scored read-only
+    by evaluate-dataset) — reuses the SAME chrome, tabs, identity-network mini
+    view, signal-driver rendering, and field accordions as the committed-card
+    path (_left_pane/_right_pane_preview/_page), fed by a pseudo evidence dict
+    built from what a pre-fusion cohort actually has: the hybrid detector's
+    per-feature error/predicted vectors and, when the cohort's graph bundle was
+    persisted (Evaluate ran with a graph), REAL shares_ip neighbours from it.
+
+    Genuinely absent pre-commit (never fabricated): subspace_groups,
+    dense_block_relational, fusion_contributions, evt_crossings — these require a
+    committed pipeline run. _reason_codes/_signal_bars/_model_trace already
+    degrade gracefully on empty inputs, so omitting them is a truthful gap,
+    not a rendering failure. The reviewer-decision form is omitted (not
+    disabled-and-shown) because confirm-fraud reads the COMMITTED features
+    file and would 422 on an uncommitted app_id.
+
+    Returns None if the app isn't in the cohort's staged scores."""
     import json as _json
-    from src.xai_layer_v3 import _top_features, _narrative
+    import numpy as np
+    from src.xai_layer_v3 import _degree_counts_from_index, _top_features
 
     scores_path = Path(f"outputs/staged_scores_{name}.csv")
     feats_path  = Path(f"outputs/staged_features_{name}.csv")
     if not scores_path.exists():
         return None
     sdf = pd.read_csv(scores_path)
-    match = sdf[sdf["application_id"].astype(str) == str(app_id)]
+    sdf["application_id"] = sdf["application_id"].astype(str)
+    match = sdf[sdf["application_id"] == str(app_id)]
     if match.empty:
         return None
     row = match.iloc[0]
@@ -835,52 +1099,115 @@ def build_staged_card_html(name: str, app_id: str) -> str | None:
         if not fm.empty:
             actual_vals = fm.iloc[0].to_dict()
 
-    top_feats = _top_features(per_feat, actual_vals, k=6, predicted=predicted)
-    score  = float(row["hybrid_anomaly_score"])
-    pseudo = {"risk_score_v3": score, "triggers": [],
-              "top_graph_neighbors": [], "top_feature_errors": top_feats}
-    narrative = _narrative(pseudo)
+    # Real identity-network preview: shares_ip neighbours from the cohort's
+    # persisted graph bundle (same mechanism the 3D ring uses). Absent only
+    # if Evaluate ran before graph persistence was added (stale cohort) —
+    # degrades to "no shared-IP co-applications found", not a crash.
+    graph_pt  = Path(f"outputs/staged_graph_{name}.pt")
+    nodeorder = Path(f"outputs/staged_nodeorder_{name}.csv")
+    graph_connections: list[dict] = []
+    neighbor_idxs = None
+    risk_map = dict(zip(sdf["application_id"], sdf["hybrid_anomaly_score"]))
+    if graph_pt.exists() and nodeorder.exists():
+        ctx = _graph_ctx(graph_pt, nodeorder)
+        if ctx is not None:
+            g_app_ids, id_to_idx, nidx, _rel_id = ctx
+            t = id_to_idx.get(str(app_id))
+            if t is not None:
+                ip_neighbors = [e["neighbor_idx"] for e in nidx.get(t, [])
+                                if e["edge_type"] == "shares_ip"]
+                if ip_neighbors:
+                    from src.config_v3 import EDGE_TYPES as _ALL_EDGE_TYPES
+                    degree = _degree_counts_from_index(nidx, len(g_app_ids), _ALL_EDGE_TYPES)["shares_ip"]
+                    this_degree = len(ip_neighbors)
+                    pct = 100.0 * (degree < this_degree).sum() / max(len(degree), 1)
+                    graph_connections.append({
+                        "edge_type": "shares_ip", "count": this_degree,
+                        "percentile": round(float(pct), 1),
+                        "sample_ids": [str(g_app_ids[i]) for i in ip_neighbors[:6]],
+                    })
+                    neighbor_idxs = ip_neighbors
 
-    rows_html = ""
-    for f in top_feats:
-        label = _esc(f.get("feature_label") or f.get("feature"))
-        err   = f.get("error")
-        val   = f.get("value")
-        exp   = f.get("expected")
-        cmp   = ""
-        if val is not None and exp is not None:
-            cmp = f"scaled {val:.3f} · model-expected {exp:.3f}"
-        elif val is not None:
-            cmp = f"scaled {val:.3f}"
-        rows_html += (f"<tr><td>{label}</td><td class='num'>{_esc(err)}</td>"
-                      f"<td class='muted'>{_esc(cmp)}</td></tr>")
+    top_feats = _top_features(per_feat, actual_vals, k=6, predicted=predicted,
+                              neighbor_idxs=neighbor_idxs)
+    score = float(row["hybrid_anomaly_score"])
 
-    return f"""<!DOCTYPE html><html><head><meta charset='utf-8'><style>
-    body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:16px;font-size:13px;}}
-    .hdr{{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px;}}
-    .aid{{font-family:ui-monospace,Consolas,monospace;color:#4cc9f0;font-weight:600;font-size:14px;}}
-    .badge{{padding:2px 10px;border-radius:999px;font-size:11px;font-weight:700;background:rgba(244,162,97,.16);color:#f4a261;border:1px solid rgba(244,162,97,.4);}}
-    .score{{font-family:ui-monospace,monospace;font-size:20px;font-weight:700;margin-left:auto;}}
-    .note{{font-size:11.5px;color:#8b949e;margin:2px 0 14px;line-height:1.5;}}
-    .narr{{background:#161b22;border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:12px 14px;line-height:1.55;margin-bottom:14px;}}
-    table{{width:100%;border-collapse:collapse;}}
-    th,td{{text-align:left;padding:7px 10px;border-bottom:1px solid rgba(255,255,255,.09);}}
-    th{{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:#6b7280;}}
-    td{{font-family:ui-monospace,Consolas,monospace;color:#c9d1d9;}}
-    .num{{color:#e6edf3;}} .muted{{color:#8b949e;font-family:'Segoe UI',sans-serif;}}
-    </style></head><body>
-    <div class='hdr'>
-      <span class='aid'>{_esc(app_id)}</span>
-      <span class='badge'>PREVIEW · pre-fusion</span>
-      <span class='score'>{score:.4f}</span>
-    </div>
-    <div class='note'>Read-only cohort score (hybrid anomaly score, higher = more anomalous).
-    This is <b>not</b> the committed fused risk_score_v3 — that needs a committed pipeline run.
-    Use the 3D identity ring above to inspect this application's relationships.</div>
-    <div class='narr'>{_esc(narrative)}</div>
-    <table><thead><tr><th>Signal driver</th><th>Error</th><th>Declared vs model-expected</th></tr></thead>
-    <tbody>{rows_html}</tbody></table>
-    </body></html>"""
+    # Within-cohort ranking — the only "population" a pre-fusion preview has.
+    risk_rank = int((sdf["hybrid_anomaly_score"] > score).sum()) + 1
+    risk_percentile = 100.0 * (sdf["hybrid_anomaly_score"] < score).sum() / max(len(sdf), 1)
+
+    # Signal-drivers preview: subspace IF / dense-block / fusion contributions,
+    # computed by evaluate_dataset() over the full merged (base+cohort)
+    # population (src/api/handlers/monitoring.py) using the SAME reusable
+    # functions the committed pipeline uses. Percentiles here are WITHIN THIS
+    # COHORT (the only population a pre-fusion preview has); EVT thresholds are
+    # the committed ones (population-level constants, still meaningful to
+    # compare a preview score against). Absent only for cohorts staged before
+    # this was added (stale bundle) -- degrades to empty, same as before.
+    from src.xai_layer_v3 import _pct_rank, EVT_JSON as _EVT_JSON, GROUP_LABELS as _GROUP_LABELS
+    evt = json.loads(_EVT_JSON.read_text()) if _EVT_JSON.exists() else {}
+
+    subspace_groups_ev: dict = {}
+    if "group_scores_json" in sdf.columns and pd.notna(row.get("group_scores_json")):
+        this_groups = _json.loads(row["group_scores_json"])
+        all_groups = [_json.loads(g) for g in sdf["group_scores_json"].dropna()]
+        for g, g_score in this_groups.items():
+            g_ev = {"score": round(float(g_score), 6), "source_model": "subspace"}
+            g_vals = np.array([d.get(g, 0.0) for d in all_groups], dtype=float)
+            if g_vals.size:
+                g_ev["percentile"] = round(_pct_rank(np.sort(g_vals), float(g_score)), 2)
+            thr = evt.get(f"subspace_if_{g}", {}).get("threshold")
+            if thr is not None:
+                g_ev["threshold"] = round(float(thr), 6)
+                g_ev["crossed"] = bool(float(g_score) >= float(thr))
+            subspace_groups_ev[g] = g_ev
+
+    dense_rel_ev: dict = {}
+    if "dense_block_score_relational" in sdf.columns and pd.notna(row.get("dense_block_score_relational")):
+        dense_rel_score = float(row["dense_block_score_relational"])
+        dense_rel_ev = {"score": round(dense_rel_score, 6), "source_model": "dense_relational",
+                         "by_relation": {
+                             rel: round(float(row[f"dense_block_score_{rel}"]), 6)
+                             for rel in ("mobile", "ip")
+                             if f"dense_block_score_{rel}" in sdf.columns and pd.notna(row.get(f"dense_block_score_{rel}"))
+                         }}
+        if dense_rel_score > 0.0:
+            dense_sorted = np.sort(sdf["dense_block_score_relational"].dropna().values.astype(float))
+            dense_rel_ev["percentile"] = round(_pct_rank(dense_sorted, dense_rel_score), 2)
+
+    fusion_contrib_ev: dict = {}
+    if "preview_fusion_contributions_json" in sdf.columns and pd.notna(row.get("preview_fusion_contributions_json")):
+        fusion_contrib_ev = _json.loads(row["preview_fusion_contributions_json"])
+
+    pseudo_card = {
+        "application_id": app_id,
+        "risk_score_v3": score,
+        "triggers": [],
+        "top_feature_errors": top_feats,
+        "evidence": {
+            "subspace_groups": subspace_groups_ev,
+            "dense_block_relational": dense_rel_ev,
+            "fusion_contributions": fusion_contrib_ev,
+            "graph_connections": graph_connections, "evt_crossings": [],
+            "risk_percentile": risk_percentile, "risk_rank": risk_rank,
+            "population_size": len(sdf), "label_source": "preview",
+        },
+    }
+
+    ring_href = f"/v3/monitoring/cohort/{name}/{_esc(app_id)}/ring"
+    body = f"""
+    <div class="wrap">
+      <div class="topbar">
+        <div><div class="eyebrow">Scholarship fraud review · NIC v3 · cohort preview</div>
+          <div class="appid">{_esc(app_id)}</div></div>
+        <div class="spacer"></div>
+        <div class="status" style="color:#f4a261;background:#f4a26122;border:1px solid #f4a26155">
+          <span class="dot"></span>PREVIEW · pre-fusion</div>
+      </div>
+      <div class="grid">{_left_pane(pseudo_card, ring_href)}{_right_pane_preview(pseudo_card)}</div>
+    </div>"""
+    nodes_json = json.dumps(_ego_nodes(pseudo_card, risk_map))
+    return _page(f"Reviewer card (preview) — {app_id}", body, nodes_json)
 
 
 def generate_ego_rings(cards: list[dict], risk_map: dict) -> dict[str, str]:
@@ -910,13 +1237,23 @@ def generate_ego_rings(cards: list[dict], risk_map: dict) -> dict[str, str]:
 
 def build_card_html(app_id: str, rank: int = 1) -> str | None:
     """LAZY: render one lightweight reviewer card as HTML for the API's /card
-    endpoint. Reads the pre-computed explanation_cards_v3.json (produced by the
-    XAI layer). The 3D link points at the API's /ring route (lazy Plotly).
-    Returns None if no card exists for this application."""
-    if not CARDS_JSON.exists():
-        return None
-    cards = json.loads(CARDS_JSON.read_text())
-    card = next((c for c in cards if str(c["application_id"]) == str(app_id)), None)
+    endpoint. First checks the pre-computed explanation_cards_v3.json (the
+    top-N reviewer-queue batch, fast path — just a JSON scan). If the
+    application isn't in that batch (added 2026-07-22 — see README changelog),
+    falls back to build_card_for_app(), which assembles a card on demand from
+    the cached population context: O(1) relative to population size after the
+    first call in this process, not a full-population rescan. This is what
+    gives every application a card, not just the top 500, without needing to
+    pre-render and store one for the whole scored population. The 3D link
+    points at the API's /ring route (also lazy). Returns None only if the
+    application isn't in the scored population at all."""
+    card = None
+    if CARDS_JSON.exists():
+        cards = json.loads(CARDS_JSON.read_text())
+        card = next((c for c in cards if str(c["application_id"]) == str(app_id)), None)
+    if card is None:
+        from src.xai_layer_v3 import build_card_for_app
+        card = build_card_for_app(app_id)
     if card is None:
         return None
     risk_map = {}

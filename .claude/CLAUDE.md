@@ -1,42 +1,38 @@
-# CLAUDE.md — NIC Scholarship Fraud Detection
+# CLAUDE.md — NIC Scholarship Fraud Detection (V4-Scale phase)
 
 ## What This Project Is
 
-ML-based fraud detection for the NIC scholarship portal. The system produces
-a per-application anomaly risk score (0–1) for 15,000 fresh applications.
+ML-based, **rule-free** fraud detection for the NIC scholarship portal. The
+detection architecture is **fixed and validated** (see `docs/HISTORY.md` for
+how we got here — v1 rules → v2 rule-free stack → v3 Hybrid GraphMCM → V4
+locked fusion). The active branch is **`V4-Scale`**: migrating I/O to
+**PostgreSQL as the system of record** and detector training to mini-batch
+sampling so the system runs at **30–40 lakh (3–4 million) applications** on
+the production server (16 vCPU, 64 GB RAM, Ubuntu 22.04, no GPU, k3s).
 
-Three architectural generations exist:
-- **v1** — rule + bridge supervised (99 NIC rules + 8 bridges). Canonical run
-  done; do not retrain without explicit instruction.
-- **v2** — rule-free: Tabular VAE + Graph AE (DOMINANT + DeepSVDD) + Isolation
-  Forest + MCM. **Superseded** — no `_v2.py` source remains in `src/`.
-- **v3** — rule-free **Hybrid GraphMCM**: one two-stream detector (masked
-  feature prediction + RGCN graph stream) + subspace Isolation Forest + EVT +
-  human-gated self-training + LightGBM fusion + XAI. **This is the current
-  system. You are almost always working on v3.**
+You are almost always working the migration plan in `docs/IMPLEMENTATION.md`.
+You are **not** redesigning detection.
 
-An experimental **Phase 2 (V4 capability layer)** sits on top of v3 on branch
-`v4-han-graphmcm`: an attention read-out (Tier 1) and a subgraph ring-classifier,
-compared head-to-head against baseline. These are **opt-in, default OFF**. The
-settled architecture is in `docs/IMPLEMENTATION.md`; all comparison results are in
-`docs/AGENTS.md` Appendix H.
-
-> **Naming:** "V4" is a capability label. The source files stay `_v3`. Do NOT
-> rename `_v3`→`_v4` or `/v3`→`/v4`.
+> **Naming:** "V4" / "V4-Scale" are capability/branch labels. Source files
+> stay `_v3`. Do NOT rename `_v3`→`_v4` or `/v3`→`/v4`.
 
 ---
 
 ## Read These Files First — Every Session
 
-1. **`docs/AGENTS.md`** — primary architecture reference for all v3 work.
-   Read before writing any code. (Editable only under explicit project-lead
-   direction — see hard stop #8.)
-2. **`docs/IMPLEMENTATION.md`** — the settled V4 layered architecture and the
-   remaining validation gate. Comparison results/tables are in `docs/AGENTS.md`
-   Appendix H.
-3. The MAR (Model & Architecture Review) critique is **folded inline** — see
-   "Known Structural Weaknesses" below and `docs/AGENTS.md`. There is no
-   separate `MAR_v2.md`/`MAR_v3.md` file.
+1. **`docs/AGENTS.md`** — the working contract: fixed architecture, module
+   ownership, all 14 hard stops, open decisions. Lead-owned (hard stop 8) —
+   never edit autonomously; flag and propose a redline.
+2. **`docs/TECHNICAL_REFERENCE_AND_SCALING.md`** — Part I: how every
+   component works; Part II: the target Postgres/k8s architecture. The
+   deepest reference; cite it rather than re-deriving.
+3. **`docs/IMPLEMENTATION.md`** — the 5-step migration plan with 15k
+   acceptance gates. Find the current step before writing code.
+4. **`docs/HISTORY.md`** — read-only metric record. Cite it (or the ablation
+   JSONs in `outputs/ablation/`) for any past number; never extend it.
+
+Pre-V4-Scale docs (incl. the 2,377-line AGENTS.md with Appendix H result
+tables) live in git history: `git show 9b772de:docs/AGENTS.md` on `main`.
 
 If a referenced file is not in the working directory, stop and say so before
 writing any code.
@@ -47,20 +43,18 @@ writing any code.
 
 **After completing any instruction that changes behaviour, interfaces, files,
 or how the system is run/deployed, update the relevant docs in the same turn.**
-Do not leave docs describing a superseded state. Concretely:
 
-- Code/endpoint/CLI/config change → update `README.md` and, if it's an API
-  change, `docs/API_TESTING_GUIDE.md`.
-- Serving/deploy/container change → update `deploy/README.md` and, if the
-  operator flow changed, `docs/OPERATIONS_RUNBOOK.md`.
-- Detection-architecture change → update `docs/IMPLEMENTATION.md`.
-- If a doc becomes redundant, delete it or rewrite it to point at the current
-  one — do not accumulate stale parallel docs.
-- `docs/AGENTS.md` is **lead-owned (hard stop #8)** — never edit it to "keep it
-  fresh." If it goes stale, flag it and propose a redline instead.
+- Code/endpoint/CLI/config change → `README.md`; API change →
+  `docs/API_TESTING_GUIDE.md`.
+- Serving/deploy/container change → `deploy/README.md`; operator-flow change
+  → `docs/OPERATIONS_RUNBOOK.md`.
+- Migration-step progress (gate passed / step started) → status markers in
+  `docs/IMPLEMENTATION.md`.
+- `docs/AGENTS.md` is lead-owned — flag staleness, propose a redline, never
+  self-serve edits. `docs/HISTORY.md` is a closed record — never extend.
 
-Treat a task as unfinished until its docs match reality. State in your summary
-which docs you touched (or that none needed changes).
+Treat a task as unfinished until its docs match reality. State in your
+summary which docs you touched (or that none needed changes).
 
 ---
 
@@ -69,328 +63,188 @@ which docs you touched (or that none needed changes).
 ```
 NIC fraud Detection Project/
 ├── main_v3.py                          # Pipeline orchestrator (entry point)
-├── README.md
-├── requirements.txt
+├── README.md / requirements.txt / requirements-dev.txt
+├── docker-compose.yml                  # redis + nic-api + nic-worker + nginx (+ postgres, step 0)
 │
-├── src/                                # All Python source modules (_v3)
-│   ├── tabular_feature_engine_v3.py    # Phase A: feature engineering
-│   ├── graph_builder_v3.py             # Phase B: identity graph + degree features
-│   ├── synthetic_exposure_builder_v3.py# Phase B: LOE exposure (tabular + topology)
-│   ├── hybrid_graphmcm_v3.py           # Phase C: Hybrid GraphMCM detector (RGCN|HAN)
-│   ├── subspace_if_v3.py               # Phase C: per-group Isolation Forest
-│   ├── evt_scorer_v3.py                # Phase D: EVT thresholds
-│   ├── self_training_loop_v3.py        # Phase D: pseudo-label promotion (human-gated)
-│   ├── fusion_classifier_v3.py         # Phase E: LightGBM fusion
-│   ├── xai_layer_v3.py                 # Phase E: evidence-first explanation cards (JSON)
-│   ├── xai_card_html_v3.py             # Phase E: interactive reviewer cards (HTML) + lazy Plotly rings
-│   ├── evaluate_model_v3.py            # Phase F: synthetic harness (isolated + connected)
-│   │
-│   ├── ring_candidate_v3.py            # V4 Phase 2 (experimental): ring candidate gen
-│   ├── ring_fingerprint_v3.py          # V4 Phase 2: structural fingerprint
-│   ├── ring_classifier_v3.py           # V4 Phase 2: ring classifier + open-set novelty
-│   ├── compare_architectures_v3.py     # V4 Phase 2: baseline/tier1/ring/max_fusion harness
-│   ├── graph_viz_v3.py                 # V4 Phase 2: interactive Plotly ring viz
-│   └── confirmed_fraud_graph_store.py  # confirmed-fraud lifecycle store
+├── src/                                # Python source (_v3 names)
+│   ├── config_v3.py                    # ALL hyperparameters — single source of truth
+│   ├── tabular_feature_engine_v3.py    # 44-feature engineering (SQL-pushdown in step 4)
+│   ├── graph_builder_v3.py             # 5-relation identity graph (hub-capped in step 4)
+│   ├── synthetic_exposure_builder_v3.py# programmatic LOE exposure
+│   ├── hybrid_graphmcm_v3.py           # Hybrid GraphMCM detector + relation-ablation XAI (NeighborLoader in step 5)
+│   ├── subspace_if_v3.py               # per-group Isolation Forest (tabular backbone)
+│   ├── dense_block_detector_v3.py      # FRAUDAR-style peeling, mobile+ip (IP-weighted max)
+│   ├── deepsad_detector_v3.py          # Deep SAD center-distance, XAI-only (not in fusion)
+│   ├── evt_scorer_v3.py                # EVT/GPD thresholds
+│   ├── self_training_loop_v3.py        # human-gated pseudo-labels
+│   ├── fusion_classifier_v3.py         # LOCKED score-level fusion
+│   ├── xai_layer_v3.py / xai_card_html_v3.py  # evidence cards (JSON / HTML)
+│   ├── evaluate_model_v3.py            # synthetic harness (v2 floors = pass bar)
+│   ├── checkpoint_manager.py           # atomic checkpoint hot-swap
+│   ├── retraining_orchestrator.py      # drift check + retrain paths
+│   ├── confirmed_fraud_store.py / confirmed_fraud_graph_store.py / model_registry.py
+│   │                                   # JSON stores (dual-write → Postgres, steps 1–3)
+│   ├── db/                             # (step 0) ALL SQL lives here — nowhere else
+│   └── api/                            # FastAPI app, handlers, Celery tasks
 │
-├── data/
-│   ├── raw/data_for_ml_model.csv       # 15,000 primary dataset
-│   └── processed/
-│       ├── engineered_features_v3.csv  # 15,000 × 44 numeric features (+ application_id)
-│       ├── v3_feature_schema.json      # 44 feature names + exclusions + dropped_from_model
-│       ├── degree_features_v3.csv
-│       ├── identity_graph_v3.pt        # PyG HeteroData graph (5 edge types)
-│       ├── synthetic_exposure_set_v3.pt# tabular LOE tensor
-│       └── synthetic_exposure_graph_v3.pt # topology LOE (clusters + edges)
-│
-├── models/
-│   └── hybrid_graphmcm_v3.pth          # detector state_dict + centroid (+ seed variants)
-│
-├── outputs/
-│   ├── hybrid_scores_v3.csv            # detector scores + per-feature error/predicted JSON
-│   ├── subspace_if_scores_v3.csv
-│   ├── evt_thresholds_v3.json
-│   ├── pseudo_labels_v3.json
-│   ├── risk_scores_v3.csv              # final fused risk
-│   ├── explanation_cards_v3.json
-│   ├── ablation/                       # comparison + ablation JSON
-│   └── viz/                            # interactive ring HTML
-│
+├── frontend/                           # vanilla-JS console (UNCHANGED this phase)
+├── deploy/                             # nginx, k8s manifests, (step 0) postgres/schema.sql
+├── data/                               # raw/ 15k dataset + processed/ artifacts
+├── models/                             # checkpoints (checkpoint_manager-managed)
+├── outputs/                            # scores, cards, ablation JSON (incl.
+│                                       #   ablation/locked_fusion_validation.json)
 └── docs/
-    ├── AGENTS.md                       # Architecture contract (v3) + Appendix H results
-    ├── IMPLEMENTATION.md               # Settled V4 layered architecture
-    ├── OPERATIONS_RUNBOOK.md
+    ├── AGENTS.md                       # working contract (lead-owned)
+    ├── TECHNICAL_REFERENCE_AND_SCALING.md
+    ├── IMPLEMENTATION.md               # 5-step migration plan + gates
+    ├── HISTORY.md                      # read-only metric record
+    ├── OPERATIONS_RUNBOOK.md           # console/operator guide
     └── API_TESTING_GUIDE.md
 ```
 
-**Convention:** all paths are relative to the project root. Source in `src/`,
-data in `data/`, checkpoints in `models/`, outputs in `outputs/`. Never write
-outputs to the project root.
+Source in `src/`, data in `data/`, checkpoints in `models/`, outputs in
+`outputs/`. Never write outputs to the project root.
 
 ---
 
-## Architecture in Brief
+## Architecture in Brief (fixed — do not relitigate)
 
 ```
-data/raw/data_for_ml_model.csv
-        │
-        ▼
-src/tabular_feature_engine_v3.py ──► engineered_features_v3.csv, v3_feature_schema.json
-        │                                         │
-        ▼                                         ▼
-src/graph_builder_v3.py ──► identity_graph_v3.pt  src/synthetic_exposure_builder_v3.py
-        │                                         │   ──► synthetic_exposure_set_v3.pt
-        │                                         │       synthetic_exposure_graph_v3.pt
-        └──────────────┬──────────────────────────┘
-                       ▼
-     src/hybrid_graphmcm_v3.py  (feature stream: K=8 masks over 44-dim
-                       │         graph stream: RGCN, 5 edge types → h_N(64)
-                       │         concat → MLP → predicted x + edge probs)
-                       │  ──► hybrid_scores_v3.csv, models/hybrid_graphmcm_v3.pth
-                       │        hybrid_anomaly_score = feature_pred_error + 0.3·edge_pred_error
-        ┌──────────────┤
-        ▼              ▼
-src/subspace_if_v3.py  src/evt_scorer_v3.py ──► evt_thresholds_v3.json
-   │ subspace_if_scores_v3.csv          │
-   └───────────────┬────────────────────┘
-                   ▼
-     src/self_training_loop_v3.py ──► pseudo_labels_v3.json  (human-gated)
-                   ▼
-     src/fusion_classifier_v3.py ──► risk_scores_v3.csv
-                   ▼
-     src/xai_layer_v3.py ──► explanation_cards_v3.json
-                   ▼
-     src/evaluate_model_v3.py ──► console PR-AUC / ablation JSON
+applications (Postgres system of record; console CSV intake preserved)
+  → 44 engineered features (MinMax, persisted params)
+  → 5-relation identity graph (shares_mobile/ip/father_name/mother_name/pincode)
+  → three detectors (ALL higher = more anomalous):
+      hybrid_anomaly_score = feature_pred_error + LAMBDA_EDGE_SCORE·edge_pred_error
+                              (RGCN GraphMCM; LAMBDA_EDGE_SCORE=0.0 since 2026-07-23 —
+                              edge_pred_error still trains, excluded from the score only)
+      subspace_if_score                                                  (backbone)
+      dense_block_ip                                                     (IP specialist)
+  → EVT thresholds (the only thresholds allowed)
+  → LOCKED fusion: final_risk = minmax(max(minmax(subspace), minmax(dense_ip), minmax(hybrid)))
+                    (unweighted max since 2026-07-22 — see Key Hyperparameters below)
+  → human-gated self-training | XAI evidence cards
 ```
 
-Strict file-based contracts. Find your module in `docs/AGENTS.md` and stay
-inside it. If a task spans two modules, stop and confirm scope before writing.
+**LightGBM is NOT the fusion layer** — it was removed (14 positives destroyed
+calibrated components; `docs/HISTORY.md`). Any record saying otherwise is
+stale.
 
-**Key v3 change vs v2:** the separate Tabular VAE and Graph AE (DOMINANT +
-DeepSVDD) are replaced by a single **Hybrid GraphMCM** detector. Full-space IF
-is replaced by a **subspace IF** (per feature group). Score direction is still
-higher = more anomalous.
-
----
-
-## Current Hyperparameters (Locked Unless Ablation Justifies Change)
-
-Source of truth: `src/config_v3.py`.
+## Key Hyperparameters (locked; source of truth `src/config_v3.py`)
 
 | Parameter | Value |
 |---|---|
-| Input feature dimensions | 44 numeric columns (`N_FEATURES`) — 68 minus the 24 nominal `IDENTIFIER_FEATURES`, dropped 2026-07-15 (noid ablation) |
-| Graph edge types | 5 (`shares_mobile`, `shares_ip`, `shares_father_name`, `shares_mother_name`, `shares_pincode`) |
-| Feature-stream masks | 8 (`MASK_NUM`) |
-| Graph hidden / embedding dim | 128 / 64 (`GRAPH_HIDDEN` / `GRAPH_EMB_DIM`) |
-| MLP hidden / Z dim | 256 / 64 (`MLP_HIDDEN` / `Z_DIM`) |
-| LOE margin | 2.0 (`LOE_MARGIN`) |
-| Edge-loss weight λ_edge | 0.3 (`LAMBDA_EDGE`) |
-| Exposure-loss weight λ_exposure | 1.0 (`LAMBDA_EXPOSURE`) |
-| Stage 1 / Stage 2 epochs | 80 / 120 (`EPOCHS_STAGE1` / `EPOCHS_STAGE2`) |
-| Learning rate / batch size | 1e-3 / 256 |
-| Random seed | 42 (`RANDOM_SEED`, override via `V4_SEED`) |
-| Encoder | `rgcn` default (`han` available; HAN drop-in regresses −0.091, 3-seed) |
+| Model features | 44 (`N_FEATURES`; 24 nominal identifiers dropped, noid ablation 2026-07-15) |
+| Graph edge types / masks | 5 / 8 |
+| Graph hidden / emb dim | 128 / 64 · MLP hidden / Z dim 256 / 64 |
+| LOE margin / λ_edge (training) / λ_exposure | data-derived (`_derive_loe_margin`, was fixed 2.0 — found ~3x too small for this embedding scale, changed 2026-07-22) / 0.3 (`LAMBDA_EDGE`, training-loss weight only) / 1.0 · Stage 2 persistent LOE weight 0.15 (`LOE_STAGE2_WEIGHT`) |
+| λ_edge_score (inference score) | `LAMBDA_EDGE_SCORE=0.0` since 2026-07-23 (decoupled from the training-loss `LAMBDA_EDGE` above) — `edge_pred_error` showed no usable signal on its 3 designed relational categories (stress-tested, replicated on 2 independently-seeded populations) and diluted `feature_pred_error`'s real MOBILE_CLUSTER signal; still trains, still computed for XAI, excluded from the ranking score only. Real-population reorder not yet ground-truth-validated — `AGENTS.md` §7 open decision 7 |
+| Stage 1 / Stage 2 epochs | 80 / 120 · LR 1e-3 · batch 256 · seed 42 (`V4_SEED`) |
+| Encoder | `rgcn`, `root_weight=False` since 2026-07-22 (HAN available; drop-in regresses −0.091, 3-seed) |
 | Incremental fine-tune | 10 epochs @ 1e-4, RGCN frozen |
-| Confirmed-fraud LightGBM weight | 3.0 (`CONFIRMED_WEIGHT`) |
-| Self-training min signals for promotion | 2 (`MIN_SIGNALS_FOR_PROMOTION`) |
-| Centroid clean percentile | 95 (`CENTROID_CLEAN_PERCENTILE`) |
-| EVT GPD shape valid range | [-0.5, 1.0] |
-| Subspace IF groups | financial / identity / network |
+| Fusion (LOCKED) | max, not weighted-sum, since 2026-07-22: `minmax(max(minmax(subspace), minmax(dense_relational), minmax(hybrid)))` — no per-component weight (`FUSION_W_*` retired); Deep SAD `center_dist_score` is NOT a fusion input (XAI-only, see below) |
+| Dense-block gate | `shares_mobile`+`shares_ip` (`DENSE_BLOCK_RELATIONS=[0,1]`), IP-priority-weighted max (`DENSE_BLOCK_RELATION_WEIGHTS={0:0.3,1:1.0}`) — history: was `shares_ip` only → extended to mobile+ip+pincode 2026-07-22 → pincode dropped same day, reverted to mobile+ip 2026-07-22 (shared pincode reflects legitimate geographic clustering, not collusion — not a valid fraud signal on its own) |
+| RGCN root weight | `root_weight=False` since 2026-07-22 (`hybrid_graphmcm_v3.RGCNEncoder`) — default `True` let each node's own unmasked features leak into `h_n` via the self-transform, independent of MCM masking; disabling it made `h_n` pure neighbor aggregation. Validated on stress_testing_1 (0.153→0.201 overall, 0.029→0.078 mobile-ring) and on the real 15k set (5/5 V2 floors still pass, edge-dropout retention 2.34) |
+| Deep SAD (XAI-only) | Separate encoder/checkpoint (`deepsad_detector_v3.py`, `models/deepsad_v3.pth`), center-pull/exposure-push objective, no reconstruction loss. `center_dist_score` surfaced on XAI cards as a supplementary signal (>75th pct) — deliberately NOT in `FUSION_COMPONENTS`. Validated on stress_testing_1: 0.201 overall / 0.093 mobile-ring / 0.050 IP-ring, strongest single relational signal found this session. Fusion inclusion TESTED AND REJECTED 2026-07-22: candidate 4-way max fusion scored 0.4181 vs locked 3-way's 0.4182 (noise-level; Deep SAD won the argmax in <1% of nodes — the existing trio already covers its specialties too well for a 4th input to matter) (`DEEPSAD_*` in config_v3.py) |
+| RGCN relation ablation (XAI-only) | `hybrid_graphmcm_v3.compute_relation_ablation()`, added 2026-07-22 — RGCN has no learned attention (unlike the rejected HAN path), so this re-scores the locked checkpoint 5 extra times (one edge type masked out per pass, via `edge_type_tensor`) and reports which relation's removal improves feature-reconstruction fit most, per node. `outputs/relation_ablation_v3.csv`; narrated on XAI cards as "Neighbourhood-expectation driver"; never feeds fusion or a threshold. New pipeline step `relation_ablation` (`main_v3.py`, between `train_hybrid` and `subspace_if`) |
+| Dense-block/EVT/ring XAI enhancements | Added 2026-07-22: (1) EVT trigger sentences cite the measured `n_flagged`/population rate per signal, not just the target `Q`; (2) 3D identity ring marks dense-block core members (gold diamond) vs. incidental shares-X neighbours; (3) ring relations are explicitly toggleable per-legend-item (fixed a real bug where `_figure_for_ring` kept only the first relation seen per node pair, silently dropping e.g. `shares_mother_name` when another relation also connected the same pair); (4) cohort-preview cards (`POST /evaluate-dataset`) now also compute subspace IF / dense-block / a preview fusion score over the batch's own merged population, so the Signal drivers tab is no longer empty pre-commit (still no EVT triggers — those are fitted against the canonical population) |
+| Drift alert | KS p < 0.01 (`DRIFT_KS_THRESHOLD`) |
+| Confirmed-fraud weight | 3.0 · promotion needs ≥2 EVT signals |
+| EVT GPD shape valid range | [-0.5, 1.0] · centroid clean percentile 95 |
 
----
-
-## Current Evaluation State (source-traceable)
-
-The **isolated-node harness** (`src/evaluate_model_v3.py::evaluate()`) uses the
-V2 PR-AUC floors as the pass bar (in `evaluate_model_v3.py`):
-
-```
-AGE_VIOLATION 0.1466 | INCOME_VIOLATION 0.6503 | IP_CONCENTRATION 0.0370
-MOTHER_NAME_COLLISION 0.2869 | FEE_INFLATION 0.4962
-```
-
-The **connected-cluster harness** (`evaluate_connected()`) is the relational
-test. The six-mode head-to-head numbers (baseline / tier1 / ring / max_fusion /
-dense_block_fusion / dense_block_only) live in `docs/AGENTS.md` Appendix H and
-`outputs/ablation/tier_comparison.json` — **the single source of
-truth for V4 results.** Do not restate PR-AUC numbers from memory; cite the JSON.
-
-> Reproducibility caveat: `RGCNConv(aggr="add")` uses CUDA scatter-add atomics
-> that are not seed-controlled, giving a ±0.03–0.04 run-to-run noise floor on
-> detector-derived scores. Use `torch.use_deterministic_algorithms(True)` or CPU
-> scoring before comparing effects smaller than that.
-
----
+> Reproducibility: `RGCNConv(aggr="add")` CUDA scatter-add gives a
+> ±0.03–0.04 noise floor on detector scores. Use deterministic algorithms or
+> CPU scoring before comparing smaller effects.
 
 ## How to Run
 
 ```bash
-# Full pipeline (from project root):
-python main_v3.py
-
-# Individual module (from project root):
-.\.venv\Scripts\python.exe -m src.hybrid_graphmcm_v3
-
-# Head-to-head comparison (V4 Phase 2):
-.\.venv\Scripts\python.exe -m src.compare_architectures_v3
+python main_v3.py                                  # full pipeline (project root)
+.\.venv\Scripts\python.exe -m src.<module_name>    # individual module
+docker compose up --build                          # serving stack (console at :8080)
 ```
 
-Modules assume the working directory is the project root, not `src/`, and are
-run as modules (`-m src.<name>`) so package imports resolve.
+Modules assume the working directory is the project root and run as modules
+(`-m src.<name>`).
 
 ---
 
 ## Hard Stops — Never Proceed Past These
 
-**1. No rules. No exceptions.**
-If you find yourself writing any of the following, stop immediately:
-- A numeric threshold against a domain concept (`ip_count >= 15`, `age > 35`)
-- A named rule code (`X1`, `YF`, `IP_CONC_ENG`, etc.)
-- A call to `apply_rules()` or any equivalent
-- A feature whose definition encodes a policy boundary
+(Mirrors `docs/AGENTS.md` §4; AGENTS.md wording governs on any divergence.)
 
-The only numeric thresholds allowed are EVT-derived (`src/evt_scorer_v3.py`) or
-learned from synthetic exposure (Stage 1 training).
-
-**2. No raw GNN embeddings leave `src/hybrid_graphmcm_v3.py`.**
-Only scalar scores (`hybrid_anomaly_score`, `feature_pred_error`,
-`edge_pred_error`) and attention *weights* (per-relation β_r, α entropy/top-1)
-are valid exports. The 64-dim `h_N` never leaves the module. If downstream code
-requires embeddings, that is a design error. Stop and flag it.
-
-**3. Score direction in v3 is higher = more anomalous.**
-`hybrid_anomaly_score` and `subspace_if_score` are both higher = more anomalous.
-Any module that inverts this convention must document the inversion explicitly at
-the point of inversion. Do not silently flip the sign.
-
-**4. `sanity` column is never used.**
-Never as a feature. Never as a label. Never for evaluation. It is in
-`EXCLUDED_FROM_FEATURES` (`config_v3.py`). See `docs/AGENTS.md` for why.
-
-**5. Self-training rounds are not automatic.**
-Each round requires a Phase D PR-AUC check before its label set is used for the
-next training cycle. Never write a loop that advances rounds without a human
-check. The Round 0 classifier-agreement condition must be code-enforced off, not
-just noted in a comment.
-
-**6. No v1 or v2 model outputs in v3.**
-`lgbm_risk_score` (v1), `vae_anomaly_score` / `graph_anomaly_score` (v2), and any
-v1/v2 checkpoint do not exist in the v3 pipeline. Not as teachers, not as
-warm-starts, not as round-0 stand-ins.
-
-**7. Synthetic exposure set is programmatically constructed.**
-Never use CTGAN, TVAE, GaussianCopula, or any tabular GAN to generate the
-exposure set. See `docs/AGENTS.md` — composite degradation is 24x or more on
-fraud behavioral signals.
-
-**8. `docs/AGENTS.md` is project-lead-owned.**
-Do not modify it autonomously. Flag outdated content explicitly and propose a
-redline; apply only under explicit project-lead direction for the current branch.
+1. **No rules.** No numeric threshold against a domain concept, no rule
+   codes, no policy-boundary features. Only EVT-derived or learned
+   thresholds. The scale-phase hub-cap / group-size ceiling must be derived
+   from the observed group-size distribution, never hand-picked.
+2. **No raw GNN embeddings leave `hybrid_graphmcm_v3.py`** — scalar scores
+   and attention weights only. No embedding columns in Postgres, ever.
+3. **Higher = more anomalous.** Document any inversion at the point of
+   inversion.
+4. **`sanity` column is never used** (feature, label, or evaluation).
+5. **Self-training rounds are human-gated**; Round 0 classifier-agreement is
+   code-enforced OFF.
+6. **No v1/v2 model outputs anywhere** (`lgbm_risk_score`,
+   `vae_anomaly_score`, `graph_anomaly_score`, old checkpoints).
+7. **Synthetic exposure is programmatic** — never CTGAN/TVAE/copula.
+8. **`docs/AGENTS.md` is lead-owned** — redlines only, applied under explicit
+   lead direction for the current branch.
+9. **Checkpoints go through `checkpoint_manager`** (temp path → validate
+   `{model_state_dict, centroid, config}` with `N_FEATURES`, `GRAPH_EMB_DIM`,
+   `N_EDGE_TYPES` → atomic rename). Never `torch.save` onto the live path.
+10. **`nic-worker` replicas = 1**, enforced in the k8s manifest with a
+    comment.
+11. **(scale) Scaler params are persisted, never refit per batch** — fit once
+    per `schema_version`, store, re-apply. Refitting on a scoring batch is a
+    batch-statistics leak.
+12. **(scale) Every migration step passes its 15k parity gate** before the
+    next starts (`docs/IMPLEMENTATION.md`).
+13. **(scale) Dual-write before cut-over** — a Postgres table becomes
+    authoritative only after demonstrated parity with its file predecessor.
+14. **(scale) `src/db/` owns all SQL** — no inline SQL in handlers or model
+    modules; schema changes via versioned migrations.
 
 ---
 
-## Known Structural Weaknesses (MAR critique, folded inline)
+## Known Structural Weaknesses (MAR critique — still true, watch during migration)
 
-Summary of the load-bearing failure conditions:
-
-| Component | Core Assumption | What Breaks |
-|---|---|---|
-| DeepSVDD centroid (Hybrid GraphMCM) | Normal data density is clean | If fraud dominates, hypersphere silently inflates to include fraud |
-| EVT Scorer | Tail fits GPD smoothly | Discontinuous distributions cause threshold to explode or collapse |
-| Self-Training Loop | EVT tail is true fraud | If tail is data-entry errors, classifier anchors on typos |
-| Isolated nodes | Every node has ≥1 typed edge | Unique-mobile + unique-IP nodes get zero structural signal — rely on subspace IF |
-| Stage 1 Synthetic Exposure | Archetypes represent real fraud geometry | Too-narrow archetypes bias Stage 2 toward obvious fraud only |
-| Reconstruction on dense rings | Anomalies are hard to reconstruct | Dense fraud cliques reconstruct *easily* (smoothing) → weak relational signal; see V4 comparison |
-
-**What would break first in production:** self-training label promotion. A
-slight misalignment in EVT score-distribution tails seeds the LightGBM with false
-positives, triggering semantic drift in Round 1.
+| Component | What breaks |
+|---|---|
+| DeepSVDD centroid | If fraud dominates the population, hypersphere silently inflates |
+| EVT | Discontinuous score distributions explode/collapse thresholds (mitigated at 3.5M — larger tails; `TECHNICAL_REFERENCE_AND_SCALING.md` §13.1) |
+| Self-training | If the EVT tail is data-entry errors, the classifier anchors on typos — this is what breaks first in production |
+| Isolated nodes | Zero typed edges → no structural signal; subspace IF carries them |
+| Dense rings vs reconstruction | Dense cliques reconstruct easily — that's why dense-block exists, gated to `shares_ip` |
 
 ---
 
 ## Quantitative Claims Protocol
 
-Before any number enters documentation, a summary, or these files:
-
-1. **Raw stdout only.** Paste the literal unedited printed output. No number
-   enters a doc without a traceable print line.
-2. **Name the baseline explicitly.** "Before vs after" requires a specific
-   prior run (timestamp or conversation line).
-3. **Seed everything** before comparing runs — model init, row sampling,
-   train/test split, random module. (Note the GPU scatter-add caveat above.)
-4. **Row-level counting only.** Count unique flagged rows, not code occurrences.
-   Use isolated masking.
-5. **No same-turn resolution.** An open question does not get resolved in the
-   same turn its supporting number was generated. Log as "proposed, pending."
-6. **Conflicting numbers halt.** Surface the conflict. Do not reconcile by
-   narrative. Re-derive from scratch.
-
----
-
-## Module Ownership — One Module Per Response
-
-| Module | File | Reads from | Writes to |
-|---|---|---|---|
-| Feature engineering | `tabular_feature_engine_v3.py` | `data/raw/data_for_ml_model.csv` | `engineered_features_v3.csv`, `v3_feature_schema.json` |
-| Graph construction | `graph_builder_v3.py` | `engineered_features_v3.csv` | `identity_graph_v3.pt`, `degree_features_v3.csv` |
-| Synthetic exposure | `synthetic_exposure_builder_v3.py` | `engineered_features_v3.csv` | `synthetic_exposure_set_v3.pt`, `synthetic_exposure_graph_v3.pt` |
-| Hybrid detector | `hybrid_graphmcm_v3.py` | `engineered_features_v3.csv`, `identity_graph_v3.pt`, exposure `.pt` | `hybrid_scores_v3.csv`, `models/hybrid_graphmcm_v3.pth` |
-| Subspace IF | `subspace_if_v3.py` | `engineered_features_v3.csv` | `subspace_if_scores_v3.csv` |
-| EVT thresholds | `evt_scorer_v3.py` | score CSVs | `evt_thresholds_v3.json` |
-| Self-training | `self_training_loop_v3.py` | score CSVs, `evt_thresholds_v3.json` | `pseudo_labels_v3.json` |
-| Fusion classifier | `fusion_classifier_v3.py` | scalar scores, `pseudo_labels_v3.json` | `risk_scores_v3.csv` |
-| Explainability | `xai_layer_v3.py` | trained detector, error/predicted vectors, score CSVs | `explanation_cards_v3.json` (+ closed-form fusion split) |
-| Reviewer cards (HTML) | `xai_card_html_v3.py` | `explanation_cards_v3.json`, `risk_scores_v3.csv`, graph (lazy ring) | `outputs/cards/*.html`; served via API `/card` + `/ring` |
-| Evaluation | `evaluate_model_v3.py` | `data/processed/*`, `models/*.pth` | console / `outputs/ablation/*.json` |
-| **(V4)** ring pipeline | `ring_candidate_v3.py`, `ring_fingerprint_v3.py`, `ring_classifier_v3.py` | public structure + scores only (never `h_N`) | `models/ring_classifier_v3.pkl` |
-| **(V4)** comparison | `compare_architectures_v3.py` | cached detectors + scores | `outputs/ablation/tier_comparison.json` |
-| **(V4)** ring viz | `graph_viz_v3.py` | structure + `hybrid_scores_v3.csv` | `outputs/viz/*.html` |
-
-**Working rule:** if your task requires reading or writing outside your module's
-row, stop and confirm scope before writing code.
-
----
-
-## v3 Conventions — Do Not Regress to v1/v2
-
-| Concept | v1 | v2 (superseded) | v3 (current) |
-|---|---|---|---|
-| Anomaly score | `vae_reconstruction_prob` (higher=normal) | `vae_anomaly_score`, `graph_anomaly_score` | `hybrid_anomaly_score` (higher=anomalous) |
-| Labels | `rule_violation_score > 0` | EVT tail + self-training | EVT tail + human-gated self-training |
-| Feature schema | `selected_features.json` | `v2_feature_schema.json` | `data/processed/v3_feature_schema.json` |
-| Risk output | `risk_scores.csv` | `risk_scores_v2.csv` | `outputs/risk_scores_v3.csv` |
-| Rules | 99 rules + 8 bridges | none | none |
-
-If you see v1/v2 column names or `_v2.py` imports in v3 code, that is a
-regression. Stop and flag it.
+1. **Raw stdout only** — no number enters a doc without a traceable print
+   line or artifact file.
+2. **Name the baseline explicitly** (file, timestamp, or commit).
+3. **Seed everything** before comparing (and mind the GPU noise floor).
+4. **Row-level counting only** — unique flagged rows, isolated masking.
+5. **No same-turn resolution** — log as "proposed, pending."
+6. **Conflicting numbers halt.** Surface, re-derive; never reconcile by
+   narrative.
 
 ---
 
 ## When to Stop and Ask
 
-Stop and ask the project lead before proceeding if:
+- A task requires modifying two modules simultaneously.
+- A new dependency not in `requirements.txt`.
+- A result conflicts with `docs/HISTORY.md` or an ablation JSON.
+- A migration-step parity gate fails.
+- A Postgres schema change (`deploy/postgres/` migrations).
+- A self-training round is ready to advance.
+- Anything would touch the fixed architecture or a locked hyperparameter.
+- A referenced file is missing from the working directory.
 
-- A task requires modifying two modules simultaneously
-- You are about to introduce a new dependency not already in `requirements.txt`
-- A quantitative result conflicts with a number stated earlier in the session
-- A synthetic exposure set does not exist and you need to create it
-- A self-training round is ready to advance (do not advance without confirmation)
-- You are unsure whether a threshold is EVT-derived or domain-set
-- Any file you need to read is not present in the working directory
-- A proposed change would affect the Phase D / connected-cluster evaluation harness
+## Open Decisions — Lead-Owned, Do Not Resolve Autonomously
 
----
-
-## Open Architecture Questions — Do Not Resolve Autonomously
-
-- λ(t) annealing schedule (linear / step / cosine) — currently linear
-- DeepSVDD centroid initialisation strategy — currently mean of clean-percentile
-  embeddings at init
-- Feature vs edge reconstruction weight — `LAMBDA_EDGE=0.3`, no ablation yet
-- Synthetic exposure set size per archetype — no sensitivity analysis
-- Isolated-node handling — currently rely on subspace IF; no structural signal
-- Reconstruction weakness on dense rings — **settled:** adopt dense-block gated to
-  `shares_ip` only (`docs/IMPLEMENTATION.md`), pending the IP-gated validation run.
-  Baseline is the backbone; RGCN retirement disproven (AGENTS.md Appendix H).
-- Encoder choice (RGCN vs HAN) — RGCN default; HAN drop-in regresses
-- Appeals framing for EVT-derived flags (policy decision, not code)
+Tracked in `docs/TECHNICAL_REFERENCE_AND_SCALING.md` §15 and
+`docs/AGENTS.md` §7: K_CAP + group-size ceiling (needs 3.5M profiling);
+NeighborLoader fan-out magnitude **and shape**; `pg_trgm` vs `difflib`
+equivalence; Postgres HA policy; batch cadence; 4th-seed confirmation of the
+locked fusion (3 seeds recorded as "proposed, pending").

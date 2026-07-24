@@ -47,7 +47,13 @@ OUT_DIR    = Path("outputs/exports")
 SCORECARD_COLUMNS = [
     "application_id", "risk_score_v3", "risk_rank", "risk_percentile",
     "label_source", "review_status",
-    "driving_model", "subspace_share", "dense_ip_share", "hybrid_share",
+    # max fusion (changed 2026-07-22): exactly one detector drives the score, so
+    # each detector's OWN normalised value is reported (not a "share of a blend")
+    "driving_model", "driving_margin",
+    "subspace_normalized", "dense_relational_normalized", "hybrid_normalized",
+    # Deep SAD (V4.2, 2026-07-22): supplementary, NOT a fusion driver — exported
+    # for traceability only, does not factor into driving_model/driving_margin above.
+    "deepsad_percentile",
     "n_triggers", "triggers", "n_evt_crossings",
     "top_feat_1", "top_feat_1_value", "top_feat_1_expected", "top_feat_1_error_pct",
     "top_feat_2", "top_feat_2_value", "top_feat_2_expected", "top_feat_2_error_pct",
@@ -79,11 +85,14 @@ def scorecard_row(card: dict) -> dict:
         "risk_percentile": ev.get("risk_percentile"),
         "label_source":    ev.get("label_source"),
         "review_status":   card.get("review_status"),
-        # provenance is already ordered by share desc; first entry is the driver
+        # provenance is ordered by normalised value desc; first entry is the driver
         "driving_model":   prov[0] if prov else "",
-        "subspace_share":  round(fc.get("subspace", {}).get("share", 0.0), 4),
-        "dense_ip_share":  round(fc.get("dense_ip", {}).get("share", 0.0), 4),
-        "hybrid_share":    round(fc.get("hybrid", {}).get("share", 0.0), 4),
+        "driving_margin":  next((round(c["margin_over_next"], 4) for c in fc.values()
+                                 if c.get("is_driver") and c.get("margin_over_next") is not None), ""),
+        "subspace_normalized":           round(fc.get("subspace", {}).get("normalized", 0.0), 4),
+        "dense_relational_normalized":   round(fc.get("dense_relational", {}).get("normalized", 0.0), 4),
+        "hybrid_normalized":             round(fc.get("hybrid", {}).get("normalized", 0.0), 4),
+        "deepsad_percentile": (ev.get("deepsad") or {}).get("percentile", ""),
         "n_triggers":      len(card.get("triggers", [])),
         "triggers":        ";".join(card.get("triggers", [])),
         "n_evt_crossings": len(ev.get("evt_crossings", [])),
@@ -332,6 +341,97 @@ def build_cohort_bulk_export(name: str):
 
 def build_cohort_selected_export(name: str, app_ids: list[str]):
     return _cohort_bundle(name, app_ids, include_rings=True)
+
+
+# ── confirmed-pattern (flagged-history) export ─────────────────────────────────
+# Mirrors the application exports above, sourced from confirmed_fraud_graph_store
+# instead of the explanation cards. One manifest row + one full JSON record per
+# pattern — the record already carries the subgraph, state, and (if promoted)
+# the exposure cluster it landed in, so nothing is recomputed here either.
+PATTERN_MANIFEST_COLUMNS = [
+    "pattern_id", "fraud_type", "state", "center_app_id", "n_members",
+    "confirmed_by", "created_at", "updated_at", "in_exposure", "exposure_cluster_id", "notes",
+]
+
+
+def _pattern_manifest_row(p: dict) -> dict:
+    sg = p.get("subgraph") or {}
+    members = sg.get("nodes") or sg.get("member_ids") or []
+    exposure = p.get("exposure") or {}
+    return {
+        "pattern_id":          p.get("pattern_id"),
+        "fraud_type":          p.get("fraud_type"),
+        "state":               p.get("state"),
+        "center_app_id":       p.get("center_app_id"),
+        "n_members":           len(members),
+        "confirmed_by":        p.get("confirmed_by"),
+        "created_at":          p.get("created_at"),
+        "updated_at":          p.get("updated_at"),
+        "in_exposure":         bool(exposure.get("appended")),
+        "exposure_cluster_id": exposure.get("cluster_id", ""),
+        "notes":               p.get("notes", ""),
+    }
+
+
+def _pattern_manifest_csv_bytes(rows: list[dict]) -> bytes:
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=PATTERN_MANIFEST_COLUMNS, extrasaction="ignore")
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+    return buf.getvalue().encode("utf-8")
+
+
+def build_pattern_bulk_export() -> tuple[str, bytes] | None:
+    """Zip bytes for every pattern in the flagged-history store (all states,
+    all sessions): manifest.csv + patterns/<pattern_id>.json (full record).
+    Returns None if the store is empty."""
+    from src.confirmed_fraud_graph_store import list_all
+    patterns = list_all()
+    if not patterns:
+        return None
+
+    rows = [_pattern_manifest_row(p) for p in patterns]
+    ts   = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    buf  = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("manifest.csv", _pattern_manifest_csv_bytes(rows))
+        for p in patterns:
+            z.writestr(f"patterns/{p['pattern_id']}.json", json.dumps(p, indent=2).encode("utf-8"))
+    return f"patterns_export_{ts}.zip", buf.getvalue()
+
+
+def build_pattern_selected_export(pattern_ids: list[str]) -> tuple[str, bytes] | None:
+    """Zip bytes for a reviewer-chosen subset of the flagged-history store.
+    Unknown ids are skipped and listed in _skipped.txt. Returns None if none
+    of the requested ids exist."""
+    from src.confirmed_fraud_graph_store import list_all
+    patterns = list_all()
+    if not patterns:
+        return None
+
+    seen: set[str] = set()
+    ordered_ids = [x for x in (str(a) for a in pattern_ids)
+                   if not (x in seen or seen.add(x))]
+
+    by_id   = {p["pattern_id"]: p for p in patterns}
+    found   = [by_id[pid] for pid in ordered_ids if pid in by_id]
+    skipped = [pid for pid in ordered_ids if pid not in by_id]
+    if not found:
+        return None
+
+    rows = [_pattern_manifest_row(p) for p in found]
+    ts   = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    buf  = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("manifest.csv", _pattern_manifest_csv_bytes(rows))
+        for p in found:
+            z.writestr(f"patterns/{p['pattern_id']}.json", json.dumps(p, indent=2).encode("utf-8"))
+        if skipped:
+            z.writestr("_skipped.txt",
+                       "These requested pattern_ids were not found in the store:\n"
+                       + "\n".join(skipped))
+    return f"patterns_selected_export_{len(found)}_{ts}.zip", buf.getvalue()
 
 
 def _write(result: tuple[str, bytes] | None, label: str) -> None:

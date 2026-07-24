@@ -86,23 +86,30 @@ def _rank_rings(candidates: list[dict]) -> list[dict]:
     return sorted(candidates, key=key, reverse=True)
 
 
-def _figure_for_ring(sg: dict, app_ids: np.ndarray, rank: int) -> go.Figure:
+def _figure_for_ring(sg: dict, app_ids: np.ndarray, rank: int,
+                      core_global_ids: set | None = None) -> go.Figure:
     node_ids = list(sg["node_ids"])           # global indices, sorted
     n = len(node_ids)
     scores = sg["scores"]
     scores = scores.cpu().numpy() if hasattr(scores, "cpu") else np.asarray(scores)
 
-    # Undirected graph over LOCAL indices; dedupe edges, remember relation.
+    # Undirected graph over LOCAL indices for LAYOUT only (spring_layout needs a
+    # plain graph, not a multigraph) -- edge RENDERING below tracks every
+    # relation that connects a pair, not just one, so a pair sharing e.g. both
+    # shares_ip AND shares_mother_name draws both lines. A single dict keyed by
+    # pair (fixed 2026-07-22: previously kept only the FIRST relation seen via
+    # setdefault, silently dropping every other relation on that pair -- this
+    # also broke the per-relation legend toggle for such pairs, since the
+    # dropped relation had no trace to toggle in the first place).
     G = nx.Graph()
     G.add_nodes_from(range(n))
-    edge_rel = {}
+    edge_rels: dict[tuple, set] = {}
     for u, v, r in sg["edges"]:
         if u == v:
             continue
         pair = (min(u, v), max(u, v))
         G.add_edge(*pair)
-        # if multiple relations connect a pair, keep the first seen (stable)
-        edge_rel.setdefault(pair, int(r))
+        edge_rels.setdefault(pair, set()).add(int(r))
 
     # More iterations + wider scale → cleaner separation of core vs periphery.
     pos = nx.spring_layout(G, dim=3, seed=RANDOM_SEED, iterations=200, scale=2.0)
@@ -112,8 +119,8 @@ def _figure_for_ring(sg: dict, app_ids: np.ndarray, rank: int) -> go.Figure:
     # ---- edges, grouped by relation so each relation is a legend entry ----
     for rel_id, rel_name in enumerate(EDGE_TYPES):
         xs, ys, zs = [], [], []
-        for pair, r in edge_rel.items():
-            if r != rel_id:
+        for pair, rs in edge_rels.items():
+            if rel_id not in rs:
                 continue
             a, b = pair
             xs += [pos[a][0], pos[b][0], None]
@@ -157,6 +164,28 @@ def _figure_for_ring(sg: dict, app_ids: np.ndarray, rank: int) -> go.Figure:
         name="applications", showlegend=False,
     ))
 
+    # ---- dense-block CORE membership overlay (2026-07-22) -------------------
+    # dense_block_detector_v3's Charikar peeling identifies which specific
+    # neighbours form the actual densest sub-block (that's what generates
+    # dense_block_score_relational > 0) vs. incidental 1-hop links that share
+    # the same identity value but sit outside the anomalous structure. Without
+    # this, the ring shows every shares_X neighbour uniformly and a reviewer
+    # can't tell which ones actually justify the flag. An open diamond ring
+    # around a node = it is part of the flagged dense core, not just a neighbour.
+    if core_global_ids:
+        core_local = [i for i, g in enumerate(node_ids) if g in core_global_ids]
+        if core_local:
+            cx = [nx_[i] for i in core_local]
+            cy = [ny_[i] for i in core_local]
+            cz = [nz_[i] for i in core_local]
+            csize = [sizes[i] + 7.0 for i in core_local]
+            traces.append(go.Scatter3d(
+                x=cx, y=cy, z=cz, mode="markers",
+                marker=dict(size=csize, color="rgba(0,0,0,0)", symbol="diamond-open",
+                            line=dict(color="#ffd60a", width=3)),
+                hoverinfo="skip", name="dense-block core", showlegend=True,
+            ))
+
     mean_risk = float(scores.mean())
     axis = dict(showticklabels=False, title="", showspikes=False,
                 showbackground=True, backgroundcolor=BG_COLOR,
@@ -167,7 +196,8 @@ def _figure_for_ring(sg: dict, app_ids: np.ndarray, rank: int) -> go.Figure:
             text=(f"<b>Flagged ring #{rank}</b>"
                   f"<span style='color:{MUTED_COLOR}'>"
                   f"    {n} nodes · {G.number_of_edges()} edges · "
-                  f"mean risk {mean_risk:.3f}</span>"),
+                  f"mean risk {mean_risk:.3f} · "
+                  f"click a relation below to hide/show its edges</span>"),
             font=dict(family=FONT_FAMILY, size=18, color=FG_COLOR),
             x=0.02, xanchor="left", y=0.97,
         ),
@@ -179,10 +209,19 @@ def _figure_for_ring(sg: dict, app_ids: np.ndarray, rank: int) -> go.Figure:
         hoverlabel=dict(bgcolor=PANEL_COLOR, bordercolor="rgba(255,255,255,0.12)",
                         font=dict(family=FONT_FAMILY, color=FG_COLOR, size=12)),
         legend=dict(
-            title=dict(text="relation", font=dict(color=MUTED_COLOR, size=12)),
+            title=dict(text="relation<br><span style='font-size:10px;font-weight:400'>"
+                            "click to toggle · double-click to isolate</span>",
+                       font=dict(color=MUTED_COLOR, size=12)),
             bgcolor="rgba(22,27,34,0.75)", bordercolor="rgba(255,255,255,0.08)",
             borderwidth=1, font=dict(color=FG_COLOR, size=12),
             x=0.01, y=0.5, itemsizing="constant",
+            # Explicit (not just relying on the Plotly default): single click
+            # hides/shows that relation's edge trace, double-click isolates it
+            # (hides every other relation) -- exactly the decluttering control
+            # dense identity cliques need. Shared by every ring caller (committed
+            # graph, Postgres path, staged cohort preview incl. stress_testing_1)
+            # since they all build through this one function.
+            itemclick="toggle", itemdoubleclick="toggleothers",
         ),
         margin=dict(l=0, r=0, t=46, b=0), showlegend=True,
     )

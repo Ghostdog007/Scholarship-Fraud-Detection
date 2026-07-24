@@ -26,6 +26,12 @@ python-multipart>=0.0.9
 celery>=5.4.0
 redis>=5.0.0
 
+# ── PostgreSQL (V4-Scale, src/db/) — MANDATORY, not optional: every
+# NIC_READS_FROM_PG-gated handler imports src.db.reads on the request path;
+# without this the review queue / status tiles / model stats 500 on first hit.
+psycopg[binary]>=3.1.0
+psycopg-pool>=3.1.0
+
 # ── Structured logging ────────────────────────────────────────────────────────
 structlog>=24.0.0
 python-json-logger>=2.0.0

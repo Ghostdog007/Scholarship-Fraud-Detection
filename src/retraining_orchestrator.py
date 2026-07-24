@@ -56,6 +56,21 @@ FEATURE_CSV       = Path("data/processed/engineered_features_v3.csv")
 FEATURE_DRIFT_JSON = Path("outputs/feature_drift_v3.json")
 
 
+def _load_prev_scores_baseline() -> list | None:
+    """PG-first (drift_baselines), file fallback. Returns None if neither
+    has a baseline (first run)."""
+    try:
+        from src.db.drift import load_baseline
+        payload = load_baseline("scores")
+        if payload is not None:
+            return payload["scores"]
+    except Exception as e:  # noqa: BLE001 — PG outage must not block drift check
+        print(f"[orchestrator] WARNING: PG drift-baseline read failed, falling back to file: {e}")
+    if PREV_KS_JSON.exists():
+        return json.loads(PREV_KS_JSON.read_text())["scores"]
+    return None
+
+
 def _check_drift() -> tuple[float, str]:
     """
     KS test: current hybrid_anomaly_score distribution vs previous cycle.
@@ -63,13 +78,15 @@ def _check_drift() -> tuple[float, str]:
     """
     if not SCORES_CSV.exists():
         return 1.0, "no_scores"
-    if not PREV_KS_JSON.exists():
+
+    prev = _load_prev_scores_baseline()
+    if prev is None:
         print("[orchestrator] No previous cycle scores found — skipping drift check (first run).")
         return 1.0, "first_run"
 
     import pandas as pd
     curr_scores = pd.read_csv(SCORES_CSV)["hybrid_anomaly_score"].values
-    prev_scores = np.array(json.loads(PREV_KS_JSON.read_text())["scores"])
+    prev_scores = np.array(prev)
 
     stat, p = ks_2samp(curr_scores, prev_scores)
     print(f"[orchestrator] KS test: stat={stat:.4f}  p={p:.4f}")
@@ -80,11 +97,18 @@ def _check_drift() -> tuple[float, str]:
 
 
 def _save_current_scores_for_ks() -> None:
-    """Save current cycle scores so next year's KS test has a baseline."""
+    """Save current cycle scores so next year's KS test has a baseline.
+    Dual-write: file stays authoritative (hard stop 13); PG mirror is
+    best-effort so a Postgres outage never blocks a training cycle."""
     if not SCORES_CSV.exists():
         return
     scores = pd.read_csv(SCORES_CSV)["hybrid_anomaly_score"].values.tolist()
     PREV_KS_JSON.write_text(json.dumps({"scores": scores}))
+    try:
+        from src.db.drift import save_baseline
+        save_baseline("scores", {"scores": scores})
+    except Exception as e:  # noqa: BLE001
+        print(f"[orchestrator] WARNING: PG drift-baseline write failed: {e}")
     print(f"[orchestrator] Saved {len(scores)} scores for next cycle KS baseline -> {PREV_KS_JSON}")
 
 
@@ -104,15 +128,29 @@ def _check_feature_drift() -> dict:
     if not FEATURE_CSV.exists():
         print("[orchestrator] Feature CSV not found — skipping feature drift check.")
         return {}
-    if not PREV_FEAT_JSON.exists():
+
+    prev_raw = None
+    try:
+        from src.db.drift import load_baseline
+        prev_raw = load_baseline("features")
+    except Exception as e:  # noqa: BLE001
+        print(f"[orchestrator] WARNING: PG feature-baseline read failed, falling back to file: {e}")
+    if prev_raw is None and PREV_FEAT_JSON.exists():
+        prev_raw = json.loads(PREV_FEAT_JSON.read_text())
+
+    if prev_raw is None:
         print("[orchestrator] No previous cycle feature snapshot — saving current as baseline.")
         curr_df = pd.read_csv(FEATURE_CSV)
         snapshot = {col: curr_df[col].tolist() for col in curr_df.columns if col != "application_id"}
         PREV_FEAT_JSON.write_text(json.dumps(snapshot))
+        try:
+            from src.db.drift import save_baseline
+            save_baseline("features", snapshot)
+        except Exception as e:  # noqa: BLE001
+            print(f"[orchestrator] WARNING: PG feature-baseline write failed: {e}")
         return {}
 
     curr_df  = pd.read_csv(FEATURE_CSV)
-    prev_raw = json.loads(PREV_FEAT_JSON.read_text())
 
     drift_report: dict = {}
     drifted_features: list[str] = []
@@ -144,13 +182,19 @@ def _check_feature_drift() -> dict:
 
 
 def _save_feature_snapshot() -> None:
-    """Save current feature distributions as baseline for next cycle's drift check."""
+    """Save current feature distributions as baseline for next cycle's drift
+    check. Dual-write: file authoritative, PG mirror best-effort."""
     if not FEATURE_CSV.exists():
         return
     PREV_FEAT_JSON = Path("outputs/prev_cycle_features_ks.json")
     curr_df  = pd.read_csv(FEATURE_CSV)
     snapshot = {col: curr_df[col].tolist() for col in curr_df.columns if col != "application_id"}
     PREV_FEAT_JSON.write_text(json.dumps(snapshot))
+    try:
+        from src.db.drift import save_baseline
+        save_baseline("features", snapshot)
+    except Exception as e:  # noqa: BLE001
+        print(f"[orchestrator] WARNING: PG feature-baseline write failed: {e}")
     print(f"[orchestrator] Feature snapshot saved -> {PREV_FEAT_JSON}")
 
 

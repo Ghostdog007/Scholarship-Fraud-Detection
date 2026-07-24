@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir -r requirements-docker.txt
 
 # Copy source
 COPY src/       ./src/
+COPY deploy/postgres/ ./deploy/postgres/
 COPY main_v3.py celeryconfig.py pyproject.toml ./
 
 # Runtime directories must exist (volumes will overlay these at runtime)

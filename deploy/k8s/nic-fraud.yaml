@@ -109,6 +109,18 @@ spec:
               value: redis://redis:6379/0
             - name: CELERY_RESULT_BACKEND
               value: redis://redis:6379/0
+            - name: NIC_DB_HOST
+              value: postgres
+            - name: NIC_DB_PORT
+              value: "5432"
+            - name: NIC_READS_FROM_PG
+              value: "1"
+            - name: NIC_DB_NAME
+              valueFrom: { secretKeyRef: { name: nic-db, key: NIC_DB_NAME } }
+            - name: NIC_DB_USER
+              valueFrom: { secretKeyRef: { name: nic-db, key: NIC_DB_USER } }
+            - name: NIC_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: nic-db, key: NIC_DB_PASSWORD } }
           resources:
             requests: { cpu: "500m", memory: "1Gi" }
             limits:   { cpu: "2",    memory: "4Gi" }
@@ -178,6 +190,18 @@ spec:
               value: redis://redis:6379/0
             - name: CELERY_RESULT_BACKEND
               value: redis://redis:6379/0
+            - name: NIC_DB_HOST
+              value: postgres
+            - name: NIC_DB_PORT
+              value: "5432"
+            - name: NIC_READS_FROM_PG
+              value: "1"
+            - name: NIC_DB_NAME
+              valueFrom: { secretKeyRef: { name: nic-db, key: NIC_DB_NAME } }
+            - name: NIC_DB_USER
+              valueFrom: { secretKeyRef: { name: nic-db, key: NIC_DB_USER } }
+            - name: NIC_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: nic-db, key: NIC_DB_PASSWORD } }
           resources:
             # CPU-only training (no GPU on this server). Give it headroom; the
             # box has 16 vCPU / 64 GB. Training here is slow by design — the
@@ -253,3 +277,89 @@ spec:
 #   hostPath:
 #     path: /srv/nic-fraud
 # (then set the PVC's storageClassName: "" and volumeName: nic-storage-pv)
+---
+# ---- PostgreSQL system of record (V4-Scale step 0) --------------------------
+# Sizing per docs/TECHNICAL_REFERENCE_AND_SCALING.md 14: request 2 vCPU/8Gi,
+# limit 4 vCPU/16Gi. Single replica; local-path PV. Credentials come from the
+# `nic-db` Secret — create it before applying:
+#   kubectl -n nic-fraud create secret generic nic-db \
+#     --from-literal=NIC_DB_NAME=nic_fraud \
+#     --from-literal=NIC_DB_USER=nic_app \
+#     --from-literal=NIC_DB_PASSWORD=<strong-password>
+# Schema is applied by running `python -m src.db.migrate` from any nic-api pod.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: nic-fraud
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi          # 3-4M rows + indexes + WAL headroom
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: nic-fraud
+spec:
+  replicas: 1                  # single-primary; HA is open decision #4
+  strategy:
+    type: Recreate             # RWO volume — never two postgres pods at once
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom: { secretKeyRef: { name: nic-db, key: NIC_DB_NAME } }
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: nic-db, key: NIC_DB_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: nic-db, key: NIC_DB_PASSWORD } }
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          args:
+            # Tuned for the 16 vCPU / 64 GB server (TECHNICAL_REFERENCE 14):
+            # few concurrent queries, big sorts/joins during feature engineering.
+            - "-c" 
+            - "shared_buffers=4GB"
+            - "-c"
+            - "work_mem=256MB"
+            - "-c"
+            - "maintenance_work_mem=1GB"
+          resources:
+            requests: { cpu: "2", memory: 8Gi }
+            limits:   { cpu: "4", memory: 16Gi }
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "nic_app", "-d", "nic_fraud"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: pgdata
+          persistentVolumeClaim:
+            claimName: postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres               # NIC_DB_HOST=postgres inside the cluster
+  namespace: nic-fraud
+spec:
+  selector: { app: postgres }
+  ports:
+    - port: 5432
+      targetPort: 5432

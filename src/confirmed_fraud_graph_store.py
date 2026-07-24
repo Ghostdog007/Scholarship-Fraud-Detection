@@ -45,6 +45,14 @@ def _load_store() -> dict:
 def _save_store(store: dict) -> None:
     STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
     STORE_PATH.write_text(json.dumps(store, indent=2))
+    # Postgres dual-write (migration step 1): full re-mirror per save — pattern
+    # counts are tiny, and this is immune to missed state transitions. JSON
+    # stays authoritative (hard stop 13); failure is loud, never fatal.
+    try:
+        from src.db.stores import mirror_patterns
+        mirror_patterns(store)
+    except Exception as e:  # noqa: BLE001 — dual-write must not break the console
+        print(f"[graph_store] WARNING: Postgres dual-write mirror_patterns FAILED: {e}")
 
 
 def add_confirmed_pattern(

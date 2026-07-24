@@ -4,6 +4,9 @@ Monitoring endpoints — ADR-005 (+ drift-simulation extension).
 GET  /v3/monitoring/drift
 GET  /v3/monitoring/fraud-store-summary
 POST /v3/monitoring/evaluate-dataset   — score a new/unseen dataset read-only, check drift
+POST /v3/monitoring/push-dataset       — CSV-free portal/ETL intake: names a server-side
+                                          CSV path, stages it in Postgres, auto-evaluates
+                                          as a background job (added 2026-07-23)
 GET  /v3/monitoring/dataset-xai        — XAI preview for the top-N staged rows
 GET  /v3/monitoring/top-suspicious     — top-N suspicious apps from the last full run
 GET  /v3/monitoring/{app_id}/topology  — interactive topology view (HTML)
@@ -21,6 +24,8 @@ from src.api.schemas import (
     EvaluateDatasetRequest,
     EvaluateDatasetResponse,
     FraudStoreSummaryResponse,
+    PushDatasetRequest,
+    PushDatasetResponse,
 )
 from src.config_v3 import DRIFT_KS_THRESHOLD
 
@@ -160,6 +165,18 @@ def drift_explain(top: int = 12):
 
 @router.get("/fraud-store-summary", response_model=FraudStoreSummaryResponse)
 def fraud_store_summary():
+    # Step 2 (Gate 2 passed): Postgres first, JSON store as fallback. Import
+    # is INSIDE the try — a missing/broken db layer (e.g. psycopg not
+    # installed) must degrade to the file path, never 500 the endpoint.
+    try:
+        from src.db import reads as db_reads
+        if db_reads.reads_from_pg():
+            s = db_reads.fraud_store_summary()
+            log.info("monitoring.fraud_store_summary", source="pg", **{k: v for k, v in s.items() if k != "by_fraud_type"})
+            return FraudStoreSummaryResponse(**s)
+    except Exception as e:  # noqa: BLE001
+        log.warning("monitoring.fraud_store_summary.pg_failed_falling_back", error=str(e))
+
     from src.confirmed_fraud_store import load_confirmed, load_false_positive_ids
     confirmed = load_confirmed()
     fp_ids    = load_false_positive_ids()
@@ -176,13 +193,18 @@ def fraud_store_summary():
     )
 
 
-@router.post("/evaluate-dataset", response_model=EvaluateDatasetResponse)
-def evaluate_dataset(req: EvaluateDatasetRequest):
-    """
-    Read-only: temporarily merges dataset_path into the raw CSV, rebuilds
+def _run_evaluate(dataset_path: Path) -> dict:
+    """Core of Evaluate, callable synchronously (the console's
+    POST /evaluate-dataset, below) or from a Celery task (the CSV-free
+    push-dataset endpoint's auto-evaluate). Read-only against the canonical
+    population: temporarily merges dataset_path into the raw CSV, rebuilds
     features + graph, scores the new rows with the CURRENT checkpoint (no
     training), then restores the canonical files. Leaves no lasting change —
-    safe to call repeatedly. Writes a staged preview to outputs/staged_scores_*.
+    safe to call repeatedly, and safe to run as a Celery task since
+    worker_concurrency=1 (hard stop 16) already serializes it against any
+    other training/evaluate job. Writes a staged preview to
+    outputs/staged_scores_*. Returns the same fields EvaluateDatasetResponse
+    needs, as a plain dict.
     """
     import numpy as np
     import shutil
@@ -190,9 +212,8 @@ def evaluate_dataset(req: EvaluateDatasetRequest):
 
     from src.api import dataset_ops
 
-    dataset_path = Path(req.dataset_path)
     if not dataset_path.exists():
-        raise HTTPException(status_code=422, detail=f"dataset_path not found: {req.dataset_path}")
+        raise ValueError(f"dataset_path not found: {dataset_path}")
 
     new_df  = pd.read_csv(dataset_path, low_memory=False)
     new_ids = set(new_df["application_id"].astype(str))
@@ -203,12 +224,54 @@ def evaluate_dataset(req: EvaluateDatasetRequest):
         dataset_ops.rebuild_features_and_graph()
 
         from src.api.inference import score_dataset_only
-        staged_df = score_dataset_only(app_ids_to_return=new_ids)
+        full_hybrid_df = score_dataset_only()  # every merged row (base + cohort)
+        staged_df = full_hybrid_df[full_hybrid_df["application_id"].isin(new_ids)].reset_index(drop=True)
 
         merged_features = pd.read_csv(dataset_ops.FINAL_CSV)
         staged_features = merged_features[
             merged_features["application_id"].astype(str).isin(new_ids)
         ]
+
+        # Signal-drivers preview: subspace IF + dense-block + closed-form fusion
+        # contributions, computed over the FULL merged population (base + cohort)
+        # via the SAME reusable functions the committed pipeline uses
+        # (subspace_if_v3.compute_subspace_if_scores, dense_block_detector_v3.
+        # dense_block_scores, fusion_classifier_v3.score_level_fusion,
+        # xai_layer_v3.build_fusion_contributions) -- no separate logic to drift
+        # out of sync. PREVIEW ONLY: this is NOT risk_score_v3 (that requires a
+        # committed pipeline run against the canonical population's own fixed
+        # normalisation) -- renormalised over base+cohort here, so values are
+        # comparable within this preview but not to the committed score.
+        import torch
+        from src.subspace_if_v3 import compute_subspace_if_scores
+        from src.dense_block_detector_v3 import dense_block_scores
+        from src.hybrid_graphmcm_v3 import _build_edge_index_and_types
+        from src.xai_layer_v3 import build_fusion_contributions
+
+        schema_features = set(json.loads(dataset_ops.SCHEMA_JSON.read_text())["features"])
+        subspace_full_df = compute_subspace_if_scores(merged_features, schema_features)
+
+        graph_data = torch.load(dataset_ops.GRAPH_PT, weights_only=False)
+        m_eil, m_ett = _build_edge_index_and_types(graph_data, torch.device("cpu"))
+        app_ids_merged = merged_features["application_id"].astype(str).values
+        dense_full_df = dense_block_scores(m_eil, m_ett, len(app_ids_merged), app_ids_merged)
+        dense_full_df["application_id"] = dense_full_df["application_id"].astype(str)
+        dense_map_full = dense_full_df.set_index("application_id").to_dict("index")
+
+        full_hybrid_df["application_id"] = full_hybrid_df["application_id"].astype(str)
+        subspace_full_df["application_id"] = subspace_full_df["application_id"].astype(str)
+        fusion_contrib_full = build_fusion_contributions(full_hybrid_df, subspace_full_df, dense_map_full)
+
+        # Fold the cohort's subset of these into staged_df so build_staged_card_html
+        # can read them straight off the CSV, same as every other staged column.
+        staged_df = (staged_df
+            .merge(subspace_full_df[["application_id", "subspace_if_score", "group_scores_json"]],
+                   on="application_id", how="left")
+            .merge(dense_full_df[["application_id", "dense_block_score_mobile",
+                                   "dense_block_score_ip", "dense_block_score_relational"]],
+                   on="application_id", how="left"))
+        staged_df["preview_fusion_contributions_json"] = staged_df["application_id"].map(
+            lambda a: json.dumps(fusion_contrib_full.get(a, {})))
 
         # Persist a cohort "bundle" so the read-only preview queue can render 3D
         # identity rings for these apps later. The merged graph (base 15k + this
@@ -220,8 +283,6 @@ def evaluate_dataset(req: EvaluateDatasetRequest):
         shutil.copy2(dataset_ops.GRAPH_PT, Path(f"outputs/staged_graph_{name}.pt"))
         merged_features[["application_id"]].to_csv(
             Path(f"outputs/staged_nodeorder_{name}.csv"), index=False)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
     finally:
         dataset_ops.restore_canonical_files(backup_dir)
         shutil.rmtree(backup_dir, ignore_errors=True)
@@ -247,15 +308,112 @@ def evaluate_dataset(req: EvaluateDatasetRequest):
     }
     Path(f"outputs/staged_scores_meta_{name}.json").write_text(json.dumps(meta, indent=2))
 
+    # Step 3: admin ran Evaluate — populate the batch's derived Postgres rows
+    # (identity_keys + features + pre-fusion preview scores). Best-effort.
+    try:
+        from src.db.ingest import batch_exists, evaluate_batch, stage_raw_csv
+        if not batch_exists(name):
+            stage_raw_csv(dataset_path, name=name)  # uploaded before step 3 existed
+        evaluate_batch(name, staged_scores_path, staged_features_path, float(p))
+    except Exception as e:  # noqa: BLE001
+        log.warning("monitoring.evaluate_dataset.pg_failed", error=str(e))
+
     log.info("monitoring.evaluate_dataset", **meta)
 
-    return EvaluateDatasetResponse(
+    return {
+        "dataset_path": str(dataset_path),
+        "n_rows": len(staged_df),
+        "p_value": float(p),
+        "recommendation": recommendation,
+        "drift_detected": drift_detected,
+        "staged_scores_path": str(staged_scores_path),
+    }
+
+
+@router.post("/evaluate-dataset", response_model=EvaluateDatasetResponse)
+def evaluate_dataset(req: EvaluateDatasetRequest):
+    """Console/synchronous entry point — unchanged behavior, now backed by
+    _run_evaluate() so the push-dataset auto-evaluate path (below) runs the
+    identical, already-tested logic."""
+    dataset_path = Path(req.dataset_path)
+    try:
+        result = _run_evaluate(dataset_path)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return EvaluateDatasetResponse(**result)
+
+
+@router.post("/push-dataset", response_model=PushDatasetResponse)
+def push_dataset(req: PushDatasetRequest):
+    """CSV-free ingestion entry point for a portal/ETL job at scale: names a
+    raw-schema CSV the sender already wrote to a server-reachable path — the
+    same data/ volume already mounted into both nic-api and nic-worker
+    (docker-compose.yml / deploy/k8s), e.g. under data/uploads/ alongside
+    console uploads. No inline row payload, since 3-4M rows as JSON in a
+    request body doesn't hold up at scale. Schema-checked exactly like the console's
+    upload-dataset; if it passes, stages the batch in Postgres (same
+    stage_raw_csv() the console path uses) and dispatches Evaluate as a
+    background Celery job — auto-preprocess only. Nothing is merged into
+    the base data or retrained here; that stays the human-gated Decide step
+    (POST /v3/training/decision) exactly as today, reviewable in the console
+    same as any console-uploaded cohort once the job completes.
+    """
+    from src.api import dataset_ops
+
+    dataset_path = Path(req.dataset_path)
+    if not dataset_path.exists():
+        raise HTTPException(status_code=422, detail=f"dataset_path not found: {req.dataset_path}")
+    if not dataset_ops.RAW_CSV.exists():
+        raise HTTPException(status_code=500, detail=f"Canonical raw schema not found: {dataset_ops.RAW_CSV}")
+
+    name = req.name or dataset_path.stem
+
+    try:
+        base_cols = list(pd.read_csv(dataset_ops.RAW_CSV, nrows=0).columns)
+        new_df    = pd.read_csv(dataset_path, low_memory=False)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not read CSV: {e}")
+
+    base_set, new_set = set(base_cols), set(new_df.columns)
+    missing = sorted(base_set - new_set)
+    extra   = sorted(new_set - base_set)
+
+    duplicate_ids: list[str] = []
+    if "application_id" in new_df.columns and "application_id" in base_cols:
+        base_ids = set(pd.read_csv(dataset_ops.RAW_CSV, usecols=["application_id"])["application_id"].astype(str))
+        duplicate_ids = sorted(set(new_df["application_id"].astype(str)) & base_ids)[:10]
+
+    schema_ok = not missing
+    staged_batch = None
+    job_id = None
+    message = ""
+
+    if schema_ok:
+        from src.db.ingest import stage_raw_csv
+        staged_batch = stage_raw_csv(dataset_path, name=name, source="portal_sync")
+
+        from src.api.tasks import run_evaluate_dataset_task
+        task = run_evaluate_dataset_task.delay(str(dataset_path))
+        job_id = task.id
+        message = "Staged and queued for auto-evaluate"
+    else:
+        message = f"Schema check failed — missing {len(missing)} required column(s), not staged"
+
+    log.info("monitoring.push_dataset", dataset_path=str(dataset_path), name=name,
+             n_rows=len(new_df), schema_ok=schema_ok, job_id=job_id)
+
+    return PushDatasetResponse(
         dataset_path=str(dataset_path),
-        n_rows=len(staged_df),
-        p_value=float(p),
-        recommendation=recommendation,
-        drift_detected=drift_detected,
-        staged_scores_path=str(staged_scores_path),
+        name=name,
+        n_rows=int(len(new_df)),
+        n_cols=int(new_df.shape[1]),
+        schema_ok=schema_ok,
+        missing_columns=missing,
+        extra_columns=extra,
+        duplicate_ids=duplicate_ids,
+        staged_batch=staged_batch,
+        job_id=job_id,
+        message=message,
     )
 
 
@@ -495,8 +653,18 @@ def delete_cohort(name: str, drop_upload: bool = True):
         t.unlink(missing_ok=True)
     if not removed:
         raise HTTPException(status_code=404, detail=f"No staged files for cohort '{name}'")
-    log.info("monitoring.delete_cohort", cohort=name, n_removed=len(removed))
-    return {"status": "ok", "cohort": name, "removed": removed}
+
+    # Step 3: also drop the cohort's staged Postgres rows (merged batches are
+    # permanent and refused by delete_staged_batch). Best-effort.
+    pg_result: dict = {}
+    try:
+        from src.db.ingest import delete_staged_batch
+        pg_result = delete_staged_batch(name)
+    except Exception as e:  # noqa: BLE001
+        log.warning("monitoring.delete_cohort.pg_failed", error=str(e))
+
+    log.info("monitoring.delete_cohort", cohort=name, n_removed=len(removed), pg=pg_result)
+    return {"status": "ok", "cohort": name, "removed": removed, "postgres": pg_result}
 
 
 @router.post("/upload-dataset")
@@ -552,6 +720,16 @@ async def upload_dataset(file: UploadFile = File(...)):
         "extra_columns":    extra,
         "duplicate_ids":    duplicate_ids,
     }
+    # Step 3: land the raw rows in Postgres as a STAGED batch (admin-gated
+    # contract — nothing derived until Evaluate/Merge). Best-effort dual-write;
+    # files stay authoritative (hard stop 13).
+    if report["schema_ok"]:
+        try:
+            from src.db.ingest import stage_raw_csv
+            report["staged_batch"] = stage_raw_csv(dest, name=dest.stem)
+        except Exception as e:  # noqa: BLE001 — PG outage must not break intake
+            log.warning("monitoring.upload_dataset.pg_stage_failed", error=str(e))
+
     log.info("monitoring.upload_dataset", filename=safe_name, n_rows=report["n_rows"],
              schema_ok=report["schema_ok"], n_missing=len(missing))
     return report
@@ -569,7 +747,22 @@ def top_suspicious(n: int = 20):
     a fallback when risk_scores_v3.csv is absent.
 
     Non-finite floats are sanitized to null globally by SafeJSONResponse.
+
+    Step 2 (Gate 2 passed): reads from Postgres by default; the file path is
+    the escape hatch (NIC_READS_FROM_PG=0) and the fallback on query failure
+    (including a missing/broken db layer — the import itself is inside the
+    try, so e.g. psycopg not being installed degrades gracefully too).
     """
+    try:
+        from src.db import reads as db_reads
+        if db_reads.reads_from_pg():
+            recs = db_reads.top_suspicious(n=n)
+            if recs:
+                return recs
+            log.warning("monitoring.top_suspicious.pg_empty_falling_back")
+    except Exception as e:  # noqa: BLE001 — PG outage must not kill the queue
+        log.warning("monitoring.top_suspicious.pg_failed_falling_back", error=str(e))
+
     risk_path = Path("outputs/risk_scores_v3.csv")
     if risk_path.exists():
         df = (pd.read_csv(risk_path)

@@ -5,6 +5,11 @@
 > and §10 (hard stops). This README is a human-readable overview; AGENTS.md is
 > the authoritative contract for all implementation decisions.
 
+> **New to this codebase?** Start with `docs/PROJECT_OVERVIEW.md` for a
+> conceptual, no-jargon walkthrough of what the system does and why it's
+> built this way. For "how do I add a feature / detector / schema change"
+> task recipes, see `docs/MAINTAINER_PLAYBOOK.md`.
+
 ---
 
 ## V4 — Final Detection Architecture (this branch, LOCKED)
@@ -60,6 +65,46 @@ kept as an independent audit signal, not a fusion input.
 > multi-seed confirmation on a representative detector is the remaining validation
 > before production sign-off. See `docs/AGENTS.md` Appendix H for the full
 > component-by-component evidence.
+
+---
+
+## V4-Scale — PostgreSQL + Kubernetes Remodel (`V4-Scale` branch, implemented)
+
+The detection architecture above is **fixed** — V4-Scale doesn't touch model
+math, it rebuilds the I/O around it so the system can process **30–40 lakh
+(3–4 million) applications** on the production Kubernetes server (16 vCPU,
+64 GB RAM, no GPU) instead of the 15k it was built against. Full detail,
+including the real Postgres schema, the external-GPU-checkpoint mechanism,
+and measured scale numbers: **`docs/TECHNICAL_REFERENCE_AND_SCALING.md`**.
+
+**What changed:**
+- **PostgreSQL is the system of record** — every application, feature
+  vector, score, label, LOE pattern, and training run lives in Postgres
+  (10 tables, `deploy/postgres/schema.sql`), not flat files. A `db-init`
+  container auto-applies the schema and ingests/replays data on every
+  `docker compose up`, so Postgres is populated the moment the API starts.
+- **SQL-pushdown feature engineering** replaces whole-frame pandas — proven
+  **bit-exact** against the old pipeline on all 44 model features.
+- **Hub-capped identity graph** replaces all-pairs edge construction (a
+  shared value with thousands of members would otherwise produce millions of
+  edges) — capped to a clique below a threshold, a star above it.
+- **Exact-neighborhood mini-batch training** replaces full-graph RGCN
+  passes — proven **bit-exact** against full-graph scoring on 15k, and
+  measured at **3.53 GB peak memory on a synthetic 1M-application test**
+  (memory is not the constraint at 3.5M; training *time*, projected at
+  ~101 h for a full retrain, is — hence the next point).
+- **External GPU-checkpoint ingestion** — a model trained entirely outside
+  the cluster (e.g. a GPU laptop, same `config_v3.py`) can be uploaded
+  through the admin console, schema-validated, and atomically hot-swapped
+  in, with zero in-cluster training time.
+- **Console CSV intake is unchanged** — upload/Evaluate/Decide behave
+  identically; underneath, rows now land in a Postgres staging batch instead
+  of a file.
+
+All five migration steps are implemented and gate-tested (bit-for-bit parity
+checks, live-stack verification via Playwright) — see `docs/IMPLEMENTATION.md`
+for the step-by-step evidence and `docs/HISTORY.md` for how the detection
+architecture above was locked in the first place.
 
 ---
 
@@ -381,7 +426,7 @@ NIC fraud Detection Project/
 ├── main_v3.py                              # Pipeline orchestrator (V3)
 ├── README.md                               # This file
 ├── Dockerfile                              # CPU image (python:3.12-slim)
-├── docker-compose.yml                      # Redis + nic-api + nic-worker + nginx
+├── docker-compose.yml                      # postgres + db-init + redis + nic-api + nic-worker + nginx
 ├── docker-compose.override.yml             # Dev-only frontend hot-mount (auto-merged)
 ├── celeryconfig.py                         # Celery broker/worker config (concurrency=1)
 ├── requirements-docker.txt                 # Linux min-version pins for Docker builds
@@ -389,28 +434,41 @@ NIC fraud Detection Project/
 ├── src/
 │   ├── config_v3.py                        # All dimension constants (single source of truth)
 │   ├── model_registry.py                   # Run/metric/checkpoint history (replaces MLflow)
-│   ├── tabular_feature_engine_v3.py        # engineer, then drop 24 identifiers → 44
-│   ├── graph_builder_v3.py                 # 5 typed edges + degree computation
+│   ├── tabular_feature_engine_v3.py        # engineer, then drop 24 identifiers → 44 (+ SQL-pushdown path)
+│   ├── graph_builder_v3.py                 # 5 typed edges + degree computation (+ hub-capped PG path)
 │   ├── synthetic_exposure_builder_v3.py    # 750 × 44 LOE tensor (graph-side only)
-│   ├── hybrid_graphmcm_v3.py               # Core model: feature stream + graph stream
+│   ├── hybrid_graphmcm_v3.py               # Core model: feature stream + graph stream (+ NeighborLoader path)
 │   ├── subspace_if_v3.py                   # 3-group subspace isolation forest (tabular backbone)
 │   ├── dense_block_detector_v3.py          # FRAUDAR greedy peeling on shares_ip (IP specialist)
 │   ├── evt_scorer_v3.py                    # GPD tail fit on 6 signals (hybrid + 5 subspace)
 │   ├── self_training_loop_v3.py            # Pseudo-label promotion (human-gated, ≥2 of 5 EVT signals)
 │   ├── fusion_classifier_v3.py             # Weighted SCORE-LEVEL fusion: subspace + dense-block-IP + hybrid → risk
 │   ├── xai_layer_v3.py                     # Evidence-first explanation cards: population percentiles, expected-vs-actual values, EVT-threshold quotes, deterministic narratives
+│   ├── xai_card_html_v3.py                 # Interactive reviewer cards (base + cohort-preview, PG-backed rings)
+│   ├── topology_view.py                    # Ego-graph extraction (PG-backed + staged-cohort fallback)
+│   ├── retraining_orchestrator.py          # Drift check + retrain dispatch (PG-backed baselines)
 │   ├── evaluate_model_v3.py                # Category-specific subspace IF + degree-stratified PR-AUC
 │   ├── pattern_ingest_v3.py                # Supervisor CSV fraud-ring intake: test (read-only) + ingest as topology-exposure pattern
-│   ├── checkpoint_manager.py               # ADR-008: atomic checkpoint validation + hot-swap
+│   ├── checkpoint_manager.py               # ADR-008: atomic checkpoint validation + hot-swap (external GPU checkpoints too)
+│   ├── confirmed_fraud_store.py / confirmed_fraud_graph_store.py  # JSON stores, dual-written to Postgres
+│   ├── db/                                 # ALL SQL lives here (hard stop 14) — see docs/TECHNICAL_REFERENCE_AND_SCALING.md §11
+│   │   ├── connection.py · migrate.py · bootstrap.py   # pool/config, schema apply, one-shot startup init
+│   │   ├── ingest.py                       # primary-batch ingest + staged-batch lifecycle (stage/evaluate/merge/delete)
+│   │   ├── reads.py                        # payload-exact PG read mirrors (queue, ego-graph, fraud summary)
+│   │   ├── features.py                     # SQL-pushdown aggregates, persisted-scaler save/load, hub-capped edges
+│   │   ├── stores.py / drift.py            # dual-write mirrors for the JSON stores + drift baselines
 │   └── api/
 │       ├── main.py                         # FastAPI app entry point + structlog setup
 │       ├── schemas.py                      # Pydantic request/response models
-│       ├── tasks.py                        # Celery task definitions (5 tasks)
+│       ├── tasks.py                        # Celery task definitions
 │       └── handlers/
 │           ├── supervisor.py               # POST confirm-fraud, mark-false-positive, confirm-batch, pattern/test, pattern/ingest, patterns/*
 │           ├── training.py                 # POST incremental/full/decision, GET jobs/{id}, upload/pull checkpoint
 │           ├── monitoring.py               # GET drift, drift-explain, fraud-store-summary, top-suspicious, {id}/card|ring|topology|export, export/bulk, export/selected; POST evaluate-dataset, upload-dataset
 │           └── model.py                    # GET checkpoint-info, stats, registry; POST rollback
+│
+├── scripts/
+│   └── profile_group_sizes.py              # K_CAP profiling query (rerun against real-scale data)
 │
 ├── data/
 │   ├── raw/data_for_ml_model.csv           # 15,000 × 136 (unchanged)
@@ -440,12 +498,15 @@ NIC fraud Detection Project/
 │
 ├── deploy/
 │   ├── README.md                           # Local Docker + Kubernetes deploy guide
+│   ├── postgres/schema.sql                 # The system-of-record schema (10 tables)
 │   ├── nginx/                              # front-door image (serves frontend + proxies API)
-│   └── k8s/nic-fraud.yaml                  # Kubernetes manifests
+│   └── k8s/nic-fraud.yaml                  # Kubernetes manifests (incl. postgres pod)
 │
 └── docs/
-    ├── AGENTS.md                           # Architecture contract (do not edit autonomously)
-    ├── IMPLEMENTATION.md                   # Settled V4 detection architecture
+    ├── AGENTS.md                           # Architecture + scale contract (do not edit autonomously)
+    ├── TECHNICAL_REFERENCE_AND_SCALING.md  # Full model + Postgres + scaling reference (start here for depth)
+    ├── IMPLEMENTATION.md                   # 5-step Postgres migration plan + gate evidence
+    ├── HISTORY.md                          # How the detection architecture was locked, with metrics
     ├── OPERATIONS_RUNBOOK.md               # Start Docker → open the console → what each screen does
     └── API_TESTING_GUIDE.md                # Manual curl testing guide for the API
 ```
@@ -483,15 +544,25 @@ docker compose up -d
 docker compose down
 ```
 
-Docker starts four containers: `redis` (broker), `nic-api` (FastAPI), `nic-worker`
-(Celery, concurrency=1), and `nginx` (the **front door** — serves the `frontend/`
-console and reverse-proxies the API, so the browser only needs `:8080`). Training
-jobs dispatched from the console run inside `nic-worker` and write to the mounted
-`data/`, `models/`, `outputs/` volumes.
+Docker starts six containers: `postgres` (system of record, host port **5433**
+— not 5432, to avoid colliding with a locally-installed PostgreSQL), `db-init`
+(one-shot — applies the schema and ingests/replays data into Postgres, then
+exits; `nic-api`/`nic-worker` wait for it to finish before starting), `redis`
+(broker), `nic-api` (FastAPI), `nic-worker` (Celery, concurrency=1), and
+`nginx` (the **front door** — serves the `frontend/` console and
+reverse-proxies the API, so the browser only needs `:8080`). Training jobs
+dispatched from the console run inside `nic-worker` and write to the mounted
+`data/`, `models/`, `outputs/` volumes and to Postgres.
 
-For operating the console screen-by-screen see `docs/OPERATIONS_RUNBOOK.md`; for
-the full local + Kubernetes deployment (storage, worker-singleton, no-GPU notes)
-see `deploy/README.md`; for raw endpoint testing see `docs/API_TESTING_GUIDE.md`.
+**Gotcha:** if you rebuild only `nic-api`/`nic-worker` (not the whole stack),
+`nginx` keeps the old container's cached IP and every request 502s — run
+`docker compose restart nginx` after a partial rebuild.
+
+For operating the console screen-by-screen see `docs/OPERATIONS_RUNBOOK.md`;
+for the full model architecture, the Postgres schema, and the scaling story
+see `docs/TECHNICAL_REFERENCE_AND_SCALING.md`; for the full local +
+Kubernetes deployment (storage, worker-singleton, no-GPU notes) see
+`deploy/README.md`; for raw endpoint testing see `docs/API_TESTING_GUIDE.md`.
 
 ---
 
@@ -523,6 +594,504 @@ screen-by-screen operator walkthrough see `docs/OPERATIONS_RUNBOOK.md`.
 ---
 
 ## Changelog
+
+### 2026-07-23 — CSV-free portal/ETL push endpoint (auto-preprocess, no auto-merge/retrain)
+
+`POST /v3/monitoring/push-dataset` (new, `src/api/handlers/monitoring.py`):
+a portal/ETL job names a raw-schema CSV it already wrote to the shared
+`data/` volume (mounted into both `nic-api` and `nic-worker`) — no inline
+JSON row payload, deliberately, since 3-4M rows in a request body doesn't
+hold up at scale where a file path does. Schema-checked the same way as the
+console's `upload-dataset`; on pass, stages the batch in Postgres
+(`stage_raw_csv()`, unchanged) and dispatches Evaluate as a background
+Celery task, returning a `job_id` immediately instead of blocking the
+request for however long feature/graph rebuild + scoring takes.
+
+Refactored `evaluate_dataset()`'s body into `_run_evaluate()` so the
+console's synchronous route and the new async task run the *identical*
+tested code path — no duplicated logic to drift out of sync. Concurrency
+safety needed no new locking: `worker_concurrency=1` (hard stop 16,
+`celeryconfig.py`) already serializes every Celery task, so an
+auto-triggered Evaluate can't collide with another training/evaluate job's
+canonical-file backup/restore.
+
+**Deliberately scoped to auto-preprocess only** — Merge (into the base data)
+and retrain dispatch stay separate, human-gated calls
+(`POST /v3/training/decision`), exactly as for a console-uploaded cohort.
+See `docs/OPERATIONS_RUNBOOK.md` §5c for the operator/integrator steps.
+
+### 2026-07-23 — Opt-in Postgres-sourced full retrain via API (no CSV required)
+
+`POST /v3/training/full` gained a `data_source` query param (`"file"`
+default, unchanged; `"postgres"` new) that lets a full retrain read every
+**merged** batch straight from Postgres (`src/db/features.py
+fetch_raw_frame()`/`edge_groups()`) instead of `data/raw/data_for_ml_model.csv`
+— no CSV round-trip needed once data is already staged + merged. Wired via
+`config_v3.DATA_SOURCE` (`NIC_DATA_SOURCE` env), which `main_v3.py`'s
+`build_base`/`build_graph` steps branch on to call `build_base_pg()`/
+`build_graph_pg()` (already built and gate-4-verified bit-exact, step 4 of
+the V4-Scale migration) writing to the same canonical file paths the rest
+of the pipeline expects — every downstream step is unaffected either way.
+See `docs/OPERATIONS_RUNBOOK.md` §5a for the operator steps.
+
+Fixed en route: `fetch_raw_frame()` previously derived its row set/order
+from the raw CSV's own `application_id` list (a known gap called out in its
+own docstring), so any batch merged into Postgres *after* the primary 15k
+would have been silently dropped from a Postgres-sourced read. It now reads
+row set/order entirely from Postgres (every `status='merged'` batch); only
+the static 136-column header still comes from the file (schema names, not
+row data). Re-verified bit-exact against the canonical
+`engineered_features_v3_nodeg.csv` after the fix, aligned by
+`application_id` (max abs diff 0.0).
+
+**Still file-based, not yet closed:** this is an opt-in read-path switch,
+not a default flip — nothing about hard stop 13 ("authoritative only after
+demonstrated parity") changes by default. Also, landing raw rows in
+Postgres in the first place still requires a CSV via `stage_raw_csv()` — a
+CSV-free *ingestion* entry point (portal/DB push -> auto-preprocess) is
+separate, not-yet-scoped work (see `docs/IMPLEMENTATION.md`, "After step 5").
+
+### 2026-07-23 — hybrid_anomaly_score drops edge_pred_error's contribution (redlined, lead direction)
+
+`LAMBDA_EDGE_SCORE` (new, `config_v3.py`) decouples the inference-time score
+weight on `edge_pred_error` from `LAMBDA_EDGE` (unchanged at 0.3, still the
+training-loss weight for the edge-prediction head). `hybrid_anomaly_score =
+feature_pred_error + LAMBDA_EDGE_SCORE * edge_pred_error`, with
+`LAMBDA_EDGE_SCORE = 0.0` — was effectively `LAMBDA_EDGE` (0.3) prior to this
+change.
+
+Evidence: `edge_pred_error` showed no usable signal on any of its 3 designed
+relational categories on a held-out stress cohort (`stress_testing_1`) —
+IP_CLUSTER/MOBILE_CLUSTER/PINCODE_CLUSTER PR-AUC 0.011-0.023, at or below
+what a random ranking would score — and on MOBILE_CLUSTER specifically it
+actively diluted `feature_pred_error`'s real standalone signal (0.268 alone
+vs 0.017 combined). Mechanistically consistent with the documented MAR
+critique (`.claude/CLAUDE.md` "Known Structural Weaknesses": dense cliques
+reconstruct/predict too easily) — ring members' edges are *easier*, not
+harder, for the RGCN to predict, so `edge_pred_error` points the wrong way
+for exactly the fraud shape it was meant to specialise in.
+
+Dropping the term from the score improved 6/7 held-out categories (mean
+PR-AUC 0.017 -> 0.056), with the only regression (IP_CLUSTER, -0.0007)
+smaller than the documented GPU noise floor. **Replicated on a second,
+independently-seeded stress population** (`stress_testing_2`, different
+seed, different sampled rows/rings, same archetype proportions): same sign
+on every one of the 7 categories, mean PR-AUC 0.017 -> 0.048. Raw stdout:
+`outputs/ablation_lambda_edge_v3_44.json`,
+`outputs/ablation_lambda_edge_v3_44_stress2.json`.
+
+Training is unaffected — `LAMBDA_EDGE` (the loss weight) is untouched, so
+the edge-prediction head still trains and `edge_pred_error` is still
+computed and available for XAI narration; it is excluded only from the
+ranking score. Untested: whether removing the edge-prediction objective
+from training entirely (not just from the score) would change embedding
+quality — a separate question, not addressed by this change.
+
+**Real-population caveat, stated plainly because it matters:** on the real
+15k population (no ground truth available), the new formula reorders
+rankings substantially — old vs. new `hybrid_anomaly_score` correlation
+0.56, top-100-most-suspicious overlap only 6/100. The synthetic evidence
+above supports that the new formula is better at catching the fraud shapes
+it was tested against; it does NOT by itself confirm the reordering is an
+improvement for the real population, since no ground truth exists there to
+check against. Flagged, not resolved, by this change.
+
+### 2026-07-22 — Explainability build-out: RGCN relation ablation, EVT empirical rates, ring fixes, cohort-preview signal drivers
+
+Same-day follow-up: three requested explainability enhancements, plus two
+real bugs found and fixed while verifying them live via Playwright against
+the rebuilt Docker API.
+
+- **RGCN per-relation ablation (new, XAI-only)** —
+  `hybrid_graphmcm_v3.compute_relation_ablation()`: the production RGCN
+  encoder has no learned attention (unlike the rejected HAN path, whose
+  `beta_r`/`top_alpha` stay dormant), so "expected this based on neighbours"
+  couldn't say WHICH relation drove that expectation. Re-scores the locked
+  checkpoint 5 extra times (once per edge type, masked via
+  `edge_type_tensor`, no retraining) and reports, per node, which relation's
+  removal improved feature-reconstruction fit the most. New pipeline step
+  `relation_ablation` (`main_v3.py`, between `train_hybrid` and
+  `subspace_if`); writes `outputs/relation_ablation_v3.csv`; narrated as
+  "Neighbourhood-expectation driver" on cards and shown as a bar on the
+  Signal drivers tab. Never feeds fusion or any threshold.
+- **EVT empirical-rate framing** — every `evt_scorer_v3._fit_evt()` branch
+  (POT-GPD and both fallbacks) now returns `n_flagged`; trigger sentences
+  cite the actual measured flagged rate for that signal ("this pattern was
+  this extreme in 31 of 15,000 applications, ~0.21%") instead of only the
+  aspirational target `Q` the tail was fit towards.
+- **Dense-block core highlighting on the 3D ring** — a gold diamond outline
+  now marks nodes that are part of the actual Charikar-peeled dense core
+  (`dense_block_score_relational > 0`), distinguishing real ring members
+  from incidental shares-X neighbours. `xai_card_html_v3._dense_core_app_ids()`.
+- **Per-relation edge toggle on the ring** — each relation's legend entry now
+  explicitly supports click-to-hide / double-click-to-isolate
+  (`itemclick="toggle"`, `itemdoubleclick="toggleothers"`), for decluttering
+  dense identity cliques.
+- **Bug fix: `shares_mother_name` (and any relation) could be silently
+  dropped from the ring.** `graph_viz_v3._figure_for_ring` used to keep only
+  the FIRST relation seen for a node pair (`edge_rel.setdefault`), so a pair
+  sharing both e.g. `shares_ip` and `shares_mother_name` only ever drew the
+  IP edge. Fixed to track every relation connecting a pair and draw one line
+  per relation — this also means the new edge-toggle now works correctly
+  for such pairs (previously, toggling the shadowing relation off did not
+  reveal the hidden one, because it was never rendered in the first place).
+- **Cohort-preview Signal drivers were empty; now populated.**
+  `POST /evaluate-dataset` now also computes subspace IF
+  (`subspace_if_v3.compute_subspace_if_scores`, refactored out as a reusable
+  pure function shared with `run_subspace_if()`) and dense-block scores over
+  the batch's merged population, plus a preview fusion score via the SAME
+  `fusion_classifier_v3.score_level_fusion()` /
+  `xai_layer_v3.build_fusion_contributions()` the committed pipeline uses.
+  `build_staged_card_html()` now reads these into `subspace_groups` /
+  `dense_block_relational` / `fusion_contributions` instead of hardcoded
+  empty dicts. Still clearly labeled PREVIEW, still not `risk_score_v3`
+  (renormalised over the cohort's own population, not the canonical one's
+  fixed scale), still without EVT triggers or model-traceability margins.
+  Verified live via Playwright against the rebuilt `nic-api` image on the
+  `stress_testing_1` cohort — bars, fusion-composition footer, and the
+  corrected preview-note text all render correctly.
+
+### 2026-07-22 — Dense-block pincode gate reverted (redlined, sole-author lead direction)
+
+Same-day follow-up to the dense-block relational extension below: pincode
+**removed** from the dense-block gate per lead direction. Shared pincode
+reflects legitimate geographic clustering, not collusion — it is not a
+valid fraud signal **on its own** for this detector (the RGCN/hybrid
+detector still consumes `shares_pincode` edges as part of the unchanged
+5-relation identity graph; this only affects the dense-block specialist's
+own gate).
+
+- **`DENSE_BLOCK_RELATIONS` reverted from `[0, 1, 4]` (mobile+ip+pincode) to
+  `[0, 1]` (mobile+ip only)**; `DENSE_BLOCK_RELATION_WEIGHTS` reverted from
+  `{0: 0.3, 1: 1.0, 4: 0.2}` to `{0: 0.3, 1: 1.0}` (mobile: 0.3, ip: 1.0).
+  `src/config_v3.py`.
+- `src/dense_block_detector_v3.py` no longer emits `dense_block_score_pincode`
+  — output columns are `dense_block_score_mobile`/`dense_block_score_ip` +
+  `dense_block_score_relational`.
+- `src/xai_layer_v3.py`, `src/xai_card_html_v3.py`, `src/fusion_classifier_v3.py`,
+  `src/compare_architectures_v3.py` updated to match — the dense-block
+  evidence section on XAI cards now names only mobile/IP as the shared
+  identity value that can drive a dense-block flag.
+- History: dense-block was `shares_ip`-only → extended to
+  mobile + ip + pincode earlier 2026-07-22 (see the entry below) → pincode
+  dropped same day, reverted to mobile + ip.
+
+### 2026-07-22 — RGCN root_weight fix + Deep SAD supplementary signal (XAI cards)
+
+Two real architecture changes, both prototyped on `stress_testing_1` before
+touching production, both now live.
+
+**`root_weight=False` on Hybrid GraphMCM's RGCN encoder.** `RGCNConv`
+defaults to `root_weight=True`, so `h_n` (the "neighborhood context" fed to
+the MCM feature predictor) contained a direct learned self-transform of a
+node's own UNMASKED features, independent of the intentional masking in
+`_apply_masks()` — leaking self-signal around the mask for every connected
+node (isolated nodes were already unaffected, overridden by
+`isolated_embedding`). Disabling it makes `h_n` pure multi-relation neighbor
+aggregation — the actual MCM contract. stress_testing_1: overall PR-AUC
+0.153→0.201, mobile-ring 0.029→0.078, IP-ring 0.032→0.055, no low-degree
+regression (3-5 degree bucket 0.193→0.385, 6+ bucket 0.153→0.201). Real
+15k-dataset retrain: 5/5 V2 floors still pass, edge-dropout retention 2.34.
+Two other prototyped alternatives were tested and rejected first: a scoped
+Graph Matching Network (cross-graph attention against exposure clusters,
+0.147 overall — flat vs baseline) and a scoped UniGAD-inspired learned-
+subgraph + spectral-energy scorer (0.123 overall — worse, particularly on
+IP/mobile). See `outputs/stress_testing_1_{gmn,unigad,rootweightoff}_stats.json`.
+
+**Deep SAD center-distance (`src/deepsad_detector_v3.py`, new module).**
+Separate encoder, separate objective (Ruff et al., ICLR 2020): pulls real
+nodes toward a learned normal center, pushes topology exposure's synthetic
+archetypes away via an inverted-distance term — no reconstruction loss, so
+it doesn't inherit the MAR reconstruct-too-easily failure mode. stress_testing_1:
+0.201 overall / 0.093 mobile-ring / 0.050 IP-ring — the strongest single
+relational signal found this session, beating both hybrid_reconstruction and
+the root_weight fix on mobile-ring specifically. A companion per-cluster
+"nearest known archetype" prototype-match mechanism was tested alongside it
+and rejected (0.116, near-random on every category — no inter-prototype
+separation term). A further CARE-GNN-style self-adjusting neighbor filter
+(dormant until a relation sees ≥20 exposure examples, then loosens/tightens
+via reward feedback) was layered on top of Deep SAD and also rejected net
+(0.189 vs 0.201 — helped mother-name/pincode, cost IP/mobile through the
+shared encoder). Deliberately kept OUT of `FUSION_COMPONENTS` /
+`final_risk_score` — promoting a 4th signal into the locked fusion is a
+bigger structural decision than this session resolved. Instead surfaced on
+XAI cards (`xai_layer_v3.py`, `xai_card_html_v3.py`) as a supplementary
+"Deep SAD center-distance" panel + narrative sentence when >75th percentile,
+clearly marked as not driving the fused score, plus a `deepsad_percentile`
+column in scorecard exports. Pipeline: new `deepsad` step in
+`main_v3.py` between `dense_block` and `evt`.
+
+Both changes redlined under explicit lead direction (sole author); see
+`docs/AGENTS.md` staleness note below.
+
+**Follow-up, same day — Deep SAD fusion inclusion tested and rejected.**
+With the card wiring live, tested whether `center_dist_score` actually
+improves the fused score if added as a 4th max-fusion input (candidate:
+`max(subspace, dense_relational, hybrid, center_dist_score)`), re-scoring
+`stress_testing_1`'s already-computed columns (no retraining). Result:
+overall PR-AUC 0.4182 (locked 3-way) vs 0.4181 (4-way) — noise-level, not
+an improvement. Deep SAD won the argmax driver role in only 483 of 50,000
+nodes (<1%): the existing three detectors already cover their specialty
+categories so completely (e.g. mobile-ring alone reaches 0.53 PR-AUC under
+the current fusion, far above Deep SAD's standalone 0.09-0.10 there) that a
+4th max-input rarely gets to matter, even though Deep SAD carries real
+information on its own. Confirms the XAI-card-only placement was the right
+call rather than an open question — not promoting it into
+`FUSION_COMPONENTS`. See `outputs/stress_testing_1_fusion4_stats.json`.
+
+**Also tested and rejected this session, for the record:** Latent Outlier
+Exposure (Qiu et al., ICML 2022) — jointly re-estimating which real nodes
+are likely-contaminated during Deep SAD training, instead of the static
+`CENTROID_CLEAN_PERCENTILE=95` heuristic. At alpha=0.05 (matching production's
+existing percentile convention): net regression, 0.201→0.193 overall. At
+alpha=0.15 (matched to stress_testing_1's actual ~15% injected fraud rate):
+overall recovered to near-parity (0.199) with the best-ever mobile-ring
+result this session (0.105), at a small cost to IP/pincode/mother-name.
+Not adopted — alpha=0.15 matches this stress-test's deliberately inflated
+contamination rate, not production's real (unmeasured, presumably much
+lower) rate; using it as-is on real data would be an unjustified guess.
+See `outputs/stress_testing_1_loe_qiu*_stats.json`. Also note the acronym
+collision: this is unrelated to the project's own "Learning-from-Only-
+Exposure" (LOE).
+
+### 2026-07-22 — On-demand explanation cards + 3D rings (scale prep for 3-4M)
+
+Found while reviewing what happens to card/ring serving at 30-40L scale: the
+**3D ring was already fully on-demand** (`build_ring_html` is PG-indexed —
+`ego_neighbors`/`induced_subgraph_edges`, no full-graph load, computed live
+per `/ring` request) — nothing to fix there. The **explanation card was not**:
+`build_card_html` only worked for an application inside the pre-computed
+top-500 batch (`explanation_cards_v3.json`), and the batch generator
+(`run_xai()`) did a full-population rescan (percentile distributions, the
+whole graph's neighbor index) on every call regardless of how many cards it
+wrote — a cost that scales with population size and would dominate at
+3-4M rows.
+
+- **`src/xai_layer_v3.py` refactored**: population-wide setup (percentile
+  stats, neighbor index, degree counts, closed-form fusion contributions) is
+  now a **cached context** (`get_xai_context`, mtime-keyed on its source
+  files — same pattern as `confirmed_fraud_graph_store.py`'s `_ip_cache`),
+  built once per scoring cycle instead of once per call. The per-application
+  assembly logic that used to live inline in `run_xai()`'s loop is now a
+  standalone `_assemble_card(app_id, ctx)`, and both `run_xai()` (the
+  top-500 batch, unchanged externally) and the new **`build_card_for_app(app_id)`**
+  (any application, on demand) call the same function — so batch and
+  on-demand cards can never drift apart. Also skips loading the hybrid model
+  entirely for attention extraction when `ENCODER_ARCH != "han"` (RGCN, the
+  production default, never uses `beta_r` — this was previously loaded and
+  forward-passed unconditionally).
+- **`src/xai_card_html_v3.build_card_html()`** now falls back to
+  `build_card_for_app()` when the requested application isn't in the
+  pre-computed batch, so the `/card` API route serves a real card for
+  *any* scored application, not just the top 500.
+- **Verified**: on a 15k population, the first on-demand call pays the
+  context-build cost (~6.3s at this scale); every subsequent on-demand card
+  for a different arbitrary application — including the single lowest-ranked
+  one, rank 15,000 — costs ~1ms. A card for application #2,847,193 will cost
+  the same as one for #1.
+- **`src/xai_card_html_v3._graph_ctx`** (the ring's `.pt`-graph fallback, used
+  only when Postgres is unavailable) is now also mtime-keyed cached instead
+  of rebuilding the whole graph's neighbor index on every fallback request.
+- Static per-application HTML file generation (`render_cards()`, gated to
+  `suspicious_only=True` already) is unchanged — it was already bounded by
+  flag rate, not population size, so it wasn't the actual problem.
+
+### 2026-07-22 — Dense-block relational extension, max fusion, LOE margin fix (redlined, sole-author lead direction)
+
+Three locked-architecture changes, all validated on the stress_testing_1
+ablation before being adopted into production. `docs/AGENTS.md`'s hard-stop
+table needs a corresponding redline (dense-block relation gate, fusion
+formula, LOE margin are all named there) — flagged, not yet applied to that
+file.
+
+- **Dense-block extended from `shares_ip`-only to mobile + IP + pincode**
+  (`DENSE_BLOCK_RELATIONS = [0, 1, 4]`), each relation scored independently
+  then combined via an **IP-priority-weighted max**
+  (`DENSE_BLOCK_RELATION_WEIGHTS = {mobile: 0.3, ip: 1.0, pincode: 0.2}` —
+  `dense_block_score_relational`). Equal-weighting was tried first and
+  rejected: it gained more overall (0.268 PR-AUC) but let ordinary, non-fraud
+  density in mobile/pincode outrank true IP-ring members (IP PR-AUC collapsed
+  0.220→0.067) — unacceptable given IP is the dominant real fraud vector.
+  IP-priority-strong keeps IP detection ~unchanged (0.220→0.220) while mobile
+  goes from near-zero (0.030) to real signal (0.149-0.349 depending on
+  weighting). `src/dense_block_detector_v3.py`, `src/config_v3.py`.
+- **Fusion changed from a weighted sum to an unweighted max**:
+  `risk = minmax(max(minmax(subspace), minmax(dense_relational), minmax(hybrid)))`.
+  The weighted-sum was found to dilute whichever detector actually found the
+  fraud with near-random noise from the other two on every category tested
+  (e.g. mobile-ring: subspace alone 0.674 PR-AUC vs the old fused 0.349).
+  Overall PR-AUC on the ablation: 0.403 (sum) → 0.447 (max). A rank-based
+  (Borda) alternative was also tried and rejected — it scored worse (0.295),
+  likely because most detector outputs are exact zero for the vast majority
+  of rows, so rank-averaging gets dominated by tie blocks.
+  `src/fusion_classifier_v3.py`.
+- **XAI cards refactored for max-fusion attribution**: "share of a blend" no
+  longer means anything under max fusion, so `build_fusion_contributions`
+  now reports each detector's own normalised value + an `is_driver` flag
+  (the argmax) + `margin_over_next` (how clearly it won). Cards show a
+  DRIVER badge on the winning detector instead of a percentage-share bar;
+  the dense-block evidence section now names WHICH shared identity value
+  (mobile/IP — pincode was briefly included here, dropped later the same
+  day, see the entry above) actually drove the flag. `src/xai_layer_v3.py`,
+  `src/xai_card_html_v3.py`, `src/export_v3.py` (scorecard columns renamed
+  `subspace_normalized`/`dense_relational_normalized`/`hybrid_normalized` +
+  `driving_margin`, replacing the old `*_share` columns).
+- **LOE topology-exposure margin fixed** — found via direct measurement,
+  not assumption, while testing why hybrid's ring detection stayed weak: the
+  locked `LOE_MARGIN=2.0` constant is ~3x SMALLER than even the REAL
+  population's own median embedding-to-centroid distance at this embedding
+  dimensionality (measured: real median ≈5.9, exposure mean ≈6.9, margin
+  2.0) — meaning exposure embeddings were already past the "margin" before
+  training even started, so the LOE warm-start term contributed exactly
+  `0.0000` throughout training regardless of formula (`exp(-sqrt(dist))`,
+  the old formula, and a fixed hinge were both tested and both stayed at
+  zero). Fixed in two parts: (1) `_loe_loss` is now a hinge
+  (`clamp(margin - dist, min=0)`) instead of the old exponential, which
+  saturates to ~0 once distances exceed a handful of units; (2) the margin
+  is now **derived from the current epoch's real embedding distribution**
+  (`_derive_loe_margin`, a percentile of real dist-to-centroid — same
+  principle as `CENTROID_CLEAN_PERCENTILE`, not a hand-picked constant) so
+  it self-calibrates to whatever scale the network's embedding space
+  actually lives at. Stage 2 also gained a small **persistent** LOE term
+  (`LOE_STAGE2_WEIGHT=0.15`, not decayed to zero) — previously Stage 2 had
+  no exposure term at all, so any separation Stage 1 bought could be freely
+  re-absorbed by 120 epochs of unconstrained reconstruction (dense synthetic
+  cliques reconstruct too easily — the MAR critique). Verified on a 15-epoch
+  test run: LOE now goes 0.85→0.25 in early epochs (genuine gradient-driven
+  separation, not saturation-from-init), decaying toward zero as embeddings
+  clear the margin — convergence, not failure to engage. `src/config_v3.py`,
+  `src/hybrid_graphmcm_v3.py` (`train`, `train_incremental`, and the
+  NeighborLoader mini-batch path all updated to keep the three training
+  loops in sync).
+
+Two prototype alternatives to Hybrid GraphMCM itself were tried and
+**rejected** on the same stress-test data before landing on the margin fix
+above — kept for the record, not adopted:
+- A GRACE/DGI-style contrastive encoder + embedding-redundancy anomaly
+  score: 0.097 PR-AUC at 120 epochs on GPU (vs hybrid's 0.276), no better
+  than a 25-epoch run — properly tested, genuinely underperforms for this
+  fraud shape.
+- A "predict from real vs. randomly-swapped neighbors" margin score on a
+  simplified MCM/RGCN: underperformed even its own model's raw error (0.148
+  vs 0.213) at 150 epochs on GPU — a clean, controlled negative result.
+
+Full numbers: `outputs/stress_testing_1_v2_stats.json` (dense-block +
+contrastive), `outputs/stress_testing_1_v2b_stats.json` (dense-block weight
+sweep), `outputs/stress_testing_1_v3_stats.json` (MCM-margin prototype).
+Prototype scripts (not part of the production module ownership):
+`scripts/prototype_v2_components.py`, `scripts/prototype_dense_weighted_max.py`,
+`scripts/prototype_mcm_margin.py`.
+
+### 2026-07-21 — 50k-application stress test ("stress_testing_1")
+
+Ad hoc scale/quality exercise, not a formal migration gate (that's the 3.5M
+K_CAP profiling in `docs/IMPLEMENTATION.md`). Generated a 50,000-row synthetic
+cohort (`scripts/generate_stress_test_dataset.py`) — 85% valid, 15% fraud
+across 4 tabular archetypes (fee inflation, income violation, age violation,
+mother-name collision) + 3 relational ring types (IP/mobile/pincode-sharing,
+147 rings, sizes 6-40), sampled/perturbed from the real 15k population per
+AGENTS.md Appendix B (no GAN/CTGAN/TVAE). Ground truth in
+`data/uploads/stress_testing_1_ground_truth.csv`.
+
+Ingested via the existing intake path (`upload-dataset` → Postgres batch
+`stress_testing_1`, 50k rows / 0 conflicts, 31s; `evaluate-dataset` → merge
+with the base 15k, rebuild features + identity graph, score with the current
+checkpoint, restore — 146s for ~65k merged nodes). Since the cohort endpoint
+only stages the pre-fusion hybrid score, `scripts/stress_test_1_analysis.py`
+separately computed subspace IF + dense-block-IP on the staged artifacts
+(same code paths, read-only) and applied the unmodified locked fusion formula
+to get the real three-detector picture: fused `risk_score_v3` PR-AUC 0.403 /
+ROC-AUC 0.800 at a 15% base rate; strongest on mobile-sharing rings (PR-AUC
+0.349, 98.6% of ring members in a top-5,000 queue) and identity-collision
+(0.187); weakest on pincode-sharing rings and the fee/age tabular archetypes
+(PR-AUC <0.05 across all three detectors — flagged as "observed, not yet
+explained," not diagnosed). Full numbers: `outputs/stress_testing_1_stats.json`,
+per-row scores in `outputs/stress_testing_1_full_scores.csv`.
+
+### 2026-07-21 — V4-Scale: PostgreSQL system of record + Kubernetes-scale remodel
+
+Branch `V4-Scale`. Detection architecture unchanged (locked, see above);
+every I/O boundary rebuilt for 30–40 lakh (3–4M) applications. Full detail:
+`docs/TECHNICAL_REFERENCE_AND_SCALING.md`; step-by-step gate evidence:
+`docs/IMPLEMENTATION.md`.
+
+- **PostgreSQL system of record** — 10-table schema (`deploy/postgres/
+  schema.sql`): `applications`, `identity_keys`, `features`,
+  `feature_scaling`, `scores`, `confirmed_fraud`, `loe_patterns`,
+  `evt_thresholds`, `training_runs`, `drift_baselines`. All access through
+  the new `src/db/` package (hard stop: no inline SQL elsewhere).
+- **`db-init` bootstrap** — a one-shot container service applies the schema
+  and ingests/replays data into Postgres on every `docker compose up`;
+  `nic-api`/`nic-worker` wait for it, so Postgres is populated the moment
+  the API starts, not just reachable.
+- **Reads flip to Postgres by default** (`NIC_READS_FROM_PG=1`), falling
+  back to files automatically on any query failure — the review queue,
+  status tiles, 3D rings, and ego-graphs are now served from indexed SQL
+  instead of whole-file parses / an in-memory graph. Verified identical to
+  the old file/graph paths across 150 sampled ego-graphs and 60 rings.
+- **CSV intake unchanged, staging added underneath** — uploads land in a
+  Postgres staging batch (raw rows only; nothing derived until Evaluate),
+  Evaluate populates preview scores, Decide → Merge makes it permanent. The
+  cohort-preview reviewer card was rebuilt to share the same rendering
+  components as the base card (real identity-network view, ranked reason
+  codes, expandable fields) instead of a separate flat-table template.
+- **SQL-pushdown feature engineering + persisted scaler** — proven
+  bit-exact against the file pipeline on all 44 features; the scaler now
+  persists its fitted parameters instead of refitting per batch (closes a
+  batch-statistics leak).
+- **Hub-capped identity graph + exact-neighborhood training** — replaces
+  all-pairs edge construction and full-graph RGCN passes. Every truncating
+  NeighborLoader fan-out tested deviated from full-graph scores; exact
+  2-hop batching reproduces them bit-for-bit while keeping memory bounded.
+  Measured on a synthetic 1M-application population: **3.53 GB peak RSS**;
+  full-retrain wall-clock projects to ~101 h at 3.5M on CPU (training time,
+  not memory, is the real scaling constraint).
+- **External GPU-checkpoint ingestion** — a checkpoint trained entirely
+  outside the cluster can be uploaded via the admin console, schema-
+  validated (rejected outright on any mismatch, live model untouched), and
+  atomically hot-swapped in.
+- **K_CAP profiling query built** (`scripts/profile_group_sizes.py`) and
+  dry-run tested on the 15k primary population; the production threshold
+  still needs a real-scale ingest to derive (open decision).
+- Two real deployment bugs found and fixed via a live `docker compose up`
+  test: `postgres:18`'s changed volume-mount convention, and the Dockerfile
+  not copying `deploy/postgres/schema.sql` into the image.
+
+### 2026-07-21 — Flagged-pattern export + explicit incremental/full retrain choice
+
+Found and fixed a real gap while checking that "flag a pattern → the model
+learns its topology" actually holds end-to-end: `append_ring_to_topology_exposure()`
+correctly writes a promoted ring's **real** identity-graph edges to
+`synthetic_exposure_graph_v3.pt`, but every retrain the console/API dispatched
+(`patterns/promote`, `confirm-batch`, `pattern/ingest`, `training/decision`)
+called `train_incremental()`, which never reads that file — it only fine-tunes
+on isolated (edge-free) feature vectors, so a promoted ring's structure sat
+unused until someone manually ran a full `main_v3.py`. The topology-consuming
+path (`hybrid_graphmcm_v3.train()` Stage 1 LOE against `synthetic_exposure_graph_v3.pt`)
+already existed via the full pipeline — it just was never wired to the pattern
+flows.
+
+- **Explicit retrain-mode choice, everywhere a pattern retrain is dispatched.**
+  `POST /v3/supervisor/patterns/promote` now takes `mode: "incremental" |
+  "full_retrain"` (default unchanged: `incremental`). `"full_retrain"` dispatches
+  the existing `run_full_pipeline_task` (same job the admin **Full pipeline**
+  button uses) instead of the incremental fine-tune, so the RGCN actually
+  trains against the ring's topology when you want that.
+- **New `POST /v3/supervisor/patterns/retrain`** — retrain directly from the
+  flagged-history store, independent of the pending-queue promote flow. Covers
+  patterns already `PROMOTED` (topology already appended — this just (re)runs
+  training) as well as any still `CONFIRMED`/`SELECTED` in the selection
+  (promoted first). Empty `pattern_ids` = every non-rejected pattern in the
+  store. Console: **Flagged history** panel gets a retrain-mode dropdown +
+  smoke-test checkbox + **▶ Retrain selected** / **▶ Retrain all** buttons,
+  reusing the existing multi-select.
+- **Flagged-pattern export**, matching the application queue's export
+  affordance: **⤓ Export selected** / **⤓ Export all** buttons on the flagged-
+  history panel. New endpoints `GET /v3/supervisor/patterns/export/bulk` and
+  `.../export/selected?ids=…`, `build_pattern_bulk_export()` /
+  `build_pattern_selected_export()` in `src/export_v3.py` — zip of
+  `manifest.csv` + `patterns/<pattern_id>.json` (the full stored record),
+  same shape as the existing application-export bundles.
 
 ### 2026-07-15 — Supervisor CSV fraud-pattern intake (relational LOE)
 

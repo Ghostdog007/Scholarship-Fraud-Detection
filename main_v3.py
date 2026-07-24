@@ -25,6 +25,8 @@ MLflow (ADR-002): every full pipeline run is logged as an MLflow experiment run.
   UI: mlflow ui  (open http://localhost:5000)
 """
 
+_BFP = "S2FuaXNoayBTaGFybWEgfCBOU1VUIHwgQmF0Y2ggMjAyNyB8IHNvbGUgYXV0aG9yLCBOSUMgRnJhdWQgRGV0ZWN0aW9uIFByb2plY3Q="
+
 import sys
 import time
 from pathlib import Path
@@ -41,8 +43,10 @@ PIPELINE_STEPS = [
     "add_degree_features",
     "build_exposure_set",
     "train_hybrid",
+    "relation_ablation",
     "subspace_if",
     "dense_block",
+    "deepsad",
     "evt",
     "self_training",
     "fusion",
@@ -173,15 +177,26 @@ def run_pipeline(steps: list[str] | None = None, smoke_test: bool = False, cycle
     t0 = time.time()
 
     def _pipeline_body():
+        import src.config_v3 as cfg
         if should_run("build_base"):
-            print("\n[main] Step 1: Feature engine -- build_base()")
-            from src.tabular_feature_engine_v3 import build_base
-            build_base()
+            if cfg.DATA_SOURCE == "postgres":
+                print("\n[main] Step 1: Feature engine -- build_base_pg() [NIC_DATA_SOURCE=postgres]")
+                from src.tabular_feature_engine_v3 import build_base_pg, NODEG_CSV
+                build_base_pg(out_csv=NODEG_CSV)
+            else:
+                print("\n[main] Step 1: Feature engine -- build_base()")
+                from src.tabular_feature_engine_v3 import build_base
+                build_base()
 
         if should_run("build_graph"):
-            print("\n[main] Step 2: Graph builder -- build_graph()")
-            from src.graph_builder_v3 import build_graph
-            build_graph()
+            if cfg.DATA_SOURCE == "postgres":
+                print("\n[main] Step 2: Graph builder -- build_graph_pg() [NIC_DATA_SOURCE=postgres]")
+                from src.graph_builder_v3 import build_graph_pg, GRAPH_PT, DEGREE_CSV
+                build_graph_pg(out_graph=GRAPH_PT, out_degree=DEGREE_CSV)
+            else:
+                print("\n[main] Step 2: Graph builder -- build_graph()")
+                from src.graph_builder_v3 import build_graph
+                build_graph()
 
         if should_run("add_degree_features"):
             print("\n[main] Step 3: Feature engine -- add_degree_features()")
@@ -205,6 +220,11 @@ def run_pipeline(steps: list[str] | None = None, smoke_test: bool = False, cycle
             from src.hybrid_graphmcm_v3 import train
             train(smoke_test=smoke_test)
 
+        if should_run("relation_ablation"):
+            print("\n[main] Step 5b: RGCN per-relation ablation (XAI-only) -- run_relation_ablation()")
+            from src.hybrid_graphmcm_v3 import run_relation_ablation
+            run_relation_ablation()
+
         if should_run("subspace_if"):
             print("\n[main] Step 6: Subspace IF -- run_subspace_if()")
             from src.subspace_if_v3 import run_subspace_if
@@ -214,6 +234,11 @@ def run_pipeline(steps: list[str] | None = None, smoke_test: bool = False, cycle
             print("\n[main] Step 6b: Dense-block detector (IP) -- run_dense_block()")
             from src.dense_block_detector_v3 import run_dense_block
             run_dense_block()
+
+        if should_run("deepsad"):
+            print("\n[main] Step 6c: Deep SAD center-distance (XAI-only, not fusion) -- run_deepsad()")
+            from src.deepsad_detector_v3 import run_deepsad
+            run_deepsad()
 
         if should_run("evt"):
             print("\n[main] Step 7: EVT scorer -- run_evt()")

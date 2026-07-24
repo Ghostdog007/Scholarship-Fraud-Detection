@@ -32,7 +32,7 @@ import pandas as pd
 
 from src.config_v3 import (
     MIN_SIGNALS_FOR_PROMOTION, EDGE_TYPES, ENCODER_ARCH,
-    FUSION_W_SUBSPACE, FUSION_W_DENSE_IP, FUSION_W_HYBRID,
+    DENSE_BLOCK_RELATION_WEIGHTS,
     IDENTIFIER_FEATURES as _IDENTIFIER_FEATURES,
 )
 
@@ -46,6 +46,9 @@ FEATURES_CSV   = Path("data/processed/engineered_features_v3.csv")
 PSEUDO_LABELS  = Path("outputs/pseudo_labels_v3.json")
 OUT_JSON       = Path("outputs/explanation_cards_v3.json")
 DENSE_CSV      = Path("outputs/dense_block_scores_v3.csv")
+DEEPSAD_CSV    = Path("outputs/deepsad_scores_v3.csv")
+ABLATION_CSV   = Path("outputs/relation_ablation_v3.csv")
+RAW_CSV        = Path("data/raw/data_for_ml_model.csv")
 
 TOP_K_FEATURES  = 5
 TOP_K_NEIGHBORS = 3
@@ -125,12 +128,38 @@ FEATURE_LABELS: dict[str, str] = {
 }
 
 TRIGGER_DESCRIPTIONS = {
-    "EVT_HYBRID":    "overall anomaly detected by hybrid model",
-    "EVT_FINANCIAL": "income or fee profile statistically extreme for this cohort",
-    "EVT_IDENTITY":  "identity fields (name / verifier codes) form an unusual cluster",
-    "EVT_NETWORK":   "IP/mobile sharing pattern statistically extreme",
-    "EVT_EDGE_RING": "graph connectivity inconsistent with the declared feature profile",
+    "EVT_HYBRID":    "overall profile looks unusual to the model",
+    "EVT_FINANCIAL": "income or fee profile is one of the most extreme in this cohort",
+    "EVT_IDENTITY":  "name / identity fields form an unusually tight cluster with other applications",
+    "EVT_NETWORK":   "IP or mobile number is shared far more than typical",
+    "EVT_EDGE_RING": "this application's network connections don't match what its declared details would predict",
 }
+
+# Plain-language translation for supervisor-confirmed fraud triggers
+# (self_training_loop_v3.py emits "CONFIRMED:<fraud_type>" verbatim from the
+# supervisor's own free-text/dropdown entry — without this, the raw code
+# renders unexplained in the narrative, e.g. "CONFIRMED:IP_CLUSTER").
+CONFIRMED_TYPE_LABELS = {
+    "IP_CLUSTER":            "IP address sharing",
+    "MOBILE_CLUSTER":        "mobile number sharing",
+    "PINCODE_CLUSTER":       "pincode sharing",
+    "AGE_VIOLATION":         "age / eligibility violation",
+    "INCOME_VIOLATION":      "income misrepresentation",
+    "FEE_INFLATION":         "fee inflation",
+    "MOTHER_NAME_COLLISION": "parent-name collision",
+}
+
+
+def _trigger_description(t: str) -> str:
+    """Plain-language description for any trigger code, including supervisor-
+    entered CONFIRMED:<type> codes not in the static TRIGGER_DESCRIPTIONS map."""
+    if t in TRIGGER_DESCRIPTIONS:
+        return TRIGGER_DESCRIPTIONS[t]
+    if t.startswith("CONFIRMED:"):
+        raw_type = t.split(":", 1)[1]
+        label = CONFIRMED_TYPE_LABELS.get(raw_type, raw_type.replace("_", " ").lower())
+        return f"matches a previously confirmed fraud pattern ({label})"
+    return t.replace("_", " ").lower()
 
 # Maps each self-training trigger to its evt_thresholds_v3.json signal key
 TRIGGER_SIGNAL_KEY = {
@@ -164,15 +193,49 @@ EDGE_TYPE_LABELS = {
 
 
 DETECTOR_LABELS = {
-    "subspace": "tabular subspace detector",
-    "dense_ip": "shared-IP dense-block",
-    "hybrid":   "relational RGCN model",
+    "subspace":         "profile-pattern detector",
+    "dense_relational":  "shared-identity cluster detector",
+    "hybrid":           "network-pattern model",
+}
+
+# Raw (pre-scaling), human-meaningful values for select features, so cards can
+# show "38 applications" / "Rs. 42,000" instead of an opaque 0-1 scaled value
+# (added 2026-07-23, readability pass). Not every engineered feature has a
+# clean raw equivalent -- ratios, ranks, and similarity scores are genuinely
+# derived quantities, and _feature_sentence() drops the scaled-value clause
+# for those rather than fabricate a number. Two kinds:
+#   passthrough  -- engineered feature IS the raw CSV column, direct lookup
+#   count        -- engineered feature is a per-value row count, recomputed
+#                    once from the raw CSV via groupby (matches
+#                    tabular_feature_engine_v3's own aggregate definitions)
+RAW_PASSTHROUGH_COLUMNS: dict[str, tuple[str, str]] = {
+    "annual_family_income":     ("annual_family_income", "Rs."),
+    "admission_fee":            ("admission_fee", "Rs."),
+    "tution_fee":               ("tution_fee", "Rs."),
+    "misc_fee":                 ("misc_fee", "Rs."),
+    "entitled_fee_amount":      ("entitled_fee_amount", "Rs."),
+    "entitled_lumpsump_amount": ("entitled_lumpsump_amount", "Rs."),
+    "pay_amt_centre_shr":       ("pay_amt_centre_shr", "Rs."),
+    "pay_amt_state_shr":        ("pay_amt_state_shr", "Rs."),
+    "p_percentage":             ("p_percentage", "%"),
+    "x_percentage":             ("x_percentage", "%"),
+    "disability_percentage":    ("disability_percentage", "%"),
+}
+RAW_COUNT_COLUMNS: dict[str, str] = {
+    "mobile_application_count":    "mobile_no",
+    "ip_application_count":        "ip_address",
+    "institute_application_count": "c_institution_id",
 }
 
 # Static model-traceability registry. Describes *what each fused model is and
 # reads* — the only new content the traceability layer adds; every number a card
 # quotes still comes from the computed fusion contributions / EVT signals. Keyed
 # to the same detector keys as DETECTOR_LABELS and fusion_contributions.
+#
+# No "weight" field (removed 2026-07-22, max fusion has no per-component weight —
+# see fusion_classifier_v3): each detector's contribution is just its own
+# min-max-normalised value; whichever is highest for a given application drives
+# the fused score (see build_fusion_contributions).
 DETECTOR_REGISTRY = {
     "subspace": {
         "name":   "Tabular subspace Isolation Forest",
@@ -181,19 +244,25 @@ DETECTOR_REGISTRY = {
                   "values within a feature group — point anomalies that stand out "
                   "from the population, with no graph link required.",
         "reads":  "20 of 44 tabular features (financial 7 · identity 6 · network 7)",
-        "weight": FUSION_W_SUBSPACE,
         "catches":"Individually implausible records — extreme income/fee ratios, "
                   "name collisions, IP/mobile counts — even for isolated applicants.",
     },
-    "dense_ip": {
-        "name":   "Shared-IP dense-block detector",
-        "what":   "FraudAR dense-subgraph peeling gated to shared-IP edges. Reads "
-                  "no features — pure graph structure. Flags coordinated rings that "
-                  "co-apply from one IP address.",
-        "reads":  "0 features — shared-IP graph structure only",
-        "weight": FUSION_W_DENSE_IP,
-        "catches":"Dense IP rings that reconstruct too easily for the relational "
-                  "model to flag — the subspace detector's structural blind spot.",
+    "dense_relational": {
+        "name":   "Shared-identity dense-block detector",
+        "what":   "FraudAR dense-subgraph peeling over shared-mobile and shared-IP "
+                  "edges independently, then max-combined with IP weighted dominant "
+                  "(mobile 0.3 / IP 1.0 — IP is the dominant real fraud vector; "
+                  "mobile is a boost, not equal). Reads no features — pure graph "
+                  "structure. Flags coordinated rings that co-apply from one shared "
+                  "identity value.",
+        "reads":  "0 features — shared-mobile/IP graph structure only",
+        "catches":"Dense identity-sharing rings that reconstruct too easily for the "
+                  "relational model to flag — the subspace detector's structural "
+                  "blind spot. Extended from IP-only 2026-07-22 (README changelog) "
+                  "after mobile-sharing rings were found to score near-zero under "
+                  "the IP-only gate; pincode was added the same day then dropped "
+                  "same day (shared pincode reflects legitimate geographic "
+                  "clustering, not collusion — not a valid fraud signal on its own).",
     },
     "hybrid": {
         "name":   "Hybrid GraphMCM (relational RGCN)",
@@ -201,7 +270,6 @@ DETECTOR_REGISTRY = {
                   "applications whose declared fields are inconsistent with the rest "
                   "of their own record and their network context.",
         "reads":  "all 44 features + the identity graph (5 edge types)",
-        "weight": FUSION_W_HYBRID,
         "catches":"Records that don't fit their own declared profile / neighbourhood; "
                   "best generalisation to novel topologies.",
     },
@@ -321,41 +389,48 @@ def build_fusion_contributions(
     subspace_df: pd.DataFrame,
     dense_map: dict,
 ) -> dict[str, dict]:
-    """Closed-form per-detector contribution to the score-level fusion.
+    """Closed-form per-detector attribution for the max score-level fusion.
 
-    Replaces the removed LightGBM TreeSHAP path. Because the fusion is
-      risk = minmax( W_S*minmax(subspace) + W_D*minmax(dense_ip) + W_H*minmax(hybrid) )
-    each detector's contribution to the pre-normalisation sum is exact — no
-    approximation. Returns app_id -> {detector: {weighted, share, normalized}}.
+    Because the fusion is
+      risk = minmax( max( minmax(subspace), minmax(dense_relational), minmax(hybrid) ) )
+    there is no "share of a sum" to report (changed 2026-07-22 — see
+    fusion_classifier_v3 and README changelog for why the sum was replaced).
+    Attribution is instead exact and binary: whichever detector's own
+    min-max-normalised value IS the max for that application is the driver.
+    Returns app_id -> {detector: {normalized, is_driver, margin_over_next}}.
+    `margin_over_next` on the driver is how far above the second-highest
+    detector it won by — a large margin means one detector clearly caught this
+    case; a small margin means it was a close call between two detectors.
     """
     fus = hybrid_df[["application_id", "hybrid_anomaly_score"]].merge(
         subspace_df[["application_id", "subspace_if_score"]], on="application_id"
     )
-    fus["dense_block_score_ip"] = fus["application_id"].map(
-        lambda a: dense_map.get(a, {}).get("dense_block_score_ip", 0.0)
+    fus["dense_block_score_relational"] = fus["application_id"].map(
+        lambda a: dense_map.get(a, {}).get("dense_block_score_relational", 0.0)
     ).astype(float)
 
     s = _minmax(fus["subspace_if_score"].values)
-    d = _minmax(fus["dense_block_score_ip"].values)
+    d = _minmax(fus["dense_block_score_relational"].values)
     h = _minmax(fus["hybrid_anomaly_score"].values)
 
-    c_s = FUSION_W_SUBSPACE * s
-    c_d = FUSION_W_DENSE_IP * d
-    c_h = FUSION_W_HYBRID   * h
-    total = c_s + c_d + c_h + 1e-12
+    keys = ["subspace", "dense_relational", "hybrid"]
+    stacked = np.stack([s, d, h], axis=1)  # (n, 3)
+    order = np.argsort(-stacked, axis=1)   # descending, per row
+    top_idx = order[:, 0]
+    top_val = stacked[np.arange(len(stacked)), top_idx]
+    second_val = stacked[np.arange(len(stacked)), order[:, 1]]
+    margin = top_val - second_val
 
     out: dict[str, dict] = {}
     for i, aid in enumerate(fus["application_id"].values):
+        driver = keys[top_idx[i]]
         out[aid] = {
-            "subspace": {"weighted": round(float(c_s[i]), 6),
-                         "share": round(float(c_s[i] / total[i]), 4),
-                         "normalized": round(float(s[i]), 6)},
-            "dense_ip": {"weighted": round(float(c_d[i]), 6),
-                         "share": round(float(c_d[i] / total[i]), 4),
-                         "normalized": round(float(d[i]), 6)},
-            "hybrid":   {"weighted": round(float(c_h[i]), 6),
-                         "share": round(float(c_h[i] / total[i]), 4),
-                         "normalized": round(float(h[i]), 6)},
+            key: {
+                "normalized": round(float(stacked[i, j]), 6),
+                "is_driver":  key == driver,
+                "margin_over_next": round(float(margin[i]), 6) if key == driver else None,
+            }
+            for j, key in enumerate(keys)
         }
     return out
 
@@ -428,6 +503,7 @@ def _top_features(
     neighbor_idxs: list | None = None,
     binary_vals: dict | None = None,
     context_edge_label: str | None = None,
+    raw_vals: dict | None = None,
 ) -> list[dict]:
     """Top interpretable features by prediction error (narration policy applied).
 
@@ -438,7 +514,12 @@ def _top_features(
 
     Ranking is by prediction error, but we scan past the top-k because some
     features are skipped. When no graph context is supplied (e.g. the pre-fusion
-    dataset preview) binaries are simply dropped and continuous evidence is used."""
+    dataset preview) binaries are simply dropped and continuous evidence is used.
+
+    raw_vals (added 2026-07-23): this application's {feature: (raw_value,
+    unit)} from _build_raw_lookup(), when a clean pre-scaling equivalent
+    exists (see RAW_PASSTHROUGH_COLUMNS/RAW_COUNT_COLUMNS) — used in place of
+    the opaque scaled value in the rendered sentence."""
     sorted_feats = sorted(per_feat.items(), key=lambda kv: kv[1], reverse=True)
     result: list[dict] = []
     for f, err in sorted_feats:
@@ -457,6 +538,8 @@ def _top_features(
             "source_model":  "hybrid",
             "kind":          kind,
         }
+        if raw_vals and f in raw_vals:
+            entry["raw_value"], entry["raw_unit"] = raw_vals[f]
 
         if kind == "binary":
             ctx = _binary_context(f, val, neighbor_idxs, binary_vals, context_edge_label)
@@ -543,37 +626,74 @@ def _binary_sentence(entry: dict) -> str:
     return s
 
 
+def _fmt_raw(raw_value: float, unit: str) -> str:
+    """Human-meaningful formatting for a raw (pre-scaling) value — money gets
+    thousands separators, percentages get one decimal, counts are plain
+    integers. Added 2026-07-23 (readability pass)."""
+    if unit == "Rs.":
+        return f"Rs. {raw_value:,.0f}"
+    if unit == "%":
+        return f"{raw_value:.1f}%"
+    if unit == "application(s)":
+        return f"{raw_value:.0f} application(s)"
+    return f"{raw_value:.3f}"
+
+
 def _feature_sentence(entry: dict) -> str:
     if entry.get("kind") == "binary":
         return _binary_sentence(entry)
     label = entry.get("feature_label", _readable(entry["feature"]))
     val   = entry.get("value")
+    raw_value = entry.get("raw_value")
+    raw_unit  = entry.get("raw_unit")
     parts = [label]
+
+    # Prefer the raw, human-meaningful number over the model's internal 0-1
+    # scaled value wherever one is available (RAW_PASSTHROUGH_COLUMNS /
+    # RAW_COUNT_COLUMNS / graph degree — see _build_raw_lookup). Ratios, ranks,
+    # and similarity scores have no clean raw equivalent — the scaled-value
+    # clause is dropped for those rather than showing a number nobody outside
+    # this codebase would know how to read.
+    have_raw = raw_value is not None and raw_unit is not None
+    amount_str = _fmt_raw(raw_value, raw_unit) if have_raw else None
 
     vp = entry.get("value_percentile")
     if val is not None and vp is not None:
         med = entry.get("population_median")
-        med_str = f", population median {med:.3f}" if med is not None else ""
         if med is not None and np.isclose(val, med):
             # Midrank percentiles are tie-inflated when the value sits on the
             # median — the value itself is ordinary; the model miss is the story.
-            parts.append(f"matches the population median (scaled value {val:.3f})")
+            suffix = f" ({amount_str})" if have_raw else ""
+            parts.append(f"matches the population median{suffix}")
         elif vp >= 50.0:
-            parts.append(f"is higher than {_fmt_pct(vp)} of applicants (scaled value {val:.3f}{med_str})")
+            suffix = f" ({amount_str})" if have_raw else ""
+            parts.append(f"is higher than {_fmt_pct(vp)} of applicants{suffix}")
         else:
-            parts.append(f"is lower than {_fmt_pct(100.0 - vp)} of applicants (scaled value {val:.3f}{med_str})")
+            suffix = f" ({amount_str})" if have_raw else ""
+            parts.append(f"is lower than {_fmt_pct(100.0 - vp)} of applicants{suffix}")
     elif val is not None:
-        parts.append(f"has scaled value {val:.3f}")
+        parts.append(f"is {amount_str}" if have_raw else "has an unusual value")
     else:
         parts.append("could not be predicted from the rest of the application")
 
     exp = entry.get("expected")
     if exp is not None and val is not None:
-        direction = "above" if val > exp else "below"
-        parts.append(
-            f"; given the other declared fields and the application's network context, "
-            f"the model expected about {exp:.3f} — the declared value is {direction} expectation"
-        )
+        direction = "higher than" if val > exp else "lower than"
+        if have_raw:
+            # exp is still in scaled [0,1] space — mixing it with the raw
+            # actual value would be inconsistent, so state direction only
+            # (still a meaningful, honest claim) rather than a fabricated
+            # raw-equivalent expected number.
+            parts.append(
+                f"; given the rest of this application and its network, the model "
+                f"expected a figure {direction} what was declared here"
+            )
+        else:
+            parts.append(
+                f"; given the other declared fields and the application's network context, "
+                f"the model expected about {exp:.3f} — the declared value is "
+                f"{'above' if val > exp else 'below'} expectation"
+            )
 
     ep = entry.get("error_percentile")
     if ep is not None:
@@ -585,8 +705,46 @@ def _feature_sentence(entry: dict) -> str:
     return " ".join(parts[:2]) + "".join(parts[2:])
 
 
+def _plain_summary(card: dict) -> str:
+    """One plain-English sentence up front — what's wrong (if anything) and
+    what to do about it, before the detailed evidence below. Added
+    2026-07-23 (readability pass) so a reviewer gets the gist immediately
+    instead of having to read the whole narrative first."""
+    ev = card.get("evidence") or {}
+    triggers = card.get("triggers", [])
+    connections = ev.get("graph_connections", [])
+    label_source = ev.get("label_source")
+
+    if label_source == "confirmed":
+        what = "This application was previously confirmed as fraud."
+    elif connections:
+        top_conn = max(connections, key=lambda c: c["count"])
+        et_label = EDGE_TYPE_LABELS.get(top_conn["edge_type"], top_conn["edge_type"].replace("_", " "))
+        pct = top_conn.get("percentile")
+        pct_str = f" — more connected than {_fmt_pct(pct)} of applicants" if pct is not None else ""
+        what = (f"Flagged: this application shares the same {et_label} with "
+                f"{top_conn['count']} other application(s){pct_str}.")
+    elif triggers:
+        what = f"Flagged: {_trigger_description(triggers[0])}."
+    elif ev.get("evt_crossings"):
+        what = "Not auto-flagged, but one statistical check came close to the review threshold."
+    else:
+        what = "Not flagged by any statistical check — shown for ranking context only."
+
+    if label_source == "confirmed":
+        action = "Hold disbursement and coordinate with the investigation team."
+    elif triggers:
+        action = "Recommend holding disbursement and requesting supporting documents."
+    elif ev.get("evt_crossings"):
+        action = "Recommend a secondary check before disbursement."
+    else:
+        action = "No action required."
+
+    return f"{what} {action}"
+
+
 def _narrative(card: dict) -> str:
-    parts: list[str] = []
+    parts: list[str] = [card.get("plain_summary") or _plain_summary(card)]
     ev        = card.get("evidence") or {}
     score     = card.get("risk_score_v3", 0.0)
     triggers  = card.get("triggers", [])
@@ -612,17 +770,30 @@ def _narrative(card: dict) -> str:
     if triggers:
         flag_lines = []
         for t in triggers:
-            desc = TRIGGER_DESCRIPTIONS.get(t, t)
+            desc = _trigger_description(t)
             sig  = evt_signals.get(t)
             if sig and sig.get("observed") is not None and sig.get("threshold") is not None:
-                flag_lines.append(f"{desc} (observed {sig['observed']:.3f} vs threshold {sig['threshold']:.3f})")
+                # Empirical rate actually measured at this threshold (n_flagged /
+                # scored population), not the aspirational target Q it was fit
+                # towards — a stronger, per-signal justification statement than a
+                # single blanket target rate for the whole card (Quantitative
+                # Claims Protocol: report the measured number, not the design one).
+                rate_str = ""
+                n_flagged = sig.get("n_flagged")
+                if n_flagged is not None and n_pop:
+                    rate_pct = 100.0 * n_flagged / n_pop
+                    rate_str = (f"; this pattern was this extreme in {n_flagged} of {n_pop:,} scored "
+                                f"applications (~{rate_pct:.2f}%)")
+                flag_lines.append(
+                    f"{desc} (observed {sig['observed']:.3f} vs threshold {sig['threshold']:.3f}{rate_str})"
+                )
             else:
                 flag_lines.append(desc)
         q = next((s.get("q") for s in evt_signals.values() if s.get("q")), None)
-        q_str = f", fitted to the score tails at a {q * 100:.1f}% target false-positive rate" if q else ""
+        q_str = f", each a statistically rare pattern (rarer than {q * 100:.1f}% of applications)" if q else ""
         plural = "s" if len(triggers) != 1 else ""
         parts.append(
-            f"Crossed {len(triggers)} independent extreme-value threshold{plural}{q_str}: "
+            f"Crossed {len(triggers)} independent rarity threshold{plural}{q_str}: "
             + "; ".join(flag_lines) + "."
         )
     elif ev:
@@ -638,38 +809,67 @@ def _narrative(card: dict) -> str:
             )
             plural = "s" if len(crossings) != 1 else ""
             parts.append(
-                f"Crossed {len(crossings)} extreme-value threshold{plural}: "
+                f"Crossed {len(crossings)} rarity threshold{plural} (statistically unusual, not a guess): "
                 + "; ".join(lines) + qualifier + "."
             )
         else:
-            parts.append("No extreme-value threshold was crossed.")
+            parts.append("No statistical rarity threshold was crossed.")
 
     # 3. Feature-level evidence — measured deviations, not boilerplate
     if top_feats:
         feat_lines = [_feature_sentence(f) for f in top_feats[:NARRATIVE_FEATURES]]
         parts.append("Key evidence: " + " | ".join(feat_lines) + ".")
 
-    # 3b. Fusion breakdown — which detector drove the fused score (closed-form,
-    #     replaces the removed LightGBM TreeSHAP attributions).
+    # 3b. Fusion breakdown — which SINGLE detector drove the fused score (max
+    #     fusion, changed 2026-07-22: no "share of a blend" any more — exactly
+    #     one detector's normalised value IS the fused score's source).
     fc = ev.get("fusion_contributions", {})
     if fc:
-        order = sorted(fc.items(), key=lambda kv: kv[1].get("share", 0.0), reverse=True)
-        parts_fc = [
-            f"{DETECTOR_LABELS.get(k, k)} {c['share'] * 100:.0f}%"
-            for k, c in order if c.get("share", 0.0) > 0.005
-        ]
-        if parts_fc:
-            parts.append("Score composition: " + ", ".join(parts_fc) + ".")
+        driver_key = next((k for k, c in fc.items() if c.get("is_driver")), None)
+        if driver_key:
+            driver = fc[driver_key]
+            others = ", ".join(
+                f"{DETECTOR_LABELS.get(k, k)} {c['normalized']:.2f}"
+                for k, c in fc.items() if k != driver_key
+            )
+            margin = driver.get("margin_over_next")
+            margin_str = (f" (clearly ahead of the next most suspicious signal, by {margin:.2f})"
+                          if margin is not None and margin >= 0.05 else
+                          " (a close call — the next-highest detector was nearly as suspicious)"
+                          if margin is not None else "")
+            parts.append(
+                f"Main reason for this score: the {DETECTOR_LABELS.get(driver_key, driver_key)} "
+                f"({driver['normalized']:.2f} on a 0-1 scale){margin_str}. Other checks: {others}."
+            )
 
-    # 3c. Dense-block-IP: the IP specialist. Only surfaced when it actually fires.
-    dib = ev.get("dense_block_ip")
+    # 3c. Shared-identity dense-block: mobile/IP ring specialist. Only
+    #     surfaced when it actually fires. Per-relation breakdown shows WHICH
+    #     shared identity value drove it, not just the combined score.
+    dib = ev.get("dense_block_relational")
     if dib and dib.get("score", 0.0) > 0.0:
         pct = dib.get("percentile")
         pct_str = f", more concentrated than {_fmt_pct(pct)} of applicants" if pct is not None else ""
+        rel_scores = dib.get("by_relation", {})
+        top_rel = max(rel_scores.items(), key=lambda kv: kv[1])[0] if rel_scores else None
+        rel_label = {"mobile": "mobile number", "ip": "IP address"}.get(top_rel, top_rel)
+        via_str = f" — driven mainly by shared {rel_label}" if rel_label else ""
         parts.append(
-            f"Shared-IP dense-block: this application sits inside a dense cluster of "
-            f"co-applications on the same IP address{pct_str} — the signal the IP specialist adds "
-            f"on top of the tabular detectors."
+            f"Cluster check: this application sits inside a tightly-linked group of "
+            f"co-applications{via_str}{pct_str} — an extra warning sign on top of the "
+            f"individual-profile checks above (technical: shared-identity dense-block)."
+        )
+
+    # 3d. Deep SAD center-distance — SUPPLEMENTARY signal, does not drive the
+    #     fused score. Only surfaced when it's notably elevated (>75th
+    #     percentile), matching this project's pattern of narrating evidence
+    #     rather than every raw number.
+    dsad = ev.get("deepsad")
+    if dsad and dsad.get("percentile") is not None and dsad["percentile"] >= 75.0:
+        parts.append(
+            f"Second opinion: a separate, independently-trained model (technical: Deep SAD, "
+            f"a different method from the one that produced the main score) also finds this "
+            f"application further from 'normal' than {_fmt_pct(dsad['percentile'])} of applicants — "
+            f"supporting context, not something that changed the score above."
         )
 
     # 4. Subspace detector context. Crossed groups are already reported in
@@ -680,9 +880,9 @@ def _narrative(card: dict) -> str:
         top_g, top_d = max(groups.items(), key=lambda kv: kv[1].get("percentile", 0.0))
         if top_d.get("percentile") is not None:
             parts.append(
-                f"Strongest independent detector: {GROUP_LABELS.get(top_g, top_g)} "
+                f"Strongest single check: the {GROUP_LABELS.get(top_g, top_g)} "
                 f"places this application above {_fmt_pct(top_d['percentile'])} of applicants "
-                f"(below its EVT threshold)."
+                f"(not yet rare enough to auto-flag)."
             )
 
     # 5. Graph evidence — connectivity measured against the population
@@ -718,9 +918,27 @@ def _narrative(card: dict) -> str:
             top_edges = attention.get("top_edges", [])
             n_edges = len(top_edges)
             parts.append(
-                f"The model weighted this application's {top_rel_label} links most heavily (β={top_w:.2f}), "
-                f"focusing on {n_edges} co-application(s)."
+                f"The model paid the most attention to this application's {top_rel_label} connections "
+                f"(weight {top_w:.2f} of 1.0), focusing on {n_edges} co-application(s)."
             )
+
+    # 5b. RGCN per-relation ablation — the production encoder's answer to the
+    #     same question the (dormant, HAN-only) attention block above answers:
+    #     which relation actually drove the model's neighbourhood-based
+    #     expectation for this node. Only narrated when ablation found a
+    #     relation whose removal genuinely improved the fit (top_delta > 0) —
+    #     a zero/negative top_delta means no relation was actively worsening
+    #     this node's reconstruction, so there is nothing honest to report.
+    ablation = ev.get("relation_ablation")
+    if ablation and ablation.get("top_relation"):
+        top_rel_label = EDGE_TYPE_LABELS.get(ablation["top_relation"],
+                                              ablation["top_relation"].replace("_", " "))
+        parts.append(
+            f"Why the network looked off: this application's {top_rel_label} connections are the "
+            f"biggest reason its profile looked unusual to the model — if those particular connections "
+            f"were set aside, its profile would have looked more normal (technical: relation-ablation "
+            f"check, largest fit improvement {ablation['top_delta']:.4f} of any connection type)."
+        )
 
     # 6. Recommended action — driven by label state and EVT crossings,
     #    not a hand-set score cut
@@ -744,35 +962,118 @@ def _narrative(card: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Cached population context (added 2026-07-22 — see README changelog)
+#
+# Everything below this point that scans the WHOLE scored population (feature
+# percentile distributions, error distributions, the graph neighbor index,
+# the fusion-contribution table, the loaded hybrid model) is population-wide
+# work that costs the same whether you want 1 card or 500. Previously
+# run_xai() rebuilt all of it from scratch on every call, and there was no
+# way to get a card for an application outside the pre-computed top-500 batch
+# at all. Splitting it into a CACHED context (mtime-keyed on its source
+# files, same pattern as confirmed_fraud_graph_store.py's _ip_cache) means:
+#   - run_xai() still writes the top-500 batch, unchanged externally
+#   - build_card_for_app(app_id) can produce a card for ANY application_id,
+#     at the cost of one row lookup, not a population-wide rescan
+# Both call the SAME _assemble_card() so they can never drift apart.
 # ---------------------------------------------------------------------------
 
-def run_xai(top_n: int = 500) -> None:
-    print("[xai] run_xai() starting ...")
+_CTX_CACHE: dict = {"key": None, "ctx": None}
 
-    schema     = json.loads(SCHEMA_JSON.read_text())
-    features   = schema["features"]
-    hybrid_df  = pd.read_csv(HYBRID_CSV)
-    risk_df    = pd.read_csv(RISK_CSV)
+
+def _ctx_cache_key() -> tuple:
+    paths = [HYBRID_CSV, RISK_CSV, DENSE_CSV, DEEPSAD_CSV, ABLATION_CSV, FEATURES_CSV, SUBSPACE_CSV,
+             GRAPH_PT, EVT_JSON, PSEUDO_LABELS, SCHEMA_JSON, RAW_CSV]
+    return tuple(p.stat().st_mtime if p.exists() else None for p in paths)
+
+
+def _build_raw_lookup() -> dict[str, dict[str, tuple[float, str]]]:
+    """application_id -> {feature: (raw_value, unit)} for the passthrough and
+    count columns above. Read-only, presentation-only (does not touch the
+    scored feature vectors or any model input)."""
+    if not RAW_CSV.exists():
+        return {}
+
+    needed_cols = {"application_id"}
+    needed_cols.update(raw_col for raw_col, _ in RAW_PASSTHROUGH_COLUMNS.values())
+    needed_cols.update(RAW_COUNT_COLUMNS.values())
+    raw_df = pd.read_csv(RAW_CSV, usecols=lambda c: c in needed_cols, low_memory=False)
+
+    lookup: dict[str, dict[str, tuple[float, str]]] = {}
+
+    for feature, (raw_col, unit) in RAW_PASSTHROUGH_COLUMNS.items():
+        if raw_col not in raw_df.columns:
+            continue
+        vals = pd.to_numeric(raw_df[raw_col], errors="coerce")
+        for app_id, v in zip(raw_df["application_id"], vals):
+            if pd.isna(v):
+                continue
+            lookup.setdefault(app_id, {})[feature] = (float(v), unit)
+
+    for feature, group_col in RAW_COUNT_COLUMNS.items():
+        if group_col not in raw_df.columns:
+            continue
+        counts = raw_df.groupby(group_col)["application_id"].transform("count")
+        for app_id, c in zip(raw_df["application_id"], counts):
+            lookup.setdefault(app_id, {})[feature] = (float(c), "application(s)")
+
+    return lookup
+
+
+def _build_xai_context() -> dict:
+    """Population-wide setup, done ONCE per scoring cycle (cached by
+    get_xai_context, not called directly outside this module)."""
+    schema   = json.loads(SCHEMA_JSON.read_text())
+    features = schema["features"]
+
+    hybrid_df = pd.read_csv(HYBRID_CSV)
+    risk_df   = pd.read_csv(RISK_CSV)
 
     has_predicted = "per_feature_predicted_json" in hybrid_df.columns
     if not has_predicted:
         print("[xai] WARNING: per_feature_predicted_json not in hybrid scores — "
               "expected-vs-actual evidence unavailable; re-run scoring for full narratives.")
-              
-    # Dense-block-IP scores (V4 IP specialist). Consumed for the closed-form
-    # fusion breakdown and as narrative evidence.
+
+    # Dense-block relational scores (mobile/IP specialist, IP-priority weighted,
+    # max-combined into dense_block_score_relational; pincode dropped 2026-07-22).
+    # Consumed for the closed-form fusion breakdown and as narrative evidence.
     dense_map: dict = {}
-    dense_ip_sorted = np.array([])
+    dense_relational_sorted = np.array([])
     if DENSE_CSV.exists():
         dense_df = pd.read_csv(DENSE_CSV)
         dense_cols = [c for c in dense_df.columns if c.startswith("dense_block_score_")]
         for _, r in dense_df.iterrows():
             dense_map[r["application_id"]] = {c: float(r[c]) for c in dense_cols}
-        if "dense_block_score_ip" in dense_df.columns:
-            dense_ip_sorted = np.sort(dense_df["dense_block_score_ip"].values.astype(float))
+        if "dense_block_score_relational" in dense_df.columns:
+            dense_relational_sorted = np.sort(dense_df["dense_block_score_relational"].values.astype(float))
     else:
-        print(f"[xai] WARNING: {DENSE_CSV} not found — dense-block-IP evidence omitted.")
+        print(f"[xai] WARNING: {DENSE_CSV} not found — dense-block-relational evidence omitted.")
+
+    # Deep SAD center-distance (V4.2, 2026-07-22) — SUPPLEMENTARY signal only, not
+    # part of fusion_classifier_v3's locked fusion. Surfaced on cards as an
+    # additional "what this separate model saw" panel (see DETECTOR_REGISTRY note
+    # below and config_v3's DEEPSAD_* block for the validation numbers).
+    deepsad_map: dict = {}
+    deepsad_sorted = np.array([])
+    if DEEPSAD_CSV.exists():
+        deepsad_df = pd.read_csv(DEEPSAD_CSV)
+        deepsad_map = dict(zip(deepsad_df["application_id"], deepsad_df["center_dist_score"].astype(float)))
+        deepsad_sorted = np.sort(deepsad_df["center_dist_score"].values.astype(float))
+    else:
+        print(f"[xai] WARNING: {DEEPSAD_CSV} not found — Deep SAD panel omitted from cards.")
+
+    # RGCN per-relation ablation (V4.3, 2026-07-22) — post-hoc, XAI-only.
+    # hybrid_graphmcm_v3.compute_relation_ablation() answers "which relation
+    # drove the model's neighbourhood-based expectation" for the LOCKED RGCN
+    # encoder, which (unlike the rejected HAN path) has no learned attention.
+    ablation_map: dict = {}
+    if ABLATION_CSV.exists():
+        ablation_df = pd.read_csv(ABLATION_CSV)
+        delta_cols = [c for c in ablation_df.columns if c.startswith("ablation_delta_")]
+        for _, r in ablation_df.iterrows():
+            ablation_map[r["application_id"]] = {c: float(r[c]) for c in delta_cols}
+    else:
+        print(f"[xai] WARNING: {ABLATION_CSV} not found — relation-ablation evidence omitted.")
 
     # Actual (scaled) feature values per application
     feat_df = pd.read_csv(FEATURES_CSV)
@@ -805,10 +1106,6 @@ def run_xai(top_n: int = 500) -> None:
         for rec in pl.get("positive_set", []):
             trigger_map[rec["application_id"]] = rec.get("trigger", [])
 
-    merged = hybrid_df.merge(risk_df, on="application_id")
-    merged = merged.sort_values("risk_score_v3", ascending=False)
-    merged_top = merged.head(top_n)
-
     print("[xai] Building neighbor index ...")
     neighbor_index = _build_neighbor_index(GRAPH_PT)
 
@@ -830,250 +1127,421 @@ def run_xai(top_n: int = 500) -> None:
     print("[xai] Computing population statistics (values, errors, degrees, groups) ...")
     stats = build_population_stats(hybrid_df, feat_df, risk_df, subspace_df, degree_counts)
 
-    from src.hybrid_graphmcm_v3 import load_model_and_inputs
-    import torch
-    print("[xai] Loading hybrid model for attention extraction ...")
-    model, x_all, edge_index_list, edge_type_tensor, isolated_mask, app_ids_arr, _ = load_model_and_inputs()
-    with torch.no_grad():
-        model(x_all, edge_index_list, edge_type_tensor, isolated_mask)
-    beta_r_tensor = model.last_beta_r.cpu().numpy() if model.last_beta_r is not None else np.ones(len(EDGE_TYPES)) / len(EDGE_TYPES)
+    # Raw (pre-scaling) values for readability (2026-07-23) — passthrough/count
+    # columns from the raw CSV, plus graph-degree counts (already computed
+    # above, no extra scan needed) so "degree_shares_ip" cards can show
+    # "38 application(s)" instead of a 0-1 scaled value.
+    raw_lookup = _build_raw_lookup()
+    for et, counts in degree_counts.items():
+        feature = f"degree_{et}"
+        for idx, c in enumerate(counts):
+            app_id = idx_to_id.get(idx)
+            if app_id is None:
+                continue
+            raw_lookup.setdefault(app_id, {})[feature] = (float(c), "application(s)")
+
+    # Attention (HAN only) needs a full-graph forward pass — genuinely
+    # unavoidable for HAN, but RGCN (the production default; HAN regresses
+    # per the 3-seed ablation) never uses beta_r, so skip the model load and
+    # forward pass entirely rather than pay for it on every context rebuild.
+    model = None
+    beta_r_tensor = None
+    if ENCODER_ARCH == "han":
+        from src.hybrid_graphmcm_v3 import load_model_and_inputs
+        import torch
+        print("[xai] Loading hybrid model for attention extraction (HAN) ...")
+        model, x_all, edge_index_list, edge_type_tensor, isolated_mask, app_ids_arr, _ = load_model_and_inputs()
+        with torch.no_grad():
+            model(x_all, edge_index_list, edge_type_tensor, isolated_mask)
+        beta_r_tensor = (model.last_beta_r.cpu().numpy() if model.last_beta_r is not None
+                         else np.ones(len(EDGE_TYPES)) / len(EDGE_TYPES))
+
+    return {
+        "features": features,
+        "raw_lookup": raw_lookup,
+        "hybrid_by_id": hybrid_df.set_index("application_id"),
+        "risk_by_id": risk_df.set_index("application_id"),
+        "has_predicted": has_predicted,
+        "dense_map": dense_map,
+        "dense_relational_sorted": dense_relational_sorted,
+        "deepsad_map": deepsad_map,
+        "deepsad_sorted": deepsad_sorted,
+        "ablation_map": ablation_map,
+        "feat_value_map": feat_value_map,
+        "subspace_map": subspace_map,
+        "fusion_contrib": fusion_contrib,
+        "evt": evt,
+        "trigger_map": trigger_map,
+        "neighbor_index": neighbor_index,
+        "id_to_idx": id_to_idx,
+        "idx_to_id": idx_to_id,
+        "binary_vals": binary_vals,
+        "stats": stats,
+        "model": model,
+        "beta_r_tensor": beta_r_tensor,
+    }
+
+
+def get_xai_context(force_reload: bool = False) -> dict:
+    """Cached population context — rebuilds only when a source file's mtime
+    changes (or force_reload=True), otherwise returns the in-process cache.
+    This is what makes build_card_for_app() cheap: the expensive
+    population-wide scan happens once per scoring cycle, not once per card."""
+    key = _ctx_cache_key()
+    if force_reload or _CTX_CACHE["key"] != key:
+        _CTX_CACHE["ctx"] = _build_xai_context()
+        _CTX_CACHE["key"] = key
+    return _CTX_CACHE["ctx"]
+
+
+def _assemble_card(app_id: str, ctx: dict) -> dict | None:
+    """Build one application's full evidence card from the cached context.
+    Returns None if the application isn't in the scored population. This is
+    the single source of truth for card assembly — both run_xai()'s batch
+    and build_card_for_app()'s on-demand path call this, so they can't drift."""
+    hybrid_by_id = ctx["hybrid_by_id"]
+    risk_by_id   = ctx["risk_by_id"]
+    if app_id not in hybrid_by_id.index or app_id not in risk_by_id.index:
+        return None
+
+    features       = ctx["features"]
+    has_predicted  = ctx["has_predicted"]
+    dense_map      = ctx["dense_map"]
+    dense_relational_sorted = ctx["dense_relational_sorted"]
+    feat_value_map = ctx["feat_value_map"]
+    subspace_map   = ctx["subspace_map"]
+    fusion_contrib = ctx["fusion_contrib"]
+    evt            = ctx["evt"]
+    trigger_map    = ctx["trigger_map"]
+    neighbor_index = ctx["neighbor_index"]
+    id_to_idx      = ctx["id_to_idx"]
+    idx_to_id      = ctx["idx_to_id"]
+    binary_vals    = ctx["binary_vals"]
+    stats          = ctx["stats"]
+    model          = ctx["model"]
+    beta_r_tensor  = ctx["beta_r_tensor"]
+    raw_lookup     = ctx.get("raw_lookup", {})
+
+    row = hybrid_by_id.loc[app_id]
+    risk_row = risk_by_id.loc[app_id]
+    node_idx = id_to_idx.get(app_id, -1)
+
+    per_feat    = json.loads(row["per_feature_error_json"])
+    predicted   = json.loads(row["per_feature_predicted_json"]) if has_predicted else None
+    actual_vals = feat_value_map.get(app_id, {})
+
+    # Validate key sets against schema
+    if set(per_feat.keys()) != set(features):
+        extra   = set(per_feat.keys()) - set(features)
+        missing = set(features) - set(per_feat.keys())
+        raise ValueError(
+            f"per_feature_error_json key mismatch for {app_id}. "
+            f"Extra: {extra}. Missing: {missing}."
+        )
+    if predicted is not None and set(predicted.keys()) != set(features):
+        raise ValueError(
+            f"per_feature_predicted_json key mismatch for {app_id}: "
+            f"key set does not match v3_feature_schema.json features."
+        )
+
+    # Graph connections: per-edge-type counts + population percentile
+    neighbors = neighbor_index.get(node_idx, [])
+    by_type: dict[str, list[int]] = {}
+    for n in neighbors:
+        by_type.setdefault(n["edge_type"], []).append(n["neighbor_idx"])
+    connections = []
+    for et, idxs in by_type.items():
+        count = len(idxs)
+        conn = {
+            "edge_type":  et,
+            "count":      count,
+            "sample_ids": [str(idx_to_id.get(i, f"idx:{i}")) for i in idxs[:TOP_K_NEIGHBORS]],
+            # Graph structure is a raw fact, not a model output — so it is
+            # tagged with the model(s) that CONSUME it. The RGCN graph stream
+            # reads every edge type; the shared-identity dense-block additionally
+            # reads shares_mobile/shares_ip only (pincode added 2026-07-22, then
+            # dropped same day — not a valid fraud signal on its own).
+            "consumed_by": (["hybrid", "dense_relational"]
+                             if et in ("shares_mobile", "shares_ip")
+                             else ["hybrid"]),
+        }
+        if et in stats.get("degree_sorted", {}):
+            conn["percentile"] = round(_pct_rank(stats["degree_sorted"][et], count), 2)
+        connections.append(conn)
+    connections.sort(key=lambda c: c["count"], reverse=True)
+
+    # Narrated evidence (narration policy applied): identifiers dropped,
+    # binaries grounded in the co-applicant distribution above.
+    neighbor_idxs = sorted({n["neighbor_idx"] for n in neighbors})
+    context_edge_label = (
+        EDGE_TYPE_LABELS.get(connections[0]["edge_type"],
+                             connections[0]["edge_type"].replace("_", " "))
+        if connections else None
+    )
+    top_feats = _top_features(
+        per_feat, actual_vals, TOP_K_FEATURES, predicted, stats,
+        neighbor_idxs=neighbor_idxs, binary_vals=binary_vals,
+        context_edge_label=context_edge_label,
+        raw_vals=raw_lookup.get(app_id),
+    )
+
+    neighbor_records = [
+        {"edge_type": n["edge_type"],
+         "application_id": str(idx_to_id.get(n["neighbor_idx"], f'idx:{n["neighbor_idx"]}'))}
+        for n in neighbors[:TOP_K_NEIGHBORS]
+    ]
+
+    # Subspace group evidence: score, percentile, EVT threshold, crossed
+    groups_ev: dict[str, dict] = {}
+    app_groups = subspace_map.get(app_id, {})
+    for g, g_score in app_groups.items():
+        g_ev: dict = {"score": round(float(g_score), 6), "source_model": "subspace"}
+        if g in stats.get("group_sorted", {}):
+            g_ev["percentile"] = round(_pct_rank(stats["group_sorted"][g], float(g_score)), 2)
+        thr = evt.get(f"subspace_if_{g}", {}).get("threshold")
+        if thr is not None:
+            g_ev["threshold"] = round(float(thr), 6)
+            g_ev["crossed"]   = bool(float(g_score) >= float(thr))
+        groups_ev[g] = g_ev
+
+    # EVT signal detail for fired triggers (observed vs fitted threshold)
+    triggers = trigger_map.get(app_id, [])
+    evt_signals: dict[str, dict] = {}
+    for t in triggers:
+        key = TRIGGER_SIGNAL_KEY.get(t)
+        sig = evt.get(key, {}) if key else {}
+        observed = None
+        if t == "EVT_HYBRID":
+            observed = float(row["hybrid_anomaly_score"])
+        elif t == "EVT_EDGE_RING":
+            observed = float(row["edge_pred_error"])
+        elif t == "EVT_FINANCIAL":
+            observed = app_groups.get("financial")
+        elif t == "EVT_IDENTITY":
+            observed = app_groups.get("identity")
+        elif t == "EVT_NETWORK":
+            observed = app_groups.get("network")
+        evt_signals[t] = {
+            "observed":  round(float(observed), 6) if observed is not None else None,
+            "threshold": round(float(sig["threshold"]), 6) if "threshold" in sig else None,
+            "q":         sig.get("q"),
+            "n_flagged": sig.get("n_flagged"),
+            "source_model": TRIGGER_MODEL.get(t),
+        }
+
+    # EVT crossings independent of promotion — a single crossed signal is
+    # real evidence even when it does not meet the multi-signal promotion
+    # requirement, and the narrative must not contradict itself about it.
+    evt_crossings = []
+    hyb_thr = evt.get("hybrid", {}).get("threshold")
+    if hyb_thr is not None and float(row["hybrid_anomaly_score"]) >= float(hyb_thr):
+        evt_crossings.append({
+            "signal":    "hybrid",
+            "label":     "hybrid-model overall anomaly score",
+            "observed":  round(float(row["hybrid_anomaly_score"]), 6),
+            "threshold": round(float(hyb_thr), 6),
+            "source_model": "hybrid",
+        })
+    edge_thr = evt.get("edge_pred_error", {}).get("threshold")
+    if edge_thr is not None and float(row["edge_pred_error"]) >= float(edge_thr):
+        evt_crossings.append({
+            "signal":    "edge_pred_error",
+            "label":     "graph-connectivity signal",
+            "observed":  round(float(row["edge_pred_error"]), 6),
+            "threshold": round(float(edge_thr), 6),
+            "source_model": "hybrid",
+        })
+    for g, g_ev in groups_ev.items():
+        if g_ev.get("crossed"):
+            evt_crossings.append({
+                "signal":    f"subspace_if_{g}",
+                "label":     GROUP_LABELS.get(g, g),
+                "observed":  g_ev["score"],
+                "threshold": g_ev["threshold"],
+                "source_model": "subspace",
+            })
 
     risk_sorted = stats["risk_sorted"]
     n_pop       = stats["n"]
+    score     = float(risk_row["risk_score_v3"])
+    label_src = risk_row["label_source"]
+    risk_rank = int(n_pop - np.searchsorted(risk_sorted, score, side="right")) + 1
+
+    evidence = {
+        "population_size":         n_pop,
+        "risk_rank":               risk_rank,
+        "risk_percentile":         round(_pct_rank(risk_sorted, score), 2),
+        "label_source":            label_src,
+        "evt_signals":             evt_signals,
+        "evt_crossings":           evt_crossings,
+        "subspace_groups":         groups_ev,
+        "graph_connections":       connections,
+        "isolated_population_pct": round(stats.get("isolated_pct", 0.0), 2),
+    }
+
+    if ENCODER_ARCH == "han" and node_idx != -1:
+        top_edges = model.top_alpha(node_idx, TOP_K_NEIGHBORS)
+        for edge in top_edges:
+            edge["neighbor_id"] = str(idx_to_id.get(edge["neighbor_idx"], f'idx:{edge["neighbor_idx"]}'))
+        attention_dict = {
+            "beta_r": {EDGE_TYPES[r]: float(beta_r_tensor[r]) for r in range(len(beta_r_tensor))},
+            "top_edges": top_edges
+        }
+    else:
+        attention_dict = None
+        
+    # Closed-form fusion breakdown — exact per-detector attribution for the
+    # max score-level fusion (subspace / dense-relational / hybrid). Provenance
+    # is ordered by normalised value, driver first (changed 2026-07-22: max
+    # fusion has exactly one driver, not a multi-detector "share" blend).
+    contrib = fusion_contrib.get(app_id, {})
+    evidence["fusion_contributions"] = contrib
+    evidence["provenance"] = [
+        DETECTOR_LABELS.get(k, k)
+        for k, c in sorted(contrib.items(), key=lambda kv: kv[1].get("normalized", 0.0), reverse=True)
+    ]
+
+    # Dense-block-relational membership evidence (mobile/IP specialist; pincode
+    # dropped 2026-07-22 -- not a valid fraud signal on its own).
+    # by_relation carries each relation's own raw score so the card can name
+    # WHICH shared identity value actually drove it, not just the combined max.
+    dense_scores = dense_map.get(app_id, {})
+    dense_rel_score = dense_scores.get("dense_block_score_relational", 0.0)
+    dense_rel_ev = {
+        "score": round(float(dense_rel_score), 6),
+        "source_model": "dense_relational",
+        "by_relation": {
+            rel: round(dense_scores[f"dense_block_score_{rel}"], 6)
+            for rel in ("mobile", "ip")
+            if f"dense_block_score_{rel}" in dense_scores
+        },
+    }
+    if dense_relational_sorted.size and dense_rel_score > 0.0:
+        dense_rel_ev["percentile"] = round(_pct_rank(dense_relational_sorted, float(dense_rel_score)), 2)
+    evidence["dense_block_relational"] = dense_rel_ev
+
+    # Deep SAD center-distance (V4.2, 2026-07-22) — SUPPLEMENTARY signal from a
+    # separate encoder/objective (center-pull vs. topology-exposure push, no
+    # reconstruction loss). Presentation-only per the narration policy: it does
+    # NOT feed fusion_contributions, risk_score_v3, or any EVT trigger — shown so
+    # a reviewer can see what a structurally different model saw, not to justify
+    # the fused score. See config_v3 DEEPSAD_* block for the validation numbers.
+    deepsad_score = ctx["deepsad_map"].get(app_id)
+    deepsad_ev = None
+    if deepsad_score is not None:
+        deepsad_ev = {"score": round(float(deepsad_score), 6), "source_model": "deepsad"}
+        if ctx["deepsad_sorted"].size:
+            deepsad_ev["percentile"] = round(_pct_rank(ctx["deepsad_sorted"], float(deepsad_score)), 2)
+    evidence["deepsad"] = deepsad_ev
+
+    # RGCN per-relation ablation (V4.3, 2026-07-22) — post-hoc answer to "which
+    # relation drove the model's neighbourhood-based expectation", since the
+    # production RGCN encoder (unlike the rejected HAN path) has no learned
+    # attention. delta = baseline_error - ablated_error per relation; positive
+    # means removing that relation's neighbours made this node fit BETTER
+    # (i.e. that relation's context is why the model's expectation looked off).
+    ablation_deltas = ctx["ablation_map"].get(app_id, {})
+    ablation_ev = None
+    if ablation_deltas:
+        by_rel = {c.replace("ablation_delta_", ""): round(v, 6) for c, v in ablation_deltas.items()}
+        top_rel, top_delta = max(by_rel.items(), key=lambda kv: kv[1])
+        ablation_ev = {
+            "by_relation": by_rel,
+            "top_relation": top_rel if top_delta > 0.0 else None,
+            "top_delta": round(top_delta, 6) if top_delta > 0.0 else 0.0,
+        }
+    evidence["relation_ablation"] = ablation_ev
+
+    # Model-traceability trail: for each fused model, what it is / reads, its
+    # own normalised value for THIS application, whether it was the ARGMAX
+    # driver of the fused score (max fusion, changed 2026-07-22 — no "share"
+    # any more, see build_fusion_contributions), and which EVT trigger(s) it
+    # raised. Ordered by normalised value. Every number here already exists
+    # above — this block only joins it to the static DETECTOR_REGISTRY text.
+    triggers_by_model: dict[str, list[str]] = {}
+    for t in triggers:
+        triggers_by_model.setdefault(TRIGGER_MODEL.get(t, "hybrid"), []).append(t)
+    trace_models = []
+    for k in sorted(DETECTOR_REGISTRY, key=lambda k: contrib.get(k, {}).get("normalized", 0.0), reverse=True):
+        reg = DETECTOR_REGISTRY[k]
+        c   = contrib.get(k, {})
+        is_driver = bool(c.get("is_driver", False))
+        fired = triggers_by_model.get(k, [])
+        entry = {
+            "key":            k,
+            "name":           reg["name"],
+            "what":           reg["what"],
+            "reads":          reg["reads"],
+            "catches":        reg["catches"],
+            "normalized":     c.get("normalized", 0.0),
+            "drove_score":    is_driver,
+            "margin_over_next": c.get("margin_over_next"),
+            "fired_triggers": fired,
+        }
+        # The honest gap: dense-block contributes to the score but never
+        # raises a self-training trigger — state it where a reader looks.
+        if k == "dense_relational" and is_driver and not fired:
+            entry["note"] = ("won the fused score but raises no self-training "
+                             "trigger (no EVT tail of its own)")
+        trace_models.append(entry)
+    evidence["model_trace"] = {
+        "fusion_formula": "risk = minmax( max( minmax(subspace), minmax(dense_relational), minmax(hybrid) ) )",
+        "models": trace_models,
+    }
+
+    card = {
+        "application_id":       app_id,
+        "risk_score_v3":        float(round(score, 6)),
+        "hybrid_anomaly_score": float(round(row["hybrid_anomaly_score"], 6)),
+        "feature_pred_error":   float(round(row["feature_pred_error"], 6)),
+        "attention":            attention_dict,
+        "edge_pred_error":      float(round(row["edge_pred_error"], 6)),
+        "review_status":        LABEL_SOURCE_DESCRIPTIONS.get(label_src, label_src),
+        "triggers":             triggers,
+        "top_feature_errors":   top_feats,
+        "top_graph_neighbors":  neighbor_records,
+        "evidence":             evidence,
+    }
+    # plain_summary (2026-07-23 readability pass): stored as its own field,
+    # not just the narrative's first sentence, so HTML rendering (xai_card_html_v3.py)
+    # can use it directly without re-parsing the joined narrative string.
+    card["plain_summary"] = _plain_summary(card)
+    card["narrative"] = _narrative(card)
+    return card
+
+
+def build_card_for_app(app_id: str, ctx: dict | None = None) -> dict | None:
+    """On-demand card for ANY application_id — not just the pre-computed
+    top-N batch run_xai() writes to explanation_cards_v3.json. Cost is one
+    row lookup against the cached population context (get_xai_context),
+    not a population-wide rescan, so this is what makes a card for
+    application #2,847,193 as cheap as one for #1 at 3-4M scale. Returns
+    None if the application isn't in the scored population.
+
+    Pass an already-fetched ctx (e.g. from a caller doing several lookups in
+    a row) to skip the cache-key check; otherwise it's fetched automatically."""
+    if ctx is None:
+        ctx = get_xai_context()
+    return _assemble_card(app_id, ctx)
+
+
+def run_xai(top_n: int = 500) -> None:
+    """Pre-computes the top-N reviewer batch (by fused risk) into
+    explanation_cards_v3.json — unchanged externally. Internally this is now
+    just get_xai_context() (cached) + _assemble_card() per app_id, the SAME
+    path build_card_for_app() uses, so the batch and on-demand cards can
+    never drift apart."""
+    print("[xai] run_xai() starting ...")
+    ctx = get_xai_context(force_reload=True)  # a fresh scoring cycle always rebuilds
+
+    risk_by_id = ctx["risk_by_id"]
+    top_ids = risk_by_id["risk_score_v3"].sort_values(ascending=False).head(top_n).index.tolist()
 
     cards = []
-    for _, row in merged_top.iterrows():
-        app_id   = row["application_id"]
-        node_idx = id_to_idx.get(app_id, -1)
-
-        per_feat    = json.loads(row["per_feature_error_json"])
-        predicted   = json.loads(row["per_feature_predicted_json"]) if has_predicted else None
-        actual_vals = feat_value_map.get(app_id, {})
-
-        # Validate key sets against schema
-        if set(per_feat.keys()) != set(features):
-            extra   = set(per_feat.keys()) - set(features)
-            missing = set(features) - set(per_feat.keys())
-            raise ValueError(
-                f"per_feature_error_json key mismatch for {app_id}. "
-                f"Extra: {extra}. Missing: {missing}."
-            )
-        if predicted is not None and set(predicted.keys()) != set(features):
-            raise ValueError(
-                f"per_feature_predicted_json key mismatch for {app_id}: "
-                f"key set does not match v3_feature_schema.json features."
-            )
-
-        # Graph connections: per-edge-type counts + population percentile
-        neighbors = neighbor_index.get(node_idx, [])
-        by_type: dict[str, list[int]] = {}
-        for n in neighbors:
-            by_type.setdefault(n["edge_type"], []).append(n["neighbor_idx"])
-        connections = []
-        for et, idxs in by_type.items():
-            count = len(idxs)
-            conn = {
-                "edge_type":  et,
-                "count":      count,
-                "sample_ids": [str(idx_to_id.get(i, f"idx:{i}")) for i in idxs[:TOP_K_NEIGHBORS]],
-                # Graph structure is a raw fact, not a model output — so it is
-                # tagged with the model(s) that CONSUME it. The RGCN graph stream
-                # reads every edge type; the shared-IP dense-block additionally
-                # reads shares_ip.
-                "consumed_by": (["hybrid", "dense_ip"] if et == "shares_ip" else ["hybrid"]),
-            }
-            if et in stats.get("degree_sorted", {}):
-                conn["percentile"] = round(_pct_rank(stats["degree_sorted"][et], count), 2)
-            connections.append(conn)
-        connections.sort(key=lambda c: c["count"], reverse=True)
-
-        # Narrated evidence (narration policy applied): identifiers dropped,
-        # binaries grounded in the co-applicant distribution above.
-        neighbor_idxs = sorted({n["neighbor_idx"] for n in neighbors})
-        context_edge_label = (
-            EDGE_TYPE_LABELS.get(connections[0]["edge_type"],
-                                 connections[0]["edge_type"].replace("_", " "))
-            if connections else None
-        )
-        top_feats = _top_features(
-            per_feat, actual_vals, TOP_K_FEATURES, predicted, stats,
-            neighbor_idxs=neighbor_idxs, binary_vals=binary_vals,
-            context_edge_label=context_edge_label,
-        )
-
-        neighbor_records = [
-            {"edge_type": n["edge_type"],
-             "application_id": str(idx_to_id.get(n["neighbor_idx"], f'idx:{n["neighbor_idx"]}'))}
-            for n in neighbors[:TOP_K_NEIGHBORS]
-        ]
-
-        # Subspace group evidence: score, percentile, EVT threshold, crossed
-        groups_ev: dict[str, dict] = {}
-        app_groups = subspace_map.get(app_id, {})
-        for g, g_score in app_groups.items():
-            g_ev: dict = {"score": round(float(g_score), 6), "source_model": "subspace"}
-            if g in stats.get("group_sorted", {}):
-                g_ev["percentile"] = round(_pct_rank(stats["group_sorted"][g], float(g_score)), 2)
-            thr = evt.get(f"subspace_if_{g}", {}).get("threshold")
-            if thr is not None:
-                g_ev["threshold"] = round(float(thr), 6)
-                g_ev["crossed"]   = bool(float(g_score) >= float(thr))
-            groups_ev[g] = g_ev
-
-        # EVT signal detail for fired triggers (observed vs fitted threshold)
-        triggers = trigger_map.get(app_id, [])
-        evt_signals: dict[str, dict] = {}
-        for t in triggers:
-            key = TRIGGER_SIGNAL_KEY.get(t)
-            sig = evt.get(key, {}) if key else {}
-            observed = None
-            if t == "EVT_HYBRID":
-                observed = float(row["hybrid_anomaly_score"])
-            elif t == "EVT_EDGE_RING":
-                observed = float(row["edge_pred_error"])
-            elif t == "EVT_FINANCIAL":
-                observed = app_groups.get("financial")
-            elif t == "EVT_IDENTITY":
-                observed = app_groups.get("identity")
-            elif t == "EVT_NETWORK":
-                observed = app_groups.get("network")
-            evt_signals[t] = {
-                "observed":  round(float(observed), 6) if observed is not None else None,
-                "threshold": round(float(sig["threshold"]), 6) if "threshold" in sig else None,
-                "q":         sig.get("q"),
-                "source_model": TRIGGER_MODEL.get(t),
-            }
-
-        # EVT crossings independent of promotion — a single crossed signal is
-        # real evidence even when it does not meet the multi-signal promotion
-        # requirement, and the narrative must not contradict itself about it.
-        evt_crossings = []
-        hyb_thr = evt.get("hybrid", {}).get("threshold")
-        if hyb_thr is not None and float(row["hybrid_anomaly_score"]) >= float(hyb_thr):
-            evt_crossings.append({
-                "signal":    "hybrid",
-                "label":     "hybrid-model overall anomaly score",
-                "observed":  round(float(row["hybrid_anomaly_score"]), 6),
-                "threshold": round(float(hyb_thr), 6),
-                "source_model": "hybrid",
-            })
-        edge_thr = evt.get("edge_pred_error", {}).get("threshold")
-        if edge_thr is not None and float(row["edge_pred_error"]) >= float(edge_thr):
-            evt_crossings.append({
-                "signal":    "edge_pred_error",
-                "label":     "graph-connectivity signal",
-                "observed":  round(float(row["edge_pred_error"]), 6),
-                "threshold": round(float(edge_thr), 6),
-                "source_model": "hybrid",
-            })
-        for g, g_ev in groups_ev.items():
-            if g_ev.get("crossed"):
-                evt_crossings.append({
-                    "signal":    f"subspace_if_{g}",
-                    "label":     GROUP_LABELS.get(g, g),
-                    "observed":  g_ev["score"],
-                    "threshold": g_ev["threshold"],
-                    "source_model": "subspace",
-                })
-
-        score     = float(row["risk_score_v3"])
-        label_src = row["label_source"]
-        risk_rank = int(n_pop - np.searchsorted(risk_sorted, score, side="right")) + 1
-
-        evidence = {
-            "population_size":         n_pop,
-            "risk_rank":               risk_rank,
-            "risk_percentile":         round(_pct_rank(risk_sorted, score), 2),
-            "label_source":            label_src,
-            "evt_signals":             evt_signals,
-            "evt_crossings":           evt_crossings,
-            "subspace_groups":         groups_ev,
-            "graph_connections":       connections,
-            "isolated_population_pct": round(stats.get("isolated_pct", 0.0), 2),
-        }
-
-        if ENCODER_ARCH == "han" and node_idx != -1:
-            top_edges = model.top_alpha(node_idx, TOP_K_NEIGHBORS)
-            for edge in top_edges:
-                edge["neighbor_id"] = str(idx_to_id.get(edge["neighbor_idx"], f'idx:{edge["neighbor_idx"]}'))
-            attention_dict = {
-                "beta_r": {EDGE_TYPES[r]: float(beta_r_tensor[r]) for r in range(len(beta_r_tensor))},
-                "top_edges": top_edges
-            }
-        else:
-            attention_dict = None
-            
-        # Closed-form fusion breakdown — exact per-detector contribution to the
-        # score-level fusion (subspace / dense-IP / hybrid). Provenance is the
-        # ordered list of detectors that actually contributed (>0.5% share).
-        contrib = fusion_contrib.get(app_id, {})
-        evidence["fusion_contributions"] = contrib
-        evidence["provenance"] = [
-            DETECTOR_LABELS.get(k, k)
-            for k, c in sorted(contrib.items(), key=lambda kv: kv[1].get("share", 0.0), reverse=True)
-            if c.get("share", 0.0) > 0.005
-        ]
-
-        # Dense-block-IP membership evidence (the IP specialist)
-        dense_ip_score = dense_map.get(app_id, {}).get("dense_block_score_ip", 0.0)
-        dense_ip_ev = {"score": round(float(dense_ip_score), 6), "source_model": "dense_ip"}
-        if dense_ip_sorted.size and dense_ip_score > 0.0:
-            dense_ip_ev["percentile"] = round(_pct_rank(dense_ip_sorted, float(dense_ip_score)), 2)
-        evidence["dense_block_ip"] = dense_ip_ev
-
-        # Model-traceability trail: for each fused model, what it is / reads, the
-        # exact share it contributed to THIS application's score (from the
-        # closed-form fusion), and which EVT trigger(s) it raised. Ordered by
-        # contribution share. Every number here already exists above — this block
-        # only joins it to the static DETECTOR_REGISTRY descriptions.
-        triggers_by_model: dict[str, list[str]] = {}
-        for t in triggers:
-            triggers_by_model.setdefault(TRIGGER_MODEL.get(t, "hybrid"), []).append(t)
-        trace_models = []
-        for k in sorted(DETECTOR_REGISTRY, key=lambda k: contrib.get(k, {}).get("share", 0.0), reverse=True):
-            reg = DETECTOR_REGISTRY[k]
-            c   = contrib.get(k, {})
-            share = c.get("share", 0.0)
-            fired = triggers_by_model.get(k, [])
-            entry = {
-                "key":            k,
-                "name":           reg["name"],
-                "what":           reg["what"],
-                "reads":          reg["reads"],
-                "catches":        reg["catches"],
-                "fusion_weight":  reg["weight"],
-                "share":          share,
-                "normalized":     c.get("normalized", 0.0),
-                "drove_score":    share > 0.005,
-                "fired_triggers": fired,
-            }
-            # The honest gap: dense-block contributes to the score but never
-            # raises a self-training trigger — state it where a reader looks.
-            if k == "dense_ip" and share > 0.005 and not fired:
-                entry["note"] = ("contributes to the fused score but raises no "
-                                 "self-training trigger (no EVT tail of its own)")
-            trace_models.append(entry)
-        evidence["model_trace"] = {
-            "fusion_formula": (f"risk = minmax({FUSION_W_SUBSPACE:g}·subspace + "
-                               f"{FUSION_W_DENSE_IP:g}·dense_ip + {FUSION_W_HYBRID:g}·hybrid)"),
-            "models": trace_models,
-        }
-
-        card = {
-            "application_id":       app_id,
-            "risk_score_v3":        float(round(score, 6)),
-            "hybrid_anomaly_score": float(round(row["hybrid_anomaly_score"], 6)),
-            "feature_pred_error":   float(round(row["feature_pred_error"], 6)),
-            "attention":            attention_dict,
-            "edge_pred_error":      float(round(row["edge_pred_error"], 6)),
-            "review_status":        LABEL_SOURCE_DESCRIPTIONS.get(label_src, label_src),
-            "triggers":             triggers,
-            "top_feature_errors":   top_feats,
-            "top_graph_neighbors":  neighbor_records,
-            "evidence":             evidence,
-        }
-        card["narrative"] = _narrative(card)
-        cards.append(card)
+    for app_id in top_ids:
+        card = _assemble_card(app_id, ctx)
+        if card is not None:
+            cards.append(card)
 
     OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
     OUT_JSON.write_text(json.dumps(cards, indent=2))

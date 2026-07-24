@@ -35,6 +35,19 @@ class ConfirmPatternRequest(BaseModel):
 
 class PromotePatternRequest(BaseModel):
     pattern_ids: list[str]
+    mode: str = "incremental"   # "incremental" | "full_retrain"
+    smoke_test: bool = False
+
+
+class RetrainPatternsRequest(BaseModel):
+    """Dispatch a retrain over the flagged-history store, independent of the
+    pending-queue promote flow — covers patterns already PROMOTED (their
+    topology is already in synthetic_exposure_graph_v3.pt; this just (re)runs
+    training) as well as any still CONFIRMED/SELECTED (promoted first, same as
+    /patterns/promote, so their topology lands before the chosen job runs).
+    pattern_ids empty/omitted = every non-REJECTED pattern in the store."""
+    pattern_ids: list[str] = []
+    mode: str = "incremental"   # "incremental" | "full_retrain"
     smoke_test: bool = False
 
 
@@ -112,6 +125,32 @@ class FraudStoreSummaryResponse(BaseModel):
 
 
 # ── Drift simulation / human-gated retraining ────────────────────────────────
+
+class PushDatasetRequest(BaseModel):
+    """CSV-free portal/ETL push: names a raw-schema CSV that a sender (a
+    portal, an ETL job, a script) already wrote to a server-side path — e.g.
+    a shared volume both it and nic-api can reach. No inline row payload
+    (deliberately, for scale — 3-4M rows as JSON in a request body doesn't
+    hold up; a file path does). Schema-checked the same way as the console's
+    upload-dataset, then auto-evaluated in the background — Merge/retrain
+    stay a separate, human-gated step (POST /v3/training/decision)."""
+    dataset_path: str   # server-side path, e.g. "data/incoming/portal_batch_2026_07_24.csv"
+    name: Optional[str] = None   # batch/cohort name; defaults to the file stem
+
+
+class PushDatasetResponse(BaseModel):
+    dataset_path: str
+    name: str
+    n_rows: int
+    n_cols: int
+    schema_ok: bool
+    missing_columns: list[str]
+    extra_columns: list[str]
+    duplicate_ids: list[str]
+    staged_batch: Optional[dict] = None
+    job_id: Optional[str] = None   # set only when schema_ok — auto-evaluate job
+    message: str = ""
+
 
 class EvaluateDatasetRequest(BaseModel):
     dataset_path: str   # e.g. "data/raw/new_cohort_2026.csv" — raw schema, unseen application_ids

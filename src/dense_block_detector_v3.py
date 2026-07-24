@@ -112,11 +112,18 @@ def dense_block_scores(
 ) -> pd.DataFrame:
     """
     Returns DataFrame: application_id, dense_block_score_<relation_name> for each
-    active DENSE_BLOCK_RELATIONS. Score = camouflage-weighted density of the densest block
-    the node belongs to, min-max normalised to [0,1] per relation.
+    active DENSE_BLOCK_RELATIONS (score = camouflage-weighted density of the
+    densest block the node belongs to, min-max normalised to [0,1] per relation),
+    PLUS dense_block_score_relational — DENSE_BLOCK_RELATION_WEIGHTS applied to
+    each relation's own normalised score, then max-combined across relations.
+    Max (not sum/average) so whichever relation is actually elevated for a given
+    node dominates, rather than being diluted by the other two; weighted (not
+    equal) so IP — the dominant real fraud vector for this population — can't be
+    outranked by ordinary, non-fraud density in mobile/pincode elsewhere in the
+    population (see config_v3 comment + README changelog 2026-07-22).
     """
-    from src.config_v3 import EDGE_TYPES
-    
+    from src.config_v3 import EDGE_TYPES, DENSE_BLOCK_RELATION_WEIGHTS
+
     col_names = []
     scores = {}
     for r in DENSE_BLOCK_RELATIONS:
@@ -175,7 +182,13 @@ def dense_block_scores(
     df = pd.DataFrame({"application_id": app_ids})
     for col in col_names:
         df[col] = scores[col]
-        
+
+    weighted = [
+        DENSE_BLOCK_RELATION_WEIGHTS.get(r, 1.0) * scores[f"dense_block_score_{EDGE_TYPES[r].replace('shares_', '')}"]
+        for r in DENSE_BLOCK_RELATIONS
+    ]
+    df["dense_block_score_relational"] = np.maximum.reduce(weighted) if weighted else np.zeros(n_nodes, dtype=np.float32)
+
     return df
 
 

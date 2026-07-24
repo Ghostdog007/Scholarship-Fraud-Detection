@@ -434,7 +434,16 @@ document.getElementById("cohort-select").addEventListener("change", (e) => {
 document.getElementById("btn-remove-cohort").addEventListener("click", async () => {
   if (!currentCohort) return;
   const name = currentCohort;
-  if (!confirm(`Remove the evaluated cohort "${name}" from the console?\n\nThis deletes its read-only preview files only — the base data and the downloadable sample CSV are NOT touched. Re-evaluate the CSV to bring it back.`)) return;
+  if (!confirm(
+    `Remove the evaluated cohort "${name}"?\n\n` +
+    `⚠ This DISCARDS all of the cohort's outputs on the server:\n` +
+    `   • its explanation / reviewer cards\n` +
+    `   • its 3D identity rings and ego-graphs\n` +
+    `   • its pre-fusion scores and evidence\n` +
+    `   • its uploaded CSV\n\n` +
+    `The base 15k data and the downloadable sample CSV are NOT touched.\n` +
+    `To see this cohort again you must re-upload and re-evaluate the CSV.`
+  )) return;
   try {
     const res = await apiPost(`/v3/monitoring/cohort/${encodeURIComponent(name)}/delete`, {});
     toast(`Removed cohort "${name}" (${res.removed.length} file(s)).`, "success");
@@ -884,6 +893,8 @@ function updateFlaggedSelectionUI() {
   const n = flaggedSelected.size;
   document.getElementById("fh-count").textContent = `${n} selected`;
   document.getElementById("btn-delete-flagged").disabled = n === 0;
+  document.getElementById("btn-export-flagged-selected").disabled = n === 0;
+  document.getElementById("btn-retrain-flagged-selected").disabled = n === 0;
   const all = document.getElementById("fh-select-all");
   const chks = document.querySelectorAll("#flagged-history-body .fh-check");
   all.checked = chks.length > 0 && [...chks].every((c) => c.checked);
@@ -929,15 +940,26 @@ document.getElementById("btn-delete-flagged").addEventListener("click", async ()
 
 document.getElementById("btn-refresh-flagged-history").addEventListener("click", loadFlaggedHistory);
 
+document.getElementById("btn-export-flagged-bulk").addEventListener("click", () => {
+  downloadUrl("/v3/supervisor/patterns/export/bulk");
+});
+
+document.getElementById("btn-export-flagged-selected").addEventListener("click", () => {
+  const ids = [...flaggedSelected];
+  if (!ids.length) return;
+  downloadUrl(`/v3/supervisor/patterns/export/selected?ids=${ids.map(encodeURIComponent).join(",")}`);
+});
+
 document.getElementById("btn-promote").addEventListener("click", async () => {
   const ids = Array.from(document.querySelectorAll(".pattern-check:checked")).map((c) => c.value);
   if (!ids.length) { toast("Select at least one pattern.", "error"); return; }
   const smoke_test = document.getElementById("chk-smoke-test").checked;
+  const mode = document.getElementById("promote-retrain-mode").value;
   const statusEl = document.getElementById("promote-job-status");
   statusEl.style.display = "block";
   statusEl.textContent = "Dispatching…";
   try {
-    const res = await apiPost("/v3/supervisor/patterns/promote", { pattern_ids: ids, smoke_test });
+    const res = await apiPost("/v3/supervisor/patterns/promote", { pattern_ids: ids, mode, smoke_test });
     statusEl.textContent = `${res.message} job_id=${res.job_id}`;
     toast("Retrain dispatched.", "success");
     pollJob(res.job_id, statusEl);
@@ -946,6 +968,37 @@ document.getElementById("btn-promote").addEventListener("click", async () => {
     statusEl.textContent = `Failed: ${e.message}`;
     toast(`Failed: ${e.message}`, "error");
   }
+});
+
+// Retrain directly from the flagged-history store — covers already-PROMOTED
+// patterns (topology already appended, this just (re)runs training) as well
+// as any still CONFIRMED/SELECTED among the selection (promoted first).
+async function retrainFlagged(pattern_ids) {
+  const mode = document.getElementById("flagged-retrain-mode").value;
+  const smoke_test = document.getElementById("chk-flagged-smoke-test").checked;
+  const statusEl = document.getElementById("flagged-retrain-job-status");
+  statusEl.style.display = "block";
+  statusEl.textContent = "Dispatching…";
+  try {
+    const res = await apiPost("/v3/supervisor/patterns/retrain", { pattern_ids, mode, smoke_test });
+    statusEl.textContent = `${res.message} job_id=${res.job_id}`;
+    toast("Retrain dispatched.", "success");
+    pollJob(res.job_id, statusEl);
+  } catch (e) {
+    statusEl.textContent = `Failed: ${e.message}`;
+    toast(`Failed: ${e.message}`, "error");
+  }
+}
+
+document.getElementById("btn-retrain-flagged-selected").addEventListener("click", () => {
+  const ids = [...flaggedSelected];
+  if (!ids.length) return;
+  retrainFlagged(ids);
+});
+
+document.getElementById("btn-retrain-flagged-all").addEventListener("click", () => {
+  if (!confirm("Retrain over every non-rejected flagged pattern? This promotes any not yet promoted, then dispatches the chosen retrain job.")) return;
+  retrainFlagged([]);
 });
 
 async function pollJob(jobId, statusEl, intervalMs = 3000, maxTries = 200) {
@@ -1314,6 +1367,41 @@ document.getElementById("btn-poll-job").addEventListener("click", () => {
   if (!jobId) return;
   out.style.display = "block";
   pollJob(jobId, out);
+});
+
+document.getElementById("btn-upload-ckpt").addEventListener("click", async () => {
+  const fileInput = document.getElementById("ckpt-file");
+  const out = document.getElementById("ckpt-upload-status");
+  const file = fileInput.files[0];
+  if (!file) { toast("Choose a .pth checkpoint file first.", "error"); return; }
+  if (!file.name.endsWith(".pth")) { toast("File must be a .pth checkpoint.", "error"); return; }
+  if (!confirm(`Upload ${file.name} (${(file.size / 1048576).toFixed(1)} MB)? ` +
+      `If validation passes, it becomes the live model.`)) return;
+
+  const form = new FormData();
+  form.append("file", file);
+  form.append("cycle", document.getElementById("ckpt-cycle").value.trim() || "unknown");
+  form.append("source_ref", document.getElementById("ckpt-source").value.trim() || "console-upload");
+
+  out.style.display = "block";
+  out.textContent = `Uploading ${file.name}…`;
+  try {
+    const res = await fetch(API_BASE + "/v3/training/upload-checkpoint", {
+      method: "POST",
+      body: form,   // multipart — browser sets the boundary header itself
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(payload.detail || `HTTP ${res.status}`);
+    out.textContent = JSON.stringify(payload, null, 2);
+    toast("Checkpoint uploaded — validating.", "success");
+    if (payload.job_id) {
+      document.getElementById("poll-job-id").value = payload.job_id;
+      pollJob(payload.job_id, out);
+    }
+  } catch (e) {
+    out.textContent = `Failed: ${e.message}`;
+    toast(`Upload failed: ${e.message}`, "error");
+  }
 });
 
 document.getElementById("btn-rollback").addEventListener("click", async () => {

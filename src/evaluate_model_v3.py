@@ -40,7 +40,7 @@ from sklearn.metrics import average_precision_score
 
 from src.config_v3 import (
     DEGREE_FEATURES,
-    LAMBDA_EDGE,
+    LAMBDA_EDGE_SCORE,
     N_EDGE_TYPES,
     RANDOM_SEED,
     SUBSPACE_GROUPS,
@@ -201,7 +201,7 @@ def _score_injected_nodes_hybrid(model, x_inject: torch.Tensor) -> np.ndarray:
             torch.zeros(n, N_EDGE_TYPES, device=device),
             reduction="none",
         ).mean(dim=1)
-        scores = (feat_err + LAMBDA_EDGE * edge_err).cpu().numpy()
+        scores = (feat_err + LAMBDA_EDGE_SCORE * edge_err).cpu().numpy()
     return scores.astype(np.float32)
 
 

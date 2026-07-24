@@ -1,1968 +1,311 @@
-# NIC Fraud Detection — V3 Hybrid GraphMCM (V4 encoder swap in progress): Agent Context File
-<!-- VERSION: 3.0-final (V3 baseline) + V4-ADR-015-draft | OWNER: Project Lead | LAST REVIEWED: 2026-07-03 -->
-<!-- DO NOT MODIFY AUTONOMOUSLY. Flag outdated content; only project lead edits this file. -->
+# AGENTS.md — V4-Scale Working Contract
+
+<!-- VERSION: 3.0 (V4-Scale rewrite, 2026-07-21, applied under explicit project-lead
+     direction for branch V4-Scale — see .claude/CLAUDE.md hard stop #8) -->
+<!-- OWNER: Project Lead. Agents do not modify this file autonomously; flag and
+     propose a redline instead. -->
+<!-- Pre-rewrite AGENTS.md (2,377 lines incl. Appendix H result tables) is preserved
+     in git history: `git show 9b772de:docs/AGENTS.md` on main. -->
+
+You are working on the **scale phase** of the NIC scholarship fraud detection
+system. The detection architecture is **fixed and validated** — you are
+migrating its I/O boundaries to PostgreSQL and its training loop to
+mini-batch sampling so it runs at 3–4 million applications on a CPU-only
+Kubernetes server. You are **not** redesigning detection.
+
+Read order for a cold start:
+1. This file — the contract.
+2. `TECHNICAL_REFERENCE_AND_SCALING.md` — Part I: how every component works
+   today; Part II: the target architecture (Postgres schema, hub-capped edges,
+   NeighborLoader, pod sizing). The single deepest reference.
+3. `IMPLEMENTATION.md` — the 5-step migration plan with acceptance gates.
+4. `HISTORY.md` — how we got here, with the metrics. Read-only; never extend.
+5. `.claude/CLAUDE.md` — session instructions and hard stops. Binding.
 
 ---
 
-## V4 — WHAT THIS BRANCH IS (read before anything else below)
-
-This branch (`v4-han-graphmcm`) is a **graph-stream capability upgrade** made of
-two chained decisions, plus the human workflow that feeds them:
-
-1. **ADR-015 — HAN encoder.** Replace the RGCN graph encoder inside
-   `src/hybrid_graphmcm_v3.py` with a HAN-style two-level attention encoder
-   (node-level GAT per relation + semantic β_r fusion across relations). This
-   also yields per-application **attention attribution** — which neighbors and
-   which relations the model weighted when scoring a node ("focused on these
-   shared-IP edges"), exported as an XAI diagnostic.
-2. **ADR-016 — topology synthetic exposure + supervisor review cycle.** Teach
-   the model confirmed fraud *shapes*, not just scalar degree counts. Confirmed
-   clusters are captured as subgraphs, staged in a review queue, visualized on
-   the FastAPI surface (IDs kept, 1-hop, ~50-node cap), and — on supervisor
-   selection — spliced into the synthetic exposure set for a batched, human-
-   triggered retrain. `model_registry.json` + the admin console's run history
-   are the audit/lineage record (originally MLflow — since removed, see the
-   ADR-016 status addendum); FastAPI is the only interactive + action surface.
-
-See ADR-015 and ADR-016 (Appendix F) for the full decision records.
-
-**Build order (do not reorder — B/C produce the ablation numbers that justify E):**
-A. Docs (this block + ADRs). B. HAN encoder + full run, store results.
-C. Topology exposure + full run, store results. D. Attention attribution export
-into XAI. E. Rendering + supervisor review cycle (FastAPI). Read-only cluster
-visualization may precede E as a diagnostic; the exposure-splice and promote
-actions come after C is proven.
-
-**The ablation that governs this branch** (same seed, same Phase D harness,
-per-category PR-AUC): (1) RGCN + feature exposure = the V3 baseline below;
-(2) HAN + feature exposure = isolates the encoder; (3) HAN + topology exposure
-= isolates the exposure mechanism. Report Δ(2−1) as HAN's contribution and
-Δ(3−2) as topology exposure's contribution. **Known confound to report
-honestly:** the current exposure path collapses every exposure node to the
-single `isolated_embedding` in the graph stream (see `_get_synth_h` /
-`encode_graph`), so config-2 feature exposure is weak by construction and
-config-3 partly *fixes* that plumbing — Δ(3−2) means "topology exposure that
-actually reaches the encoder," not "topology vs scalar" in isolation. Add a
-4th config to separate those if the distinction matters.
-
-### V4 ABLATION RESULTS — 3 seeds (42/43/44), recorded 2026-07-04
-
-Configs actually run (the project lead sequenced topology-first, so the encoder
-is held at RGCN while topology is added, then HAN is added on top):
-**①** RGCN + feature exposure (baseline) · **②** RGCN + topology exposure ·
-**③** HAN + topology exposure. Metric = connected-cluster PR-AUC (the
-graph-sensitive T1 harness; the old isolated-node table is subspace-IF-only and
-does NOT move with the encoder — verified constant within each seed).
+## 1. The fixed detection architecture (do not relitigate)
 
 ```
-Connected PR-AUC (mean ± std over 3 seeds)   ①RGCN+feat   ②RGCN+topo   ③HAN+topo
-ip_concentration                             0.303±0.03   0.464±0.15   0.376±0.02
-mother_name_collision                        0.484±0.04   0.652±0.08   0.392±0.09
-fee_inflation                                0.062±0.01   0.099±0.03   0.036±0.00
-age_violation                                0.062±0.02   0.049±0.00   0.033±0.00
-income_violation                             0.069±0.03   0.063±0.02   0.033±0.00
-MEAN                                         0.196±0.02   0.265±0.02   0.174±0.02
-score_retention                              2.70±0.33    3.90±0.52    1.18±0.15
-Paired Δ topology (②−①): +0.069 ± 0.034  per-seed [+0.072,+0.027,+0.110]  (all +)
-Paired Δ HAN      (③−②): −0.091 ± 0.032  per-seed [−0.099,−0.050,−0.126]  (all −)
+raw applications (PostgreSQL `applications` / today: data/raw CSV)
+   → tabular_feature_engine_v3  : 44 numeric features, MinMax-scaled
+   → graph_builder_v3           : 5-relation identity graph
+       (shares_mobile, shares_ip, shares_father_name,
+        shares_mother_name, shares_pincode)
+   → three FUSED detectors, all higher = more anomalous:
+       hybrid_graphmcm_v3       : 8-mask feature stream + RGCN graph stream
+                                  (root_weight=False since 2026-07-22 — pure
+                                  neighbor aggregation, no self-leak around
+                                  the MCM mask)
+                                  → hybrid_anomaly_score
+                                    = feature_pred_error + LAMBDA_EDGE_SCORE·edge_pred_error
+                                    (LAMBDA_EDGE_SCORE=0.0 since 2026-07-23 —
+                                    edge_pred_error still trains and is still
+                                    computed/available for XAI, just excluded
+                                    from the ranking score; see below)
+       subspace_if_v3           : per-group IF (financial/identity/network)
+       dense_block_detector_v3  : FRAUDAR-style peeling over shares_mobile +
+                                  shares_ip (independently peeled,
+                                  IP-priority-weighted max-combined — was
+                                  shares_ip only, extended to mobile+ip+
+                                  pincode 2026-07-22, pincode dropped same
+                                  day per lead direction: shared pincode
+                                  reflects legitimate geographic clustering,
+                                  not collusion, on its own)
+   → evt_scorer_v3              : GPD tail thresholds (the only thresholds allowed)
+   → LOCKED fusion              : final_risk = minmax(max(minmax(subspace),
+                                     minmax(dense_relational), minmax(hybrid)))
+                                   (since 2026-07-22; was a weighted sum)
+   → self_training_loop_v3      : EVT-tail pseudo-labels, HUMAN-GATED
+   → xai_layer_v3 / xai_card_html_v3 : evidence cards (JSON + HTML)
+
+A 4th detector, deepsad_detector_v3 (Deep SAD center-distance: separate
+RGCN encoder, center-pull/exposure-push, no reconstruction loss), runs
+alongside but is NOT fused — tested directly as a 4th max-fusion input and
+rejected (2026-07-22: candidate 4-way scored 0.4181 vs the locked 3-way's
+0.4182 on stress_testing_1, noise-level). It reads into xai_layer_v3 only,
+as a supplementary XAI-card signal, never into final_risk_score.
+
+A post-hoc RGCN per-relation ablation (hybrid_graphmcm_v3.compute_relation_
+ablation, 2026-07-22) also runs alongside, XAI-only: re-scores the LOCKED
+checkpoint 5 extra times (once per edge type, masked out via edge_type_tensor)
+and reports, per node, which relation's removal improved feature-reconstruction
+fit the most — the RGCN's answer to "which relation drove the neighbourhood
+expectation," since RGCN (unlike the rejected HAN path) has no learned
+attention. Writes outputs/relation_ablation_v3.csv; never touches the
+checkpoint, fusion, or any threshold.
 ```
 
-**Verdict — topology synthetic exposure (ADR-016): ADOPT.** Positive in all 3
-seeds (~2σ), concentrated in the two relational categories injected as cliques
-(IP +53%, mother-name +35%), and it *raises* robustness (score_retention
-2.70→3.90). Modest not dramatic: the single-seed pilot overstated it (+0.113);
-the 3-seed truth is **+0.069 mean (~+35% relative)**. Mechanism confirmed —
-config-1 Stage-1 printed `h_synth.std=0.0000` (feature exposure collapses to
-`isolated_embedding`, teaching the graph stream nothing); topology exposure
-gives std>0.
-
-**Verdict — HAN encoder (ADR-015): DO NOT ADOPT as a drop-in.** Reliably
-*worse* than RGCN+topology in all 3 seeds (−0.091 mean, ~3σ) — robust, not seed
-noise. Worst on the dense mother-name clique (−0.26); its only occasional win
-(IP) flips sign across seeds. score_retention collapses to 1.18: HAN
-over-relies on graph edges and **over-smooths dense cliques** (attention
-averages homogeneous neighbours → a fraud clique reconstructs *well* → low
-anomaly score → worse detection — "consensus fraud looks locally normal," made
-worse by attention). Likely compounded by the global-β_r simplification
-(one relation-weight vector for the whole graph, not per-node). Before any
-reconsideration: implement per-node β_r + an HAN hyperparameter pass, then
-re-run this ablation. Until then the shipping config is **② RGCN + topology
-exposure**; set `ENCODER_ARCH="rgcn"`, `TOPO_EXPOSURE_ENABLED=True`
-(this is now the `config_v3.py` default).
-
-### V4 — CURRENT STATE & NEXT-SESSION HANDOFF (2026-07-04)
-
-**What is implemented and committed on `v4-han-graphmcm`:**
-- **Topology synthetic exposure (ADR-016) — validated, shipping.**
-  `synthetic_exposure_builder_v3.build_topology_exposure()` writes
-  `data/processed/synthetic_exposure_graph_v3.pt` (connected fraud cliques);
-  `hybrid_graphmcm_v3._get_synth_h_topology()` feeds them through the encoder
-  in Stage 1 (fixes the `isolated_embedding` collapse). Built by `main_v3.py`
-  Step 4 when `TOPO_EXPOSURE_ENABLED`.
-- **HAN encoder (ADR-015) — implemented but NOT shipping.** `HANEncoder` in
-  `hybrid_graphmcm_v3.py`, selected by `ENCODER_ARCH` (both encoders kept).
-  3-seed ablation says it regresses as a drop-in (see results above).
-- **Connected-cluster eval (T1):** `evaluate_model_v3.evaluate_connected()`,
-  run via `python -m src.evaluate_model_v3 --connected --ablation-tag <tag>`
-  (NOTE the `-m` form; `python src/evaluate_model_v3.py` breaks on `from src.`).
-- **Attention attribution (T4):** `xai_layer_v3.py` reads `model.last_beta_r`
-  and `model.top_alpha()` into each card's `attention` object. Known
-  deviation: `last_beta_r` is a global `[5]` vector, not per-node.
-- **Supervisor cycle + viz (T6):** `topology_view.py`,
-  `confirmed_fraud_graph_store.py`, new endpoints in `api/handlers/
-  {monitoring,supervisor}.py`. Built and smoke-tested. The promote/
-  exposure-write action path is **implemented (2026-07-15)**:
-  `confirmed_fraud_graph_store.promote()` appends each promoted pattern's
-  real subgraph (via `pattern_ingest_v3.append_ring_to_topology_exposure`)
-  as one cluster in `synthetic_exposure_graph_v3.pt`, recording the result
-  in the pattern's `exposure` field. Note: MLflow was later removed from the
-  stack (replaced by `model_registry.json` + the admin console); the SVG
-  logging referenced in ADR-016 no longer exists — see the ADR-016 status
-  addendum.
-- **Reviewer-card presentation + review loop (2026-07-06):** new module
-  `src/xai_card_html_v3.py` renders the evidence-first cards
-  (`explanation_cards_v3.json`) as interactive HTML — **suspicious/flagged
-  applications only** — with an identity ego-graph, per-detector signal bars,
-  the **closed-form fusion split** (subspace/dense-IP/hybrid shares), and a
-  per-field declared-vs-model-expected breakdown. The 3D Plotly ring is **lazy**
-  (computed on link-click, never batched). Served by three read-only HTML
-  endpoints — `GET /v3/monitoring/{app_id}/card` and `/ring`, driving one-click
-  review via the card's buttons → `POST /v3/supervisor/{confirm-fraud,
-  mark-false-positive,clear-label}`. `clear-label` (new; `remove_label()` in
-  `confirmed_fraud_store.py`) undoes a label so the detection loop can be
-  re-demoed. `main_v3.py` renders the cards after `run_xai` (originally also
-  logged to MLflow as a `cards` artifact — MLflow since removed; cards are
-  served from `outputs/cards/` directly). The dead LightGBM/SHAP
-  path in `xai_layer_v3.py` was replaced with the exact closed-form fusion
-  attribution. (Also fixed a pre-existing committed syntax error in
-  `api/handlers/supervisor.py` — an unterminated module docstring — that had
-  kept the whole FastAPI app unimportable.) Docs: `IMPLEMENTATION.md`,
-  `OPERATIONS_RUNBOOK.md` §4.4, `API_TESTING_GUIDE.md` §2.3/§5.3.
-- Ablation record: `outputs/ablation/*.json` (9 runs). Reproduce with env vars
-  `V4_SEED`, `V4_ENCODER_ARCH`, `V4_TOPO_EXPOSURE` (see `config_v3.py`).
-  Smoke harness: `scripts/smoke_v4.py`.
-
-**Files to view first next session:** this block → `docs/IMPLEMENTATION.md`
-(settled layered architecture) → Appendix H (comparison results) →
-`src/hybrid_graphmcm_v3.py` (encoders) → `src/config_v3.py` (switches) →
-`outputs/ablation/tier_comparison.json` (numbers).
-
-**Strategy — how to get attention's benefits (the ablation showed HAN-as-
-detector hurts because better reconstruction lowers anomaly on cliques):**
-- **Tier 1 (recommended, no regression):** keep RGCN+topology as the detector;
-  use a lightweight attention head only for (a) supervisor edge attribution
-  (T4, already scaffolded) and (b) attention-summary features (per-relation
-  β_r, α concentration/entropy) fed into the LightGBM fusion classifier, so
-  attention informs the score *discriminatively*, never by easing
-  reconstruction.
-- **Tier 2 (only if attention must be the encoder):** per-node β_r; residual /
-  GATv2 + edge/attention dropout + 1-hop (counter over-smoothing / the 1.18
-  score_retention); and a one-class/contrastive or density-aware term so a
-  clique's reconstructability stops meaning "normal." Then re-run the 3-seed
-  ablation. Speculative, against current evidence.
-- **Tier 3 (research):** score by attention anomaly (α-entropy / β-divergence)
-  instead of reconstruction — fraud rings show peaked attention.
-
-**Scope note (project-lead directed, 2026-07-03):** `src/*.py` changes ARE
-authorized on this branch for the above work (this is an ML-architecture
-program, a directed exception to the F.0 "no src modification" MLOps
-invariant). Every change must be explained. **The `_v3` file/module/route
-names still do NOT change** — "V4" is the capability label, not a rename. A
-prior session's blanket `_v3`→`_v4` rename was reverted because it collided
-with the ADR-015/016 usage of "V4" and destabilized MLOps/API surfaces. If
-asked to "rename V3 to V4," stop and confirm — the answer is no.
-
-Everything below this block, and everything in
-`docs/OPERATIONS_RUNBOOK.md` / `docs/API_TESTING_GUIDE.md`, describes the V3
-system as it runs today — file names, `src/*_v3.py` paths, `/v3/...` routes,
-checkpoint paths (`models/hybrid_graphmcm_v3.pth`), and curl commands are
-unchanged. The V4 work adds capability inside those files; it does not rename
-them.
-
-**V3 baseline metrics (recorded before any V4 work, do not overwrite —
-see §5.1 for the full table and floors):**
-```
-AGE_VIOLATION             | V2 Floor: 0.1466 | V3 Score: 0.3417 (demographic IF) | PASS
-INCOME_VIOLATION          | V2 Floor: 0.6503 | V3 Score: 0.9063 (financial IF)   | PASS
-IP_CONCENTRATION          | V2 Floor: 0.0370 | V3 Score: 0.1184 (network IF)     | PASS
-MOTHER_NAME_COLLISION     | V2 Floor: 0.2869 | V3 Score: 0.5206 (identity IF)    | PASS
-FEE_INFLATION             | V2 Floor: 0.4962 | V3 Score: 0.7420 (financial IF)   | PASS
-Isolated-node stratum PR-AUC: 0.47-1.00. Edge-dropout score_retention: 3.6452.
-```
-The HAN encoder (V4/ADR-015) must be evaluated against this exact table —
-report deltas per category, not just pass/fail, once implemented.
-
-**Step B — HAN encoder swap (ADR-015), scoped to the graph stream only:**
-1. Swap only `RGCNEncoder` inside `hybrid_graphmcm_v3.py` for a `HANEncoder`
-   class in the same file. `HybridGraphMCM.encode_graph()` keeps its exact
-   isolated-node fallback (`torch.where(isolated_mask, isolated_embedding, h)`)
-   and its exact output contract (`h_N(i)`, shape `(None, GRAPH_EMB_DIM)`).
-2. Add HAN constants to `config_v3.py` (`ARCH_VERSION`, `ATTN_HEADS`,
-   `ATTN_LEAKY_SLOPE`, `SEMANTIC_ATTN_HIDDEN`) — see §6.
-3. Add `ARCH_VERSION` to the checkpoint `config` dict and enforce it in
-   `checkpoint_manager.validate_and_hotswap()`.
-4. The encoder swap *itself* touches nothing but the graph stream — feature
-   engineering, graph construction, subspace IF, EVT, self-training, and
-   LightGBM fusion stay byte-identical. (Steps C–E deliberately extend the
-   XAI layer and the API — that is ADR-016, not the encoder swap.)
-5. Full retrain required (`python main_v3.py`) — the HAN swap is NOT
-   compatible with `train_incremental()`'s frozen-encoder path. Old (RGCN)
-   checkpoints must fail `ARCH_VERSION` validation by design.
-6. Validation order: unit tests (shape/isolated-node parity) → CPU smoke test
-   → full retrain → Phase D evaluation with per-category deltas vs the table
-   above, plus β_r attention-weight logging (aggregate mean/std per relation).
-
----
-
-## AGENT QUICK-START — Read This First
-
-**What this system is:** Unsupervised fraud detection for 15,000 NIC scholarship
-applications. Outputs a 0–1 risk score per application. No hardcoded rules allowed.
-
-**Current state:** V3 fully implemented and evaluated (this is the baseline
-the V4 HAN encoder swap above must beat). MLOps Phase 1 complete
-(MLflow SQLite backend, DVC, pre-commit). MLOps Phase 2 complete — FastAPI
-REST server with 18 endpoints (`src/api/`), Celery + Redis async job queue
-(`celeryconfig.py`, `src/api/tasks.py`), atomic checkpoint manager with
-hot-swap and schema validation (`src/checkpoint_manager.py`), structlog JSON
-logging in all new API files, Dockerfile (`python:3.12-slim`, CPU-only, single
-image), `docker-compose.yml` (Redis + nic-api + nic-worker). Full stack tested
-end-to-end via Docker Desktop. Manual testing guide at `docs/API_TESTING_GUIDE.md`.
-Note: `main_v3.py` and `retraining_orchestrator.py` were NOT modified for
-structlog (AGENTS.md invariant: no `src/*.py` modification). OQ-2 (auth/VPN)
-unresolved — CORS is `allow_origins=["*"]` until project lead decides.
-
-ADR-014 (human-gated drift simulation) added 2026-07-02: `POST
-/v3/monitoring/evaluate-dataset`, `GET /v3/monitoring/dataset-xai`, `GET
-/v3/monitoring/top-suspicious`, `POST /v3/training/decision`. Business logic
-verified by calling the handler functions directly in Python (drift
-correctly detected on the test dataset, `p≈2.5e-39`; canonical files
-correctly restored after the read-only path) — **not yet exercised through
-the live Docker/Celery stack**. Project lead is running that validation next
-via `docs/API_TESTING_GUIDE.md` §9.
-
-Evidence-first XAI narratives added 2026-07-03 (project-lead approved
-two-module change): `hybrid_scores_v3.csv` gained `per_feature_predicted_json`
-(model-expected value per feature; hard stop #2 export list amended); all
-three scoring paths route through `hybrid_graphmcm_v3.compute_score_frame()`;
-new `score_only()` entry point (`python -m src.hybrid_graphmcm_v3
---score-only`) regenerates scores from the existing checkpoint without
-retraining — parity vs the prior CSV verified at ≤1.5e-6. `xai_layer_v3.py`
-rewritten: narratives are deterministic prose composed from measured evidence
-(value/error/degree percentiles vs the 15,000-application population,
-expected-vs-actual with direction, subspace IF group scores vs EVT
-thresholds, risk rank). Hand-set narrative cuts (0.7/0.4 tiers, `_magnitude`
-buckets) removed; the only numeric gates quoted are EVT-derived. Narratives
-distinguish "crossed an EVT threshold" from "promoted" (2-signal rule).
-Cards regenerated (500), incl. `evidence` object per card.
-
-**Next task:** validate ADR-014 end-to-end through the real Docker stack
-(§9 of the API testing guide) — the Docker image should be rebuilt first so
-it picks up the new XAI/hybrid/inference code. After that: Phase 3 MLOps —
-do not begin without explicit project lead sign-off. Candidates: ADR-011
-(Kubernetes / k3s single-node), ADR-012 (PostgreSQL for ego-graph inference),
-ADR-013 (GitHub Actions CI/CD). Discuss scope and order before writing any code.
-
-**On session start — read these, in order:**
-1. This AGENT QUICK-START block (already done)
-2. `docs/OPERATIONS_RUNBOOK.md` §0–§2 (operational context, 2-minute read)
-3. The specific module file you are assigned to — nothing else in `src/`
-
-**Do NOT read on session start (waste of context):**
-- All of `docs/AGENTS.md` in one pass — use the §jump-links below instead
-- `src/` modules you are not assigned to
-- `outputs/*.json` or `outputs/*.csv` — too large; use `head` if a sample is needed
-- `data/processed/` files — same
-- `docs/API_TESTING_GUIDE.md` — only relevant for manual API testing
-- Appendix A–G of this file — look up on demand, do not pre-read
-- `.venv/` — never
-
-**Three rules you must never break:**
-1. No domain-threshold rules anywhere in code (no `age > 35`, no rule codes). §10 stop #1.
-2. No raw GNN embeddings outside `hybrid_graphmcm_v3.py`. §10 stop #2.
-3. Never advance self-training rounds without project lead approval. §10 stop #5.
-
-**Jump to what you need:**
-- Your module boundary → §9 (Module Ownership table)
-- All hard stops → §10
-- File input/output contracts → §7
-- Dimension constants → §6 (import from `src/config_v3.py`, never hardcode)
-- Current evaluation results → §5.1
-- MLOps decisions → Appendix F
-
----
-
-## AGENT CLOSING INSTRUCTION — Do This Before Every Session End
-
-Before ending any session, you MUST update the **AGENT QUICK-START** block
-above with the current state of the project. Specifically update these two lines:
-
-```
-**Current state:** <what is fully implemented and verified>
-**Next task:**     <exactly what the next session should start with>
-```
-
-Also update AGENTS.md and README.md to reflect any code changes made during
-the session (module boundaries, file contracts, hard stops, evaluation results).
-
-This is mandatory — not optional. A future agent reading this file cold must
-be able to pick up exactly where this session left off without asking the user
-to re-explain context.
-
----
-
-## 0. How to Use This File
-
-**Read this entire file before writing a single line of code.**
-
-This is the authoritative contract for V3. Every module boundary, every tensor
-dimension, every file path, and every inter-module message format is specified
-here. Agents working in parallel MUST respect these contracts — a dimension
-mismatch discovered at fusion time costs a full retrain.
-
-**Parallel agent rules:**
-- Each agent owns exactly one module (§9).
-- Agents communicate only through the file-based contracts in §8.
-- If your output shape deviates from §7, stop and flag it — do not silently
-  adjust to make downstream code compile.
-- If two modules need to change simultaneously, stop and confirm scope with
-  the project lead before proceeding.
-
----
-
-## 1. Why V3 Exists
-
-### V1 → V2: Remove the rules ceiling
-
-V1 used 99 NIC rules + 8 engineered bridges to generate positive training
-labels. Any fraud pattern not in the rulebook was invisible regardless of how
-anomalous the detectors found it. V2 removed all rules, replacing them with
-unsupervised autoencoders seeded by synthetic outlier exposure and EVT tail
-thresholds.
-
-### V2 → V3: Close the conditional gap and unify the detection pathway
-
-V2 ran five independent scorers (VAE, Graph AE, Isolation Forest, MCM,
-Subspace IF) and fused their outputs. The XAI demo and PR-AUC ablations
-revealed two problems:
-
-1. **The VAE and full-space IF were redundant.** MCM strictly dominated both
-   on every tabular category. The VAE's two-stage LOE training added complexity
-   without adding detection capability.
-
-2. **MCM and Graph AE operated in separate worlds.** MCM asked "given this
-   row's features, is feature X expected?" but had no graph context. Graph AE
-   asked "can I reconstruct this node's edges?" but had no conditional masking.
-   Neither could ask the more powerful question: "given this node's features
-   AND its neighborhood, does the full picture make sense?"
-
-V3 replaces the five independent scorers with:
-
-- **One Hybrid GraphMCM model** — masked feature prediction informed by graph
-  neighborhood context. Single training loop, joint feature+edge scoring,
-  richer XAI.
-- **One Subspace IF ensemble** — focused marginal detection on 3 feature
-  groups. Cheap, no training, catches extreme values that conditional models
-  miss.
-- **Five degree-aware features** added to the feature engine — makes isolation
-  visible as an explicit input signal rather than a silent absence.
-
-**Scorer count: 5 → 2. Training loops: 4 → 1 (plus instant IF fitting).**
-
----
-
-## 2. What V3 Can Detect That V2 Cannot
-
-### Graph-informed conditional prediction
-
-V2 MCM predicted: *"Given age=45 and other tabular features, is
-pre_post_matric=1 expected?"*
-
-V3 Hybrid predicts: *"Given age=45, other features, AND the fact that this
-node's IP neighbors are all age 13–15 from the same school — is
-pre_post_matric=1 expected?"*
-
-The neighborhood context sharpens the conditional. A 45-year-old in pre-matric
-is suspicious alone. A 45-year-old in pre-matric sharing an IP with fifteen
-14-year-olds is far more suspicious — but V2 could only see one or the other,
-never both simultaneously.
-
-### Feature-informed edge prediction
-
-V2 Graph AE asked: *"Can I reconstruct this node's edges?"* — purely
-structural, blind to what the application's features imply about expected
-connectivity.
-
-V3 asks: *"Given that this is a rural student from Bihar with income 50k,
-should they have 25 IP connections spanning 15 districts?"*
-
-DOMINANT could not reason about this because it treated edge reconstruction
-and feature reconstruction as independent objectives. The hybrid model learns a
-joint distribution: what connectivity is normal FOR this feature profile.
-
-### Partial isolated-node detection
-
-V2: isolated nodes (11.1% of dataset — 1,663 nodes with degree=0 across all
-5 edge types) received zero graph signal. Silent.
-
-V3: degree-aware features (`degree_shares_pincode`, `degree_shares_ip`, etc.)
-make isolation visible as tabular input. The model can learn "zero pincode
-connections is unusual — 82.8% of nodes share a pincode" and flag the
-combination of unusual isolation with an anomalous feature profile.
-
-**Hard limit that no architecture can overcome:** an application with unique
-values across all 5 edge fields AND normal-looking tabular features is
-statistically indistinguishable from a genuine isolated student. The system
-detects fraud that leaves statistical traces — forensically clean applications
-are outside the detection boundary.
-
----
-
-## 3. Architecture Overview
-
-```
-data/raw/data_for_ml_model.csv
-        │
-        ▼
-src/tabular_feature_engine_v3.py
-        │  44 features (39 kept base + 5 degree-aware; 24 nominal identifiers dropped 2026-07-15, see MODEL_ARCHITECTURE_REVIEW A.4)
-        │  data/processed/engineered_features_v3.csv
-        │  data/processed/v3_feature_schema.json
-        ▼
-src/graph_builder_v3.py
-        │  data/processed/identity_graph_v3.pt
-        │  data/processed/degree_features_v3.csv   ← 5 per-edge-type degrees
-        ▼
-src/synthetic_exposure_builder_v3.py
-        │  data/processed/synthetic_exposure_set_v3.pt   (750 × 44)
-        ▼
-src/hybrid_graphmcm_v3.py          ← THE CORE MODEL
-        │  models/hybrid_graphmcm_v3.pth
-        │  outputs/hybrid_scores_v3.csv
-        │    columns: application_id, hybrid_anomaly_score,
-        │             feature_pred_error, edge_pred_error,
-        │             per_feature_error_json, per_feature_predicted_json
-        ▼
-src/subspace_if_v3.py
-        │  outputs/subspace_if_scores_v3.csv
-        │    columns: application_id, subspace_if_score,
-        │             group_scores_json (financial/identity/network)
-        ▼
-src/evt_scorer_v3.py
-        │  outputs/evt_thresholds_v3.json
-        ▼
-src/self_training_loop_v3.py
-        │  outputs/pseudo_labels_v3.json
-        ▼
-src/fusion_classifier_v3.py
-        │  outputs/risk_scores_v3.csv
-        ▼
-src/xai_layer_v3.py
-        │  outputs/explanation_cards_v3.json
-        ▼
-src/evaluate_model_v3.py
-        │  Console: degree-stratified PR-AUC + edge-dropout test
-        ▼
-      [END]
-```
-
----
-
-## 4. The Hybrid GraphMCM: Internal Design
-
-### 4.1 Two streams, one model
-
-```
-Node i: features x_i (44-dim) + neighbors N(i)
-              │
-    ┌─────────┴──────────┐
-    ▼                    ▼
- FEATURE STREAM       GRAPH STREAM
- Learned Masks        RGCN Encoder
- (K=8 masks)         (aggr='add', tanh)
- masked_x_i          h_N(i) = neighborhood
-    │                    │
-    └─────────┬──────────┘
-              ▼
-    Concat([masked_x_i ; h_N(i)])   → 44 + GRAPH_EMB_DIM
-              │
-             MLP
-              │
-         predicted x_i
-              │
-    ┌─────────┴──────────┐
-    ▼                    ▼
-feature_pred_error    edge_pred_error
-|predicted - actual|  P(edge | x_i, h_N(i))
-per-feature           per-edge-type
-    │                    │
-    └─────────┬──────────┘
-              ▼
-   hybrid_anomaly_score = feature_err + λ × edge_err
-```
-
-### 4.2 Training
-
-**Stage 1 — Synthetic Exposure (LOE):** Graph-side warm-start only. Inject
-synthetic nodes, push their embeddings away from the normal centroid using the
-exposure loss from V2. The masked prediction objective is self-supervised and
-does NOT need synthetic data — it learns from the normal data distribution.
-
-**Stage 2 — Free joint reconstruction:** Masked feature prediction + edge
-prediction simultaneously on real data. The feature stream and graph stream
-learn to inform each other.
-
-No Stage 1 is needed for the feature prediction pathway (unlike V2 VAE). LOE
-is graph-side only.
-
-### 4.3 Isolated node handling
-
-For degree=0 nodes, `h_N(i)` is a learned zero-vector embedding (not literal
-zeros — a trainable `isolated_embedding` parameter). The model sees:
-
-```
-Concat([masked_x_i ; isolated_embedding])
-```
-
-This means: isolated nodes still get a prediction, and the model can learn
-"features that look suspicious given that there are NO neighbors" as a distinct
-conditional distribution from "features that look suspicious given rich
-connectivity."
-
----
-
-## 5. Evaluation Protocol
-
-### 5.1 Standard PR-AUC (inherited from V2)
-
-Same 5 categories × 150 injected anomalies × different seeds from training.
-V3 must beat V2's best scores.
-
-**Achieved results (full-trained model, 111 pseudo-positives, round 0):**
-
-| Category | V2 Floor | V3 Score | Primary scorer | Status |
-|---|---|---|---|---|
-| AGE_VIOLATION | 0.1466 | **0.3417** | demographic IF | PASS |
-| INCOME_VIOLATION | 0.6503 | **0.9063** | financial IF | PASS |
-| IP_CONCENTRATION | 0.0370 | **0.1184** | network IF | PASS |
-| MOTHER_NAME_COLLISION | 0.2869 | **0.5206** | identity IF | PASS |
-| FEE_INFLATION | 0.4962 | **0.7420** | financial IF | PASS |
-
-Isolated-node degree stratum: 0.47–1.00 across all categories.
-Edge-dropout score_retention = 3.6452 (feature-based suspicion persists without graph edges).
-
-### 5.2 Degree-Stratified PR-AUC (new in V3)
-
-For each category, report PR-AUC split by the degree of the injected nodes:
-- `isolated` (degree=0)
-- `low` (degree 1–5)
-- `high` (degree 6+)
-
-This makes the isolated-node gap explicit and measurable rather than hidden in
-the aggregate number.
-
-**Evaluation methodology note — injected nodes are always isolated:**
-The hybrid model's `isolated_embedding` is a single trained vector shared by
-ALL degree-zero nodes. This means `feature_pred_error` is nearly uniform across
-different injected-anomaly types — the hybrid cannot discriminate between, say,
-age fraud and income fraud among isolated nodes. The correct primary scorer for
-isolated-node evaluation is therefore the category-specific subspace IF group,
-which focuses its full statistical capacity on the feature dimensions that
-define each fraud type.
-
-The evaluation harness uses an eval-only "demographic" group for AGE_VIOLATION
-(`age_at_registration`, `competitive_exam_year`, `admission_year`,
-`c_course_year`) that is not part of the production pipeline config. This group
-is fitted fresh from real data during evaluation and is not exported to any
-pipeline output file.
-
-For scoring, both real-node and inject-node subspace IF scores are normalized
-on the same real-data range, so inject scores > 1.0 indicate a node more
-extreme than any real node in that group.
-
-### 5.3 Edge-Dropout Test (new in V3)
-
-After training, pick the top 100 highest-scoring nodes from the hybrid. Remove
-all their edges. Re-score. Report:
-
-```
-score_retention = median(score_after_dropout) / median(score_before_dropout)
-```
-
-If `score_retention > 0.5`, the model learned feature-based suspicion that
-persists without graph support. If `score_retention < 0.2`, detection is
-graph-dependent and isolated-node performance will be poor.
-
----
-
-## 6. Fixed Dimension Constants
-
-**These are the single source of truth. Every module reads these values.
-Never hardcode these numbers in module code — import from `src/config_v3.py`.**
-
-```python
-# src/config_v3.py  (agent must create this file)
-
-N_FEATURES      = 44    # 39 kept base + 5 degree; 24 nominal identifiers dropped 2026-07-15
-N_EDGE_TYPES    = 5     # shares_mobile, shares_ip, shares_father_name,
-                        # shares_mother_name, shares_pincode
-MASK_NUM        = 8     # number of learned masks in GraphMCM
-GRAPH_HIDDEN    = 128   # RGCN hidden channels
-GRAPH_EMB_DIM   = 64    # RGCN output embedding dimension (h_N(i))
-MLP_HIDDEN      = 256   # MLP hidden dim after concat
-Z_DIM           = 64    # latent dimension after concat+MLP
-LOE_MARGIN      = 2.0   # exposure loss margin (graph side only)
-LAMBDA_EDGE     = 0.3   # weight of edge_pred_error in hybrid score
-LAMBDA_EXPOSURE = 1.0   # initial LOE weight (decays linearly to 0)
-EPOCHS_STAGE1   = 80    # graph LOE warm-start epochs
-EPOCHS_STAGE2   = 120   # free joint reconstruction epochs
-LR              = 1e-3  # Adam learning rate
-BATCH_SIZE      = 256
-RANDOM_SEED     = 42
-
-# Subspace IF feature groups
-SUBSPACE_GROUPS = {
-    "financial":  ["annual_family_income", "fee_income_ratio",
-                   "income_rank_in_district", "income_deviation_from_state_median",
-                   "admission_fee", "tution_fee", "misc_fee"],
-    "identity":   ["name_similarity_score", "is_father_name_eq_mother",
-                   "is_applicant_name_eq_father", "is_applicant_name_eq_mother",
-                   "mobile_unique_names", "mobile_unique_fathers"],
-    "network":    ["ip_application_count", "ip_to_mobile_ratio",
-                   "mobile_application_count", "institute_application_count",
-                   "degree_shares_ip", "degree_shares_mobile",
-                   "degree_shares_pincode"],
-}
-
-# Log1p-transform these columns before MinMaxScaling
-LOG1P_COLS = ["annual_family_income", "admission_fee", "tution_fee", "misc_fee"]
-
-# ── Risk-mitigation constants (added 2026-06-30) ──────────────────────────────
-
-# Self-training: minimum number of EVT signals that must fire simultaneously
-# for a node to be promoted to pseudo-positive in Round 0.
-# 1 = original OR logic (any single signal promotes). 2 = multi-signal agreement.
-# Raised to 2 to reduce confirmation bias from single-signal data-entry noise
-# (e.g. income=5 INR fires EVT_FINANCIAL alone but passes no other signal).
-MIN_SIGNALS_FOR_PROMOTION = 2
-
-# EVT GPD shape validity range. Fits outside this range indicate a distribution
-# that violates GPD regularity assumptions (discrete cluster spikes, heavy-tailed
-# or bounded distributions). Bad fits fall back to empirical quantile.
-EVT_SHAPE_MIN = -0.5
-EVT_SHAPE_MAX = 1.0
-
-# DeepSVDD centroid: fraction of nodes KEPT when computing the initial centroid.
-# The top (100 - CENTROID_CLEAN_PERCENTILE)% of nodes by embedding norm are
-# excluded before averaging. These are the highest-anomaly embeddings and are
-# likely to include fraud — including them shifts the centroid toward fraud,
-# causing the DeepSVDD hypersphere to silently expand to accept fraud as normal.
-CENTROID_CLEAN_PERCENTILE = 95
-```
-
-### EVT per-signal threshold overrides
-
-`evt_scorer_v3.py` fits 6 signals: `hybrid_anomaly_score`, `subspace_if_score`,
-`subspace_if_financial`, `subspace_if_identity`, `subspace_if_network`,
-`edge_pred_error`. The default `U_PERCENTILE = 95` (POT baseline) applies to
-all signals except where overridden:
-
-```python
-U_PERCENTILE_OVERRIDES = {
-    "subspace_if_identity": 97,   # identity IF over-flagged at 95th; 97th reduces noise
-}
-```
-
-The only non-EVT numeric in this module is `Q = 0.002` (false-positive rate).
-All other thresholds are GPD-derived.
-
-### Self-training pseudo-label signals (Round 0)
-
-Round 0 requires **at least `MIN_SIGNALS_FOR_PROMOTION` (= 2) EVT signals to
-fire simultaneously** (no classifier agreement required). A node is
-pseudo-positive if it clears the threshold on ≥ 2 of:
-- `EVT_HYBRID` — `hybrid_anomaly_score >= hybrid_threshold`
-- `EVT_FINANCIAL` — `subspace_if_financial >= financial_threshold`
-- `EVT_IDENTITY` — `subspace_if_identity >= identity_threshold`
-- `EVT_NETWORK` — `subspace_if_network >= network_threshold`
-- `EVT_EDGE_RING` — `edge_pred_error >= edge_pred_error_threshold`
-
-**Rationale for change (2026-06-30):** The original OR logic (any 1 of 5)
-promoted 111 nodes in the full-trained run. A meaningful fraction of these
-were single-signal hits driven by data-entry noise (e.g. `annual_family_income
-= 5 INR` fires `EVT_FINANCIAL` alone but looks normal on every other signal).
-Requiring 2 signals ensures each promoted node has independent corroboration
-from two different fraud-detection lenses before entering LightGBM training.
-
-Each positive record in `pseudo_labels_v3.json` carries a `trigger` field
-listing which signals fired for that application.
-
-### Concat dimension check (all agents must verify)
-
-```
-masked_x_i shape:  (B, N_FEATURES)         = (B, 44)
-h_N(i) shape:      (B, GRAPH_EMB_DIM)      = (B, 64)
-concat shape:      (B, N_FEATURES + GRAPH_EMB_DIM) = (B, 132)
-MLP input:         132
-MLP output (z):    Z_DIM = 64
-decoder output:    N_FEATURES = 44
-```
-
-If any module produces a tensor that violates these shapes, it must raise a
-`DimensionError` with the actual vs expected shape — never silently broadcast.
-
----
-
-## 7. File-Based Contracts (Inter-Module Messages)
-
-Every module reads from and writes to these exact files. No module reads
-another module's source files directly. No embeddings cross module boundaries.
-
-| File | Producer | Consumer | Schema |
+Why each piece is locked (metrics in `HISTORY.md`, raw JSON in
+`outputs/ablation/locked_fusion_validation.json`):
+- **Subspace IF is the backbone** (3-seed mean connected PR-AUC 0.743).
+- **Dense-block extended beyond IP-only 2026-07-22** (shares_ip-only scored
+  mobile-sharing rings near zero, PR-AUC 0.030; extending to mobile+ip
+  (briefly mobile+ip+pincode, same day) with IP-priority weighting — not
+  equal weighting, which let ordinary non-fraud density outrank true IP
+  rings — fixed that while holding IP-ring detection ~unchanged). Pincode
+  was dropped from the gate the same day, per lead direction: shared
+  pincode reflects legitimate geographic clustering, not collusion, and is
+  not a valid fraud signal on its own for this detector. Reverted to
+  `DENSE_BLOCK_RELATIONS = [0, 1]` (shares_mobile + shares_ip),
+  `DENSE_BLOCK_RELATION_WEIGHTS = {0: 0.3, 1: 1.0}`.
+- **RGCN stays, and its root_weight was fixed 2026-07-22** (retirement
+  disproven; best generalisation to novel topology; the root_weight=False
+  fix recovered signal the LOE-margin fix below had cost it).
+- **LOE margin was fixed 2026-07-22** (`LOE_MARGIN=2.0` was ~3x too small
+  for this embedding scale — the exposure-push term contributed
+  effectively zero gradient throughout training; replaced with a
+  data-derived margin + a small persistent Stage-2 term).
+- **LightGBM fusion is gone, and so is the weighted-sum fusion that
+  replaced it** (LightGBM: 14 positives destroyed calibrated components.
+  Weighted sum, superseded 2026-07-22: it diluted strong single-detector
+  signals — e.g. mobile-ring, subspace alone 0.674 vs summed fusion 0.349 —
+  replaced with an unweighted max). If you see LightGBM OR a `+` between
+  detector terms referenced as the fusion layer anywhere, that record is stale.
+- **HAN encoder available but off** (−0.091 vs RGCN, 3 seeds).
+- **`edge_pred_error` dropped from the hybrid score, not from training,
+  2026-07-23** (`LAMBDA_EDGE_SCORE=0.0`, decoupled from the training-loss
+  weight `LAMBDA_EDGE=0.3` which is unchanged). Showed no usable signal on
+  any of its 3 designed relational categories on `stress_testing_1`
+  (IP/MOBILE/PINCODE cluster PR-AUC 0.011–0.023, noise-floor), and actively
+  diluted `feature_pred_error`'s real MOBILE_CLUSTER signal (0.268 alone vs
+  0.017 combined) — consistent with the documented MAR critique (dense
+  cliques predict/reconstruct too easily, so ring members' edges are
+  *easier*, not harder, to predict). Dropping it improved 6/7 categories,
+  replicated on an independently-seeded second population
+  (`stress_testing_2`). **Caveat, not yet resolved:** on the real 15k
+  population (no ground truth) the reorder is substantial — old/new
+  correlation 0.56, top-100 overlap 6/100 — so this is validated against
+  synthetic ground truth only, not confirmed as an improvement for the real
+  population. See README changelog 2026-07-23.
+- **Deep SAD exists but is XAI-only, not fused** (validated strongest single
+  relational signal this session on stress_testing_1, but tested directly
+  as a 4th fusion input and found to not improve the fused score — see
+  pipeline diagram above).
+
+Hyperparameter source of truth: `src/config_v3.py`. Naming rule: **source
+files keep `_v3` names** — "V4"/"V4-Scale" are capability/branch labels only.
+Never rename `_v3` → `_v4`.
+
+## 2. The scale target and what changes
+
+**Target: 30–40 lakh = 3.0–4.0 million applications** (not 30–40 million) on
+one server: 16 vCPU, 64 GB RAM, Ubuntu 22.04, **no GPU**, k3s Kubernetes.
+**PostgreSQL is the system of record** — training data, LOE patterns,
+confirmed fraud, scores, batches all live in it; every ingestion path (console
+CSV upload, portal sync, bulk COPY) writes to it. The console's CSV-intake
+UX is preserved exactly — only handler internals change.
+
+Exactly four things change (design in `TECHNICAL_REFERENCE_AND_SCALING.md`
+Part II — cite it, don't re-derive):
+
+| Change | Replaces | Why |
+|---|---|---|
+| SQL-pushdown feature engineering, chunked, **persisted scaler params** | whole-frame pandas, fit-on-population MinMax | 20–30 GB peak → <1 GB; also fixes a batch-statistics leak |
+| Hub-capped edge topology (K_CAP cliques, star above, statistical group-size ceiling) | all-pairs edges per shared value | O(k²) blowup: one 5,000-member pincode = 12.5M edges |
+| NeighborLoader mini-batch training/scoring for the hybrid detector | full-graph forward passes | full graph at 3.5M nodes cannot fit 64 GB |
+| Postgres tables behind existing interfaces | CSV/JSON file stores | indexed queries, concurrency, one source of truth |
+
+Everything else — model classes, losses, hyperparameters, score semantics,
+subspace IF / EVT / fusion / XAI logic, the frontend — **does not change**.
+
+## 3. Module ownership
+
+One module per response. If a task spans two rows, stop and confirm scope.
+
+**Stable interfaces (added 2026-07-23, additive/non-breaking):** `src/interfaces/`
+holds one thin re-export module per row below (`feature_engine.py`,
+`graph_builder.py`, `synthetic_exposure.py`, `hybrid_detector.py`,
+`subspace_if.py`, `dense_block.py`, `deepsad.py`, `evt.py`, `self_training.py`,
+`fusion.py`, `xai.py`, `evaluate.py`). New code should import a layer's public
+functions from its interface module, not the concrete `_v3` file directly —
+if a concrete file is ever renamed or split, only that one interface's import
+line changes, not every call site. Purely additive: existing call sites into
+the `_v3` modules are unchanged and keep working. `src/db/`, `src/api/`,
+`checkpoint_manager.py`, `retraining_orchestrator.py`, and `model_registry.py`
+already have unversioned names and have no interface module.
+
+**Deploy gate (added 2026-07-23, additive):** `src/deploy_gate.py` +
+`src/build_held_out_set.py` are a manual pre-promotion quality gate — a
+candidate checkpoint must not regress (beyond the ±0.03–0.04 noise floor) on
+any held-out fraud category vs. the currently-live checkpoint before
+`checkpoint_manager.validate_and_hotswap()` is called. Held-out set is
+versioned by `schema_version = "v3_<N_FEATURES>"` and built from the existing
+`data/uploads/stress_testing_1.csv` ground-truth cohort. See
+`MAINTAINER_PLAYBOOK.md` Recipe 3. `model_registry.log_run()` now also
+records `git_commit` and `schema_version` on every run for traceability.
+
+| Module | File(s) | Reads | Writes |
 |---|---|---|---|
-| `data/processed/engineered_features_v3.csv` | feature_engine | graph_builder, hybrid, subspace_if, evaluate | N×44 numeric + application_id |
-| `data/processed/v3_feature_schema.json` | feature_engine | all modules | `{features, aggregation_features, degree_features, excluded, n_features, log1p_cols}` |
-| `data/processed/identity_graph_v3.pt` | graph_builder | hybrid, evaluate | PyG HeteroData, 5 edge types |
-| `data/processed/degree_features_v3.csv` | graph_builder | feature_engine (written back) | N×5, cols=`degree_shares_*` |
-| `data/processed/synthetic_exposure_set_v3.pt` | synthetic_builder | hybrid | (750, 44) float32 tensor |
-| `models/hybrid_graphmcm_v3.pth` | hybrid | xai, evaluate | `{model_state_dict, centroid, config}` |
-| `outputs/hybrid_scores_v3.csv` | hybrid | evt, self_training, fusion, xai | `application_id, hybrid_anomaly_score, feature_pred_error, edge_pred_error, per_feature_error_json, per_feature_predicted_json` — predicted column added 2026-07-03 (project-lead approved) so XAI states expected-vs-actual with direction; all three scoring paths (train, incremental, API staged) emit it via `hybrid_graphmcm_v3.compute_score_frame()` |
-| `outputs/subspace_if_scores_v3.csv` | subspace_if | fusion, xai | `application_id, subspace_if_score, group_scores_json` |
-| `outputs/evt_thresholds_v3.json` | evt | self_training, xai (read-only, quotes thresholds in narratives) | 6 signals: `{hybrid, subspace_if, subspace_if_financial, subspace_if_identity, subspace_if_network, edge_pred_error}` each with `{u, scale, shape, threshold, n_flagged}` |
-| `outputs/pseudo_labels_v3.json` | self_training | fusion, xai | `positive_set` array, each record: `{application_id, round, trigger: [list of EVT signal names], hybrid_anomaly_score, subspace_if_*, edge_pred_error}` |
-| `outputs/risk_scores_v3.csv` | fusion | xai, evaluate | `application_id, risk_score_v3, label_source` |
-| `outputs/explanation_cards_v3.json` | xai | [end user] | per-application JSON, evidence-first (2026-07-03). `top_feature_errors`: `{feature, feature_label, error, value, expected, value_percentile, population_median, error_percentile}` — `expected` is the model's predicted value; percentiles are computed against the full scored population (replaces the old hand-bucketed `magnitude`). `top_graph_neighbors`: `{edge_type, application_id}` — resolved to actual application IDs. `evidence`: `{population_size, risk_rank, risk_percentile, label_source, evt_signals, evt_crossings, subspace_groups, graph_connections, isolated_population_pct}` — every quantity measured from data or EVT thresholds, no hand-set narrative cuts. `review_status`: human-readable string replacing raw `label_source`. `narrative`: deterministic prose composed from `evidence` (same evidence ⇒ same words; auditable for appeals); distinguishes EVT-threshold crossings from multi-signal promotion. |
-| `data/processed/confirmed_fraud.json` | API / supervisor endpoint | retraining_orchestrator, self_training, fusion | `{confirmed: [{application_id, fraud_type, confirmed_by, cycle, feature_vec, confirmed_at, notes}], false_positives: [{application_id, confirmed_by, confirmed_at, notes}]}` |
-| `models/checkpoints/hybrid_v3_<cycle>_<run_id>.pth` | checkpoint_manager | rollback command, MLflow | same schema as `hybrid_graphmcm_v3.pth` (`model_state_dict`, `centroid`, `config`); keep last 5; filename encodes cycle and mlflow_run_id |
-| `outputs/prev_cycle_scores_ks.json` | retraining_orchestrator (end of cycle) | next-cycle drift check | `{scores: [float, ...]}` — score distribution baseline for KS test; overwritten after every completed inference cycle |
-| `outputs/feature_drift_v3.json` | retraining_orchestrator | API `/monitoring/drift` endpoint | `{feature_name: {ks_stat, p_value, mean_prev, mean_curr}}` for all 44 engineered features |
-| `outputs/staged_scores_<dataset_name>.csv` | `POST /v3/monitoring/evaluate-dataset` (ADR-014) | `GET /v3/monitoring/dataset-xai` | same schema as `hybrid_scores_v3.csv`, filtered to only the staged dataset's rows; read-only preview, not fused into `risk_scores_v3.csv` |
-| `outputs/staged_features_<dataset_name>.csv` | `POST /v3/monitoring/evaluate-dataset` (ADR-014) | `GET /v3/monitoring/dataset-xai` | scaled feature values for the staged rows, captured before canonical files are restored |
-| `outputs/staged_scores_meta_<dataset_name>.json` | `POST /v3/monitoring/evaluate-dataset` (ADR-014) | `POST /v3/training/decision` | `{dataset_path, n_rows, p_value, recommendation, drift_detected}` — carries the drift result into the audit log at decision time |
-| `outputs/drift_audit_log.json` | `POST /v3/training/decision` (ADR-014) | human review, MLflow-adjacent audit trail | append-only list of `{timestamp, dataset_path, p_value, recommendation, action, cycle, decided_by, job_id, backup_dir}` — one record per decision call, including `action: "none"` |
-| `data/backups/<timestamp>_<label>/` | `src/api/dataset_ops.backup_canonical_files()` (ADR-014) | `restore_canonical_files()`, manual rollback | snapshot of `RAW_CSV, NODEG_CSV, FINAL_CSV, SCHEMA_JSON, GRAPH_PT, DEGREE_CSV` before any merge; `evaluate-dataset` deletes its own backup after restoring, `decision` (incremental/full_retrain) keeps it |
+| Feature engineering | `src/tabular_feature_engine_v3.py` | `applications`/raw CSV | `features` table / `engineered_features_v3.csv`, `v3_feature_schema.json` |
+| Graph construction | `src/graph_builder_v3.py` | features + `identity_keys` | graph artifact, degree features |
+| Synthetic exposure | `src/synthetic_exposure_builder_v3.py` | features, promoted `loe_patterns` | exposure `.pt` artifacts |
+| Hybrid detector | `src/hybrid_graphmcm_v3.py` | features, graph, exposure | `hybrid_scores`, `models/hybrid_graphmcm_v3.pth` |
+| Subspace IF | `src/subspace_if_v3.py` | features | subspace scores |
+| Dense-block | `src/dense_block_detector_v3.py` | `shares_mobile`/`shares_ip` edges (pincode dropped 2026-07-22) | per-relation scores + `dense_block_score_relational` |
+| Deep SAD (XAI-only, not fused) | `src/deepsad_detector_v3.py` | features, graph, exposure | `center_dist_score`, `models/deepsad_v3.pth` |
+| Relation ablation (XAI-only, not fused) | `src/hybrid_graphmcm_v3.py::compute_relation_ablation` | trained checkpoint, features, graph (5 re-scores, one edge type masked per pass) | `relation_ablation_v3.csv` (per-node, per-relation reconstruction-error delta) |
+| EVT | `src/evt_scorer_v3.py` | score vectors | `evt_thresholds` |
+| Self-training | `src/self_training_loop_v3.py` | scores, EVT, `confirmed_fraud` | `pseudo_labels` |
+| Fusion | `src/fusion_classifier_v3.py` | three score vectors | `final_risk_score` |
+| XAI | `src/xai_layer_v3.py`, `src/xai_card_html_v3.py` | scores, per-feature errors | explanation cards |
+| Evaluation | `src/evaluate_model_v3.py` | processed data, checkpoints | console / ablation JSON |
+| Checkpoint manager | `src/checkpoint_manager.py` | incoming `.pth` (temp path) | live checkpoint (atomic rename), `models/checkpoints/` |
+| Orchestrator | `src/retraining_orchestrator.py` | scores, drift state | training runs, drift JSON |
+| **(new)** DB layer | `src/db/` | — | the only module that owns SQL; everything else goes through it |
+| API | `src/api/` | via `src/db/` + stores | HTTP responses, Celery jobs |
+| Frontend | `frontend/` | API | — (unchanged in this phase) |
 
-**Hard rule:** `per_feature_error_json` and `per_feature_predicted_json` are
-each a JSON string of `{feature_name: float}` for all 44 features. Downstream
-XAI reads these columns — their key sets must exactly match the feature names
-in `v3_feature_schema.json`. If they diverge, the XAI layer must raise, not
-silently skip unknown keys. Note: predicted values come from an unbounded
-Linear decoder head and may fall slightly outside [0, 1]; export them as-is.
+**Migration rule:** during steps 1–4 of `IMPLEMENTATION.md`, `src/` model
+modules are untouched; new code lives in `src/db/` and handler internals.
+Model-module edits (feature engine internals, graph builder, NeighborLoader
+loop) happen only in their designated steps, one module at a time.
 
-**Clarification (2026-07-03) — `identity_graph_v3.pt` is not preserved across
-cycles, and that is correct behavior, not a gap.** Every retraining cycle
-(`src/api/dataset_ops.rebuild_features_and_graph()`, and the equivalent
-`build_base() → build_graph() → add_degree_features()` order in `main_v3.py`)
-overwrites `identity_graph_v3.pt` in place from whatever is currently in
-`data/raw/data_for_ml_model.csv`. There is no versioned or archived copy of a
-prior cycle's graph anywhere in the pipeline (contrast with model checkpoints,
-which ARE versioned — see `models/checkpoints/` above and ADR-008). This is
-intentional: the RGCN encoder learns to interpret structural *patterns*
-(unusual IP concentration, name-sharing density, degree distributions) at
-training time, not the identity of specific IPs/mobiles/names present in any
-one batch's edges. Those identities are meaningless outside the batch they
-came from — next cycle's fraud rings use different IPs. What must persist
-across cycles is the learned weights (`hybrid_graphmcm_v3.pth` /
-`models/checkpoints/`), not the graph tensor. `train_incremental()` reflects
-this directly: it loads the checkpoint, optionally freezes the RGCN encoder
-(`freeze_rgcn=True` when confirmed fraud < 50 — see `retraining_orchestrator.py`),
-and re-scores against the freshly rebuilt graph for the current batch only.
-Do not add graph versioning/archival as a "fix" — there is nothing to fix here.
+## 4. Hard stops (all binding; carried forward + scale-phase additions)
 
----
+1. **No rules.** No numeric threshold against a domain concept, no named rule
+   codes, no policy-boundary features. Only EVT-derived or learned thresholds.
+   The hub-cap / group-size ceiling must be derived from the observed
+   group-size distribution (a statistical cutoff), never a hand-picked domain
+   number.
+2. **No raw GNN embeddings leave `hybrid_graphmcm_v3.py`.** Scalar scores and
+   attention weights only. This includes the Postgres schema: **no embedding
+   columns, ever.**
+3. **Higher = more anomalous.** Any inversion must be documented at the point
+   of inversion.
+4. **`sanity` column is never used** — not as feature, label, or evaluation.
+5. **Self-training rounds are human-gated.** No loop advances rounds
+   automatically; Round 0 classifier-agreement is code-enforced OFF.
+6. **No v1/v2 model outputs anywhere.**
+7. **Synthetic exposure is programmatic.** Never CTGAN/TVAE/copula generators.
+8. **This file is lead-owned.** Flag staleness; propose redlines; edit only
+   under explicit lead direction for the current branch.
+9. **Checkpoints go through `checkpoint_manager`** — temp path, validate
+   `{model_state_dict, centroid, config}` (config must contain `N_FEATURES`,
+   `GRAPH_EMB_DIM`, `N_EDGE_TYPES`), atomic rename. Never
+   `torch.save(...)` directly onto the live path.
+10. **`nic-worker` replicas = 1**, enforced in the k8s manifest with a
+    comment. Training jobs write fixed paths; two workers corrupt each other.
+11. **(scale) Scaler parameters are persisted, never refit per batch.** Fit
+    on the training population once per `schema_version`, store (Postgres
+    `feature_scaling` / artifact), apply stored params to every subsequent
+    batch. Refitting on a scoring batch is a correctness bug (batch-statistics
+    leak), not a style issue.
+12. **(scale) Every migration step passes its 15k parity gate before the next
+    starts.** Gates are defined in `IMPLEMENTATION.md`. No skipping ahead
+    because a step "looks done."
+13. **(scale) Dual-write before cut-over.** A Postgres table becomes
+    authoritative only after parity with its file predecessor is demonstrated;
+    until then the file store remains the source of truth.
+14. **(scale) `src/db/` owns all SQL.** No inline SQL in handlers or model
+    modules. Schema changes go through versioned migration files.
 
-## 8. Degree-Aware Features: Build Order
+## 5. Quantitative claims protocol (unchanged, binding)
 
-The 5 degree features create a **build dependency**: graph_builder needs the
-raw CSV to build edges, but the feature engine needs the degrees to write the
-final feature CSV. Resolution:
-
-1. `tabular_feature_engine_v3.py` runs **first** with 63 features, writes a
-   temp CSV `data/processed/engineered_features_v3_nodeg.csv`.
-2. `graph_builder_v3.py` reads the temp CSV, builds the graph, computes per-
-   node degrees per edge type, writes `degree_features_v3.csv`.
-3. `tabular_feature_engine_v3.py` has a second entry point `add_degree_features()`
-   that reads `degree_features_v3.csv`, merges into the temp CSV, writes the
-   final `engineered_features_v3.csv` with all 44 features, and updates
-   `v3_feature_schema.json`.
-
-`main_v3.py` must call them in this order:
-```
-feature_engine.build_base()       # step 1
-graph_builder.build_graph()       # step 2
-feature_engine.add_degree_features()  # step 3
-```
-
----
-
-## 9. Module Ownership
-
-One agent, one module, one session. If your task requires editing outside your
-row, stop and confirm scope.
-
-| Module | File | Reads from | Writes to | Hard boundary |
-|---|---|---|---|---|
-| Feature engine | `src/tabular_feature_engine_v3.py` | raw CSV | `engineered_features_v3.csv`, `v3_feature_schema.json` | no model code |
-| Graph builder | `src/graph_builder_v3.py` | `engineered_features_v3_nodeg.csv` | `identity_graph_v3.pt`, `degree_features_v3.csv` | no training code |
-| Config | `src/config_v3.py` | — | — | no logic, constants only |
-| Synthetic exposure | `src/synthetic_exposure_builder_v3.py` | `engineered_features_v3.csv` | `synthetic_exposure_set_v3.pt` (750×44) | no training code |
-| Hybrid model | `src/hybrid_graphmcm_v3.py` | `identity_graph_v3.pt`, `synthetic_exposure_set_v3.pt`, `engineered_features_v3.csv` | `hybrid_scores_v3.csv`, `hybrid_graphmcm_v3.pth` | no rule thresholds |
-| Subspace IF | `src/subspace_if_v3.py` | `engineered_features_v3.csv` | `subspace_if_scores_v3.csv` | no neural network code |
-| EVT scorer | `src/evt_scorer_v3.py` | `hybrid_scores_v3.csv`, `subspace_if_scores_v3.csv` | `evt_thresholds_v3.json` | no model training |
-| Self-training | `src/self_training_loop_v3.py` | score CSVs, `evt_thresholds_v3.json` | `pseudo_labels_v3.json` | no architecture changes |
-| Fusion | `src/fusion_classifier_v3.py` | score CSVs, `pseudo_labels_v3.json` | `risk_scores_v3.csv` | no raw embeddings |
-| XAI | `src/xai_layer_v3.py` | `hybrid_scores_v3.csv`, `risk_scores_v3.csv`, `pseudo_labels_v3.json`, `engineered_features_v3.csv`, `subspace_if_scores_v3.csv`, `evt_thresholds_v3.json` (read-only) | `explanation_cards_v3.json` | no training code |
-| Evaluate | `src/evaluate_model_v3.py` | `engineered_features_v3.csv`, `models/*.pth` | console stdout | no training code |
-| Orchestrator | `main_v3.py` | — | calls all modules | no business logic |
-| Checkpoint manager | `src/checkpoint_manager.py` | incoming `.pth` (temp path), `models/hybrid_graphmcm_v3.pth` | `models/hybrid_graphmcm_v3.pth` (live), `models/hybrid_graphmcm_v3.pth.bak`, `models/checkpoints/` | no training code; no model forward pass; validation and file operations only |
-
----
-
-## 10. Hard Stops (Inherited + New)
-
-**All V2 hard stops apply unchanged:**
-
-1. **No rules. No exceptions.** No numeric threshold against a domain concept,
-   no named rule code, no `apply_rules()` call, no feature whose definition
-   encodes a policy boundary. The only allowed thresholds are EVT-derived or
-   learned from synthetic exposure.
-2. **No raw GNN embeddings leave `hybrid_graphmcm_v3.py`.** Only
-   `hybrid_anomaly_score`, `feature_pred_error`, `edge_pred_error`,
-   `per_feature_error_json`, and `per_feature_predicted_json` are valid
-   exports. (`per_feature_predicted_json` added 2026-07-03 with project-lead
-   approval — predicted feature values are decoder outputs, not embeddings;
-   `h_N(i)` and all latent vectors remain forbidden.)
-3. **Score direction: higher = more anomalous.** Any module that inverts this
-   must document the inversion explicitly at the point of inversion.
-4. **`sanity` column is never used.** Drop at load time in every pipeline file.
-5. **Self-training rounds are not automatic.** Each round requires a Phase D
-   PR-AUC check. Round 0 classifier-agreement condition must be code-enforced
-   off, not just noted in a comment.
-6. **No v1 or v2 model outputs in v3.** No v1/v2 checkpoints, no
-   `lgbm_risk_score`, no `vae_anomaly_score`, no `graph_anomaly_score` from
-   prior versions.
-7. **Synthetic exposure set is programmatically constructed.** Never use CTGAN,
-   TVAE, GaussianCopula, or any tabular GAN — composite degradation is 24x or
-   more on fraud behavioral signals (arXiv:2604.13125).
-8. **Never modify this file autonomously.** Flag outdated content explicitly.
-
-**Additional V3 stops:**
-
-9. **Dimension constants are in `config_v3.py` only.** Never hardcode `44`,
-   `64`, `132`, `8`, or `5` inside module code.
-10. **`h_N(i)` never leaves `hybrid_graphmcm_v3.py`.** Raw graph embeddings
-    are not outputs.
-11. **Isolated nodes use the learned `isolated_embedding`, not zero vectors.**
-    `torch.zeros(GRAPH_EMB_DIM)` for isolated nodes is forbidden. The model
-    must have a trainable `nn.Parameter` named `isolated_embedding` of shape
-    `(GRAPH_EMB_DIM,)` initialized to `torch.randn`.
-12. **Degree features are always in the 39:44 slice.** Columns 0–38 are the
-    original 63 features in V2 order. Columns 63–67 are
-    `degree_shares_mobile`, `degree_shares_ip`, `degree_shares_father_name`,
-    `degree_shares_mother_name`, `degree_shares_pincode`. Use named indexing
-    via `v3_feature_schema.json` — never positional hardcoding.
-13. **`score_retention` must be printed by `evaluate_model_v3.py`.** If
-    `score_retention < 0.2`, print: "Graph-dependent detection: isolated node
-    performance will be degraded."
-14. **`hybrid_graphmcm_v3.pth` is never written directly.** The live checkpoint
-    path is a read-only destination at runtime. All writes go to a temp path
-    (`models/incoming_<timestamp>_<uuid>.pth`) first. `checkpoint_manager.py`
-    performs the atomic rename after validation passes. Any code that calls
-    `torch.save(..., "models/hybrid_graphmcm_v3.pth")` directly is wrong —
-    route through `checkpoint_manager.validate_and_hotswap()` instead.
-15. **Checkpoint schema must embed a `config` dict.** `hybrid_graphmcm_v3.py`
-    must save checkpoints with exactly these top-level keys:
-    `{model_state_dict, centroid, config}`. The `config` dict must contain at
-    minimum `N_FEATURES`, `GRAPH_EMB_DIM`, and `N_EDGE_TYPES` sourced from
-    `config_v3.py`. This is the contract `checkpoint_manager.py` validates
-    against before any swap. A checkpoint missing these keys is rejected with
-    no change to the live model.
-16. **`nic-worker` replica count is fixed at 1.** Training jobs write to fixed
-    output paths (`outputs/*.csv`, `models/*.pth`). Scaling `nic-worker` to 2
-    causes concurrent runs to overwrite each other's intermediates. Enforce
-    in the k8s Deployment manifest with an explicit comment — `concurrency=1`
-    at the Celery level alone is not sufficient.
-
----
-
-## 11. Open Architecture Questions — Do Not Resolve Autonomously
-
-- Optimal `LAMBDA_EDGE` (currently 0.3) — needs ablation.
-- Whether `isolated_embedding` should be shared or per-node (currently shared).
-- `MASK_NUM=8` — no ablation done with graph context.
-- `EPOCHS_STAGE1=80` — V2 used 100; reduced because feature stream doesn't
-  need LOE. May need tuning.
-- Whether Subspace IF `network` group is final — degree features are untested
-  as IF inputs.
-- Optimal `MIN_SIGNALS_FOR_PROMOTION` — currently 2; no ablation on whether
-  3-signal agreement would improve pseudo-label precision at the cost of recall.
-- Archetype expansion — `_add_context_noise()` widens existing archetype
-  geometry but the 5 archetype types are unchanged. 3–5 additional archetypes
-  (cross-cycle IP reuse, institute-cluster, income-rounding) should be evaluated
-  before the next full retrain. See Appendix B.
-
----
-
-## 12. Quantitative Claims Protocol (inherited from V2, unchanged)
-
-1. Raw stdout only. No number enters a doc without a traceable print line.
-2. Name the baseline explicitly. V3 must beat V2 best scores from §5.1.
-3. Seed everything before comparing runs.
+1. Raw stdout only — no number enters a doc without a traceable print line or
+   artifact file.
+2. Name the baseline explicitly (file, timestamp, or commit).
+3. Seed everything before comparing; remember the ±0.03–0.04 GPU scatter-add
+   noise floor on detector scores (use deterministic algorithms or CPU scoring
+   for smaller effects).
 4. Row-level counting only.
-5. No same-turn resolution.
-6. Conflicting numbers halt.
-
----
-
----
-
-# Appendix A — Dataset Ground Truth (Inherited, Do Not Re-Derive)
-
-> Sourced from executed analysis on `data_for_ml_model.csv`, confirmed across
-> V1 and V2 runs. These facts apply to V3 unchanged — the raw CSV is the same.
-
-## A.1 Primary Dataset
-
-| Property | Value |
-|---|---|
-| Rows | 15,000 |
-| Columns | 136 |
-| All applicants | Fresh applicants only (`fresh_renewal = 'F'`) |
-| Pre-Matric (`pre_post_matric = 1`) | 5,073 |
-| Post-Matric (`pre_post_matric = 2`) | 9,908 |
-| Fraud-labeled records (`sanity` not null) | 4 (0.027%) — confirmed valid in this slice; duplicate counterparts exist outside the 15,000-record boundary. **Never use as evaluation target.** |
-
-## A.2 Confirmed 100% Null Columns — Drop at Load Time
-
-```
-updated_by, delete_record, deleted_by, delete_on, delete_ip_address,
-deleted_by_level, c_university_id, p_institution_id, x_institution_id,
-xii_institution_id, competitive_exam_score, xii_course_id,
-new_entitled_fee_amount_centre_share, sub_category_id,
-updated_by-2, updated_on-2
-```
-
-## A.3 Confirmed Duplicate Columns — Keep Only One per Group
-
-```
-# State ID group (all identical): domicile_state_id == state_id == state_id-2 == pfms_state_code
-# State name group (identical):   state_name == state_name-2
-# District ID group (identical):  permanent_district_id == district_id
-# District name group (identical): district_name == district_name-2
-```
-
-Keep: `domicile_state_id`, `state_name`, `permanent_district_id`, `district_name`.
-
-## A.4 Key High-Nullity Fields
-
-| Column | Null % | Handling |
-|---|---|---|
-| `disability_percentage`, `disablity_type` | 99.49% | Fill 0 — disability is rare, expected |
-| `orphan_flag` | 99.75% | Fill 0 |
-| `gaurdian_name` | 99.77% | Fill 0 |
-| `enroll_udid_no` | 99.49% | Fill 0 |
-| `ration_card_no`, `ration_card_member_no` | 96.49% | Fill 0 |
-| `district_short_name` | 99.97% | Drop |
-
-## A.5 Confirmed Missing Fields (Do Not Engineer Proxies)
-
-```
-bank_account_no, bank_name, ifsc_code
-```
-These appear in NIC revalidation rules but are entirely absent from the CSV.
-
-## A.6 Confirmed Data Anomalies (Sanity-Check Reference)
-
-- **1 IP address submitted 39 applications.** Top 10 IPs: 15–39 applications each.
-- **1 mobile number shared by 6 applicants.** 59 mobiles shared by 2–3.
-- **Family income as low as 5 INR** — likely data entry errors or fraud.
-- **3 Post-Matric applicants exceed the 35-year age limit** but are NOT flagged
-  in `sanity`. Confirms enforcement gaps in the source system.
-- **Institute `c_institution_id=10791`** has 151 applications — highest concentration.
-
-## A.7 Fields That Must Never Appear as Features
-
-```
-sanity          — never a feature, never a label, never for evaluation
-application_id  — row identifier only
-jwt             — row identifier only
-```
-
-Also never use: `rule_violation_score`, `rule_codes_fired`, `apply_rules()`,
-any NIC rule code (X1, X7, YF, UW, YK…), any engineered bridge
-(IP_CONC_ENG, FEE_ENG, FM_ENG…), or any V1/V2 model checkpoint output.
-
----
-
-# Appendix B — Synthetic Exposure: GAN Prohibition (Hard Reference)
-
-> Source: arXiv:2604.13125 (2026 benchmark). This prohibition applies to
-> `synthetic_exposure_builder_v3.py` and any future exposure set construction.
-
-Standard tabular generators (CTGAN, TVAE, GaussianCopula, TabularARGN) fail
-severely at preserving behavioral fraud patterns — including temporal, velocity,
-and multi-account signals — with composite degradation ratios of **24x or
-more**.
-
-**Required approach:** construct the synthetic exposure set programmatically
-from the actual feature distributions. Sample a real application, duplicate its
-IP field across N rows, perturb name fields, etc. The goal is structurally
-valid fraud-shaped examples, not statistically faithful synthetic data.
-
-The five V3 archetypes (same as V2):
-
-| Archetype | Construction method |
-|---|---|
-| IP_CONCENTRATION | Sample real application; duplicate `ip_address` across 15 rows; vary `mobile_no` |
-| MOTHER_NAME_COLLISION | Pair applications; set `father_name == mother_name`; differ from `applicant_name` |
-| FEE_INFLATION | Sample high-income application; set `fee_income_ratio > 1.0` |
-| AGE_VIOLATION | Pre-matric: set `age_at_registration > 20`; post-matric: set > 35 |
-| INCOME_VIOLATION | Set `annual_family_income < 1000` |
-
-150 synthetic examples per archetype = 750 total. Use seeds distinct from
-evaluation harness seeds.
-
----
-
-# Appendix C — V1 / V2 Architecture Evolution (Historical Reference Only)
-
-> This section documents what was tried before V3 and why it was superseded.
-> None of the V1 or V2 code, model outputs, or rule logic carries into V3.
-
-## C.1 V1 — Rule-Based Supervision
-
-V1 applied 99 NIC policy rules + 8 engineered bridges to generate positive
-training labels, then trained a LightGBM classifier on those labels. Key
-outputs: `rule_violation_score`, `rule_codes_fired`, `lgbm_risk_score`.
-
-**Ceiling:** any fraud pattern not in the rulebook was invisible regardless of
-how statistically anomalous the detectors found it.
-
-**V1 standalone-VAE baseline PR-AUC** (the original evaluation floor):
-
-| Category | V1 VAE-Alone ROC-AUC | V1 VAE-Alone PR-AUC |
-|---|---|---|
-| INCOME_VIOLATION | 0.9465 | 0.1162 |
-| AGE_VIOLATION | 0.8737 | 0.0506 |
-| MOTHER_NAME_COLLISION | 0.8012 | 0.0258 |
-| FEE_INFLATION | 0.7961 | 0.0264 |
-| IP_CONCENTRATION | 0.7672 | 0.0239 |
-
-## C.2 V1.5 (Considered, Not Built)
-
-A hybrid extension that would have kept V1's rule system but upgraded how it
-interacted with learning components. V1's trained `lgbm_risk_score` would have
-been used as a distillation teacher for the tabular VAE's Stage 1 alignment
-loss; rule *concepts* would have remained while EVT replaced hand-set thresholds.
-
-**Why V2 was chosen over V1.5:** V1.5 would have baked V1's rule-bounded
-geometry into the new model's starting point, preserving the detection ceiling
-it was meant to raise. The self-training loop seeded by rule labels would have
-been biased toward known patterns from day one. See the full comparison below.
-
-| Dimension | V1.5 | V2 |
-|---|---|---|
-| Rule dependency | Reduced but present | Eliminated |
-| Cold start confidence | High — V1 model provides warm round-0 signal | Lower — EVT mutual tail only |
-| Novel pattern ceiling | Lower — Stage 1 shaped by rule-bounded geometry | Higher — no rule ceiling |
-| Explainability at launch | Stronger — rule codes provide auditable named justification | Weaker — reconstruction dims + graph neighbors |
-| Risk of V1 blind spots persisting | Real — distilling V1 score bakes in its limitations | None |
-| Self-training stability | More stable — rule-confirmed positives anchor round 0 | Less stable — EVT-only round 0 is noisier |
-
-## C.3 V2 — Five Independent Scorers
-
-V2 ran: Tabular VAE, Graph AE (DOMINANT + DeepSVDD), Isolation Forest, MCM,
-Subspace IF. EVT tail + self-training pseudo-labels replaced all rule labels.
-
-**V2 best PR-AUC results** (the floor V3 must beat — see §5.1):
-
-| Category | V2 Best | Scorer |
-|---|---|---|
-| AGE_VIOLATION | 0.1466 | MCM |
-| INCOME_VIOLATION | 0.6503 | Subspace IF |
-| IP_CONCENTRATION | 0.0370 | Graph AE |
-| MOTHER_NAME_COLLISION | 0.2869 | Graph AE |
-| FEE_INFLATION | 0.4962 | Subspace IF |
-
-**Why V3 supersedes V2:** VAE and full-space IF were redundant (MCM dominated
-both). MCM and Graph AE operated in separate worlds with no information flow
-between them. V3 unifies them into a single joint model.
-
----
-
-# Appendix D — V2 Architecture Critique (MAR Reference)
-
-> Source: internal Model and Architecture Review (June 2026), now folded inline
-> here — there is no separate `MAR_v2.md`/`MAR_v3.md` file. This appendix is the
-> canonical MAR critique.
-> Some failure modes are partially mitigated in V3; others remain.
-> Read before making changes to the hybrid model, EVT scorer, or self-training loop.
-
-## D.1 Structural Weaknesses That Persist in V3
-
-| Component | Core Assumption | Failure Condition | Failure Mode | V3 Status |
-|---|---|---|---|---|
-| DeepSVDD / Hybrid centroid | Normal data density is clean | Fraud dominates the dataset | Hypersphere inflates to accept fraud as normal — silent | **Partially mitigated** — contamination-aware init excludes top 5% embedding-norm nodes before computing centroid (`CENTROID_CLEAN_PERCENTILE=95`). Does not eliminate risk if fraud fraction > 5%. |
-| EVT Scorer | Tail fits GPD smoothly | Score distribution has discrete cluster spikes or violates regularity | Threshold explodes or drops to 0 | **Partially mitigated** — score jitter (σ=0.001) smooths discrete spikes; shape validation rejects GPD fits outside `[EVT_SHAPE_MIN, EVT_SHAPE_MAX]` = `[-0.5, 1.0]` and falls back to empirical quantile. Verified live: caught `subspace_if_score` (shape=-0.513) and `subspace_if_network` (shape=-0.533) on first run. |
-| Self-Training Loop | EVT tail contains true positives | EVT tail is mostly data entry typos (e.g., income = 5 INR) | Classifier anchors on typos, misses sophisticated fraud | **Partially mitigated** — `MIN_SIGNALS_FOR_PROMOTION=2` requires independent corroboration from ≥2 EVT signals before promotion. Single-signal noise hits (e.g. income=5 INR firing EVT_FINANCIAL alone) no longer promoted. Human EVT-tail review before Round 1 remains mandatory. |
-| Isolated nodes | Degree features make isolation visible | Applicant has unique values on all 5 edge fields AND normal-looking features | Statistically indistinguishable from a genuine isolated student | **Partially mitigated** (degree features help; forensically clean isolated fraud remains undetectable). Diagnostic added: scoring pass prints isolated-node fraction in top-100 risk scores. |
-| Stage 1 Synthetic Exposure | Archetypes represent real fraud geometry | Archetypes are too narrow or obvious | Stage 2 biased toward obvious fraud; subtle patterns treated as normal | **Partially mitigated** — each archetype now produces `N_CLEAN=50` peak-signal examples + `N_PERTURB=100` graduated variants spanning 85th–97th percentile signal strength, plus `_add_context_noise()` perturbing 25% of non-target features per row. Wider geometry. Novel fraud archetypes remain unrepresented — still needs archetype expansion. |
-
-## D.2 What Would Break First in Production
-
-**The self-training label promotion.** Without robust ground truth, relying on
-EVT mutual agreement to seed the LightGBM is the highest-risk step. A slight
-misalignment in EVT score distribution tails seeds the classifier with false
-positives, triggering semantic drift in Round 1.
-
-**Recommended mitigation (not yet implemented):** replace fully automated Round 0
-with an active learning interface where an investigator explicitly reviews the
-EVT tail before the LightGBM is ever allowed to train.
-
-## D.3 What the Metrics Don't Measure
-
-Phase D synthetic harness PR-AUC proves the system detects injected archetypes.
-It does NOT prove the system can detect zero-day real-world fraud patterns
-outside those specific synthetic topologies.
-
-## D.4 Outstanding External Dependencies
-
-- **AISHE/DISE data:** institutional geo-location data needed to structurally
-  ground `institute_application_count` into a true physical feature. Until
-  available, `state_match_flag` remains dormant.
-- **Human review of Round 0 pseudo-labels:** before Round 1 self-training,
-  NIC investigators should perform a blind review of the top EVT-flagged
-  applications to confirm cold-start precision.
-
----
-
-# Appendix E — Research Citations
-
-## E.1 Primary (directly grounds a V3 component)
-
-| Short Ref | Full Citation | Grounds |
-|---|---|---|
-| `GraphMAE` | Hou et al., "Masked Autoencoders Are Scalable Vision Learners," KDD 2022 | Feature-stream + graph-stream design in `hybrid_graphmcm_v3.py` |
-| `MaskGAE` | Li et al., NeurIPS 2022 Workshop | Joint masking of edges and features; two-error scoring |
-| `MCM` | Masked Cell Modeling, ICLR 2024 | Learned masks for tabular conditional prediction |
-| `LOE` | Qiu et al., "Latent Outlier Exposure for Anomaly Detection with Contaminated Data," ICML 2022, arXiv:2202.08088 | Graph-side Stage 1 warm-start in hybrid model |
-| `DOMINANT` | Ding et al., "Deep Anomaly Detection on Attributed Networks," SDM 2019 | RGCN encoder architecture (aggr='add', tanh bounding) |
-| `DeepSVDD` | Ruff et al., "Deep One-Class Classification," ICML 2018 | Hypersphere centroid; anomaly = distance from normal centroid |
-| `EVT-SPOT` | Siffer et al., "Anomaly Detection in Streams with Extreme Value Theory," KDD 2017 | GPD tail fitting in `evt_scorer_v3.py` |
-| `R-GCN` | Schlichtkrull et al., "Modeling Relational Data with Graph Convolutional Networks," ESWC 2018 | Typed-edge RGCN encoder |
-| `ASTRA-SelfTrain` | Karamanolakis et al., "Self-Training with Weak Supervision," NAACL 2021, arXiv:2104.05514 | Self-training promotion logic |
-| `OutlierExposure` | Hendrycks et al., "Deep Anomaly Detection with Outlier Exposure," ICLR 2019, arXiv:1812.04606 | Synthetic anomaly exposure curriculum |
-| `GNNExplainer` | Ying et al., NeurIPS 2019, arXiv:1903.03894 | XAI layer per-case explanations |
-| `PGExplainer` | Luo et al., NeurIPS 2020, arXiv:2011.04573 | XAI layer volume-scale upgrade |
-| Tabular GAN benchmark | arXiv:2604.13125 (2026) | Hard prohibition on GAN-generated exposure sets (Appendix B) |
-
-## E.2 Tech Stack
-
-| Purpose | Library | Version constraint |
-|---|---|---|
-| Data loading | `pandas` | >= 1.5 |
-| Numerical ops | `numpy` | >= 1.23 |
-| Neural networks | `torch` (PyTorch) | >= 2.0 |
-| Graph neural networks | `torch_geometric` (PyG) | >= 2.4 |
-| Graph construction | `networkx` | >= 3.0 |
-| Gradient boosting | `lightgbm` | >= 4.0 |
-| SHAP explainability | `shap` | >= 0.44 |
-| EVT / GPD fitting | `scipy.stats.genpareto` | >= 1.11 |
-| Evaluation metrics | `scikit-learn` | >= 1.2 |
-
-**Do not introduce:** `tensorflow`, `keras`, `xgboost` (unless discussed),
-SMOTE/oversampling, any autoML library, any tabular GAN (Appendix B).
-
----
-
-# Appendix F — MLOps Architecture Decisions (ADR Format)
-<!-- STATUS: Proposed | OWNER: Project Lead | DATE: 2026-06-29 -->
-<!-- These ADRs define the operational infrastructure for V3. -->
-<!-- No ADR is implemented until explicitly authorized by the project lead. -->
-
-## F.0 Context
-
-V3 has a well-designed ML architecture with zero MLOps infrastructure.
-There is no experiment tracking, model registry, artifact versioning, CI/CD,
-containerization, or observability. The file-based inter-module contracts
-(§8) are an MLOps asset — every improvement here wraps the existing `src/`
-modules without touching them.
-
-**Three-phase migration:**
-- **Phase 1 (zero-risk):** Fix the broken reproducibility baseline.
-- **Phase 2 (low-risk):** Operational layer — API, async jobs, registry, logging.
-- **Phase 3 (infrastructure):** Containerization, Kubernetes, PostgreSQL, CI/CD.
-
-**Invariant:** no `src/*.py` module is modified in any phase. Wrappers only.
-
----
-
-## ADR-001 — Fix `requirements.txt` to declare all dependencies
-
-**Status:** Implemented (2026-06-29)
-**Context:** `requirements.txt` did not declare `torch`, `torch_geometric`, or
-any operational dependencies. A fresh `pip install -r requirements.txt` on the
-production server produced a broken environment.
-**Decision:** Add pinned minimum versions for PyTorch, PyG, FastAPI, Celery,
-Redis, psycopg3, MLflow, and structlog to `requirements.txt`. Add a separate
-`requirements-dev.txt` for DVC, ruff, mypy, pytest, and pre-commit.
-**Note on PyTorch install:** the wheel is platform-specific. CPU server:
-`pip install torch --index-url https://download.pytorch.org/whl/cpu`.
-GPU laptop: `pip install torch` (default index picks the CUDA wheel).
-**Consequences:** Reproducible environments. Docker builds will succeed.
-**Files changed:** `requirements.txt`, `requirements-dev.txt` (new).
-**Phase:** 1
-
----
-
-## ADR-002 — MLflow experiment tracking
-
-**Status:** Proposed
-**Context:** Every training run overwrites `models/hybrid_graphmcm_v3.pth`
-in place. No hyperparameters, metrics, or run metadata are recorded.
-**Decision:** Wrap `main_v3.py` and `retraining_orchestrator.py` entry points
-in `mlflow.start_run()` context managers. Log all `config_v3.py` constants as
-params, all PR-AUC values from `evaluate_model_v3.py` as metrics, and model
-checkpoints as artifacts. Use local file-based MLflow tracking for Phase 1–2;
-migrate to a tracking server in Phase 3 if needed.
-**Technology chosen:** MLflow over W&B (W&B sends metadata to cloud — NIC
-data cannot leave premises) and Aim (smaller community, less mature registry).
-**Consequences:** Every run is reproducible by checkpoint. Year-over-year
-PR-AUC comparison is automatic. No `src/` module is modified.
-**Files to change:** `main_v3.py` (wrap), `retraining_orchestrator.py` (wrap),
-`src/evaluate_model_v3.py` (log metrics).
-**Phase:** 1
-
----
-
-## ADR-003 — DVC for data and artifact versioning
-
-**Status:** Proposed
-**Context:** `data/processed/` artifacts change every cycle and are not
-version-controlled. `models/*.pth` are overwritten in place. No data lineage
-exists between a model checkpoint and the dataset that produced it.
-**Decision:** `dvc init` in the repository. Track `data/processed/`,
-`models/`, and `outputs/` under DVC. Use local remote storage initially;
-upgrade to Azure Blob or S3-compatible in Phase 3.
-**Technology chosen:** DVC over LakeFS (requires S3-compatible backend,
-adds infrastructure) and Delta Lake (requires Spark, Parquet-only).
-**Consequences:** Every artifact is content-addressed. `dvc checkout` reproduces
-any prior cycle's exact state. `dvc push` provides off-site backup.
-**Files to change:** `.dvc/` (new), `.dvcignore` (new), `.gitignore` (update).
-**Phase:** 1
-
----
-
-## ADR-004 — Pre-commit hooks for code quality
-
-**Status:** Proposed
-**Context:** No automated code quality enforcement. A type error or import
-error in any `src/` module is discovered only at pipeline runtime — which may
-be months after the change was merged.
-**Decision:** Add `.pre-commit-config.yaml` with `ruff` (lint + format),
-`mypy` (type check), and `pytest --smoke` (2-epoch pipeline smoke test).
-**Consequences:** Breaking changes are caught before they reach `main`. The
-smoke test adds ~3 minutes to commit time but catches import errors immediately.
-**Files to change:** `.pre-commit-config.yaml` (new), `pyproject.toml` (new).
-**Phase:** 1
-
----
-
-## ADR-005 — FastAPI inference and supervisor server
-
-**Status:** Implemented (2026-07-02)
-**Context:** The supervisor workflow (confirm fraud, mark false positives,
-trigger retraining) currently requires a developer to run Python scripts
-directly. This is a deployment blocker for any non-technical user.
-**Decision:** Implement a 20-endpoint REST API in `src/api/`. Six endpoint
-groups: inference, supervisor feedback, training, monitoring, configuration,
-health. All training commands return a `job_id` immediately (async via
-Celery — see ADR-006). No `src/` module is modified — handlers call the
-existing `confirmed_fraud_store`, `retraining_orchestrator`, and `evt_scorer`
-functions directly.
-**Key endpoints:**
-```
-POST /v3/supervisor/confirm-fraud        → confirmed_fraud_store.add_confirmed()
-POST /v3/supervisor/mark-false-positive  → confirmed_fraud_store.add_false_positive()
-POST /v3/training/incremental            → retraining_orchestrator [async]
-POST /v3/training/full                   → main_v3.run_pipeline() [async]
-GET  /v3/training/jobs/{job_id}          → Celery task status
-POST /v3/training/decision               → human-gated none|incremental|full_retrain [ADR-014]
-GET  /v3/monitoring/drift                → _check_drift() result
-GET  /v3/monitoring/fraud-store-summary  → confirmed_fraud_store.summary()
-POST /v3/monitoring/evaluate-dataset     → read-only staged scoring + KS drift check [ADR-014]
-GET  /v3/monitoring/dataset-xai          → top-N XAI preview on staged data [ADR-014]
-GET  /v3/monitoring/top-suspicious       → top-N from outputs/top_suspicious_v3.tsv [ADR-014]
-GET  /health                             → 200 if model loaded
-GET  /ready                              → 200 if scores CSV exists
-POST /v3/training/upload-checkpoint      → checkpoint_manager.validate_and_hotswap() [multipart .pth]
-POST /v3/training/pull-checkpoint        → dvc pull + checkpoint_manager.validate_and_hotswap() [async]
-GET  /v3/model/checkpoint-info           → {version, loaded_at, mlflow_run_id, n_features, graph_emb_dim}
-POST /v3/model/rollback                  → checkpoint_manager.validate_and_hotswap(versioned_path) [async]
-```
-**Open question:** public-facing vs internal-only (VPN). If public, TLS
-termination and authentication (API keys or OAuth2) must be added. Resolve
-before Phase 2 implementation.
-**Files changed:** `src/api/main.py`, `src/api/handlers/supervisor.py`,
-`src/api/handlers/training.py`, `src/api/handlers/monitoring.py`,
-`src/api/handlers/model.py`, `src/api/schemas.py`, `src/api/__init__.py`,
-`src/api/handlers/__init__.py` (all new).
-**Actual endpoint count:** 18 (health + ready + 2 supervisor + 6 training + 5 monitoring + 2 model).
-Corrected from the original count of 13 documented above — the original
-breakdown said "4 supervisor," but only 2 supervisor endpoints (`confirm-fraud`,
-`mark-false-positive`) were ever implemented; the arithmetic was wrong even
-before ADR-014 added the 5 drift-simulation endpoints (+1 training, +3
-monitoring; `/v3/training/decision` and `/v3/monitoring/evaluate-dataset` +
-`dataset-xai` + `top-suspicious`).
-**Open question (OQ-2):** auth/VPN decision pending — CORS is `allow_origins=["*"]` until resolved.
-**Phase:** 2
-
----
-
-## ADR-006 — Celery + Redis for async job management
-
-**Status:** Implemented (2026-07-02)
-**Context:** `train_incremental()` runs ~15 minutes. `run_pipeline()` runs
-2–4 hours. HTTP endpoints cannot block for this duration.
-**Decision:** Celery with Redis as broker. Each training command returns a
-`job_id` immediately. Callers poll `GET /v3/training/jobs/{job_id}` for
-status. On the CPU server, a single Celery worker with `concurrency=1`
-serializes training jobs (training must not run concurrently).
-**Technology chosen:** Celery + Redis over Prefect (adds a UI server; overkill
-for twice-yearly jobs) and Kubeflow Pipelines (requires full K8s cluster,
-YAML pipelines, weeks of setup — too heavy for batch-once-per-year).
-**Files changed:** `src/api/tasks.py` (new), `celeryconfig.py` (new),
-`docker-compose.yml` (Redis + nic-api + nic-worker services).
-**Worker concurrency:** fixed at 1 — hard stop #16. Never scale `nic-worker` above 1 replica.
-**Phase:** 2
-
----
-
-## ADR-007 — Structured logging with structlog
-
-**Status:** Implemented (partial, 2026-07-02)
-**Context:** All modules use `print()`. On a server with cron-scheduled runs,
-logs from different runs interleave without timestamps or module tags. There
-is no machine-parseable format for alerting or aggregation.
-**Decision:** Replace `print()` calls at orchestrator and API level with
-`structlog` JSON logging. Module internals may keep `print()` — only
-`main_v3.py`, `retraining_orchestrator.py`, and `src/api/main.py` are changed.
-`structlog` is drop-in compatible with Python's `logging` module.
-**Consequences:** Logs are shippable to ELK, Loki, or CloudWatch. Each log
-line includes timestamp, module name, cycle label, and log level.
-**Files changed:** `src/api/main.py` and all `src/api/handlers/*.py` (new files — structlog added).
-**NOT changed:** `main_v3.py` and `retraining_orchestrator.py` — AGENTS.md invariant
-prohibits modifying existing `src/*.py` modules. ADR-007 is partially complete until
-the project lead decides whether to override the invariant for these two orchestrator files.
-**Phase:** 2
-
----
-
-## ADR-008 — Versioned model registry and rollback
-
-**Status:** Implemented (2026-07-02)
-**Context:** `train_incremental()` writes a single `.pth.bak` before
-overwriting. After two incremental runs the first checkpoint is gone. There
-is no way to roll back to a known-good model more than one step.
-**Decision:** After every training run, copy the checkpoint to a versioned
-path: `models/checkpoints/hybrid_graphmcm_v3_<cycle>_<mlflow_run_id>.pth`.
-Keep the last 5 versioned checkpoints. Register each in MLflow as an artifact
-with its associated PR-AUC and cycle label. Add
-`rollback_to_checkpoint(run_id)` to `retraining_orchestrator.py` that copies
-the versioned file back to `models/hybrid_graphmcm_v3.pth` and restores its
-DVC hash.
-**Consequences:** Any prior cycle's model can be restored in one command.
-PR-AUC regression is recoverable.
-**Files changed:** `src/checkpoint_manager.py` (new — atomic validation, hot-swap,
-versioned copy to `models/checkpoints/`, prune to MAX_VERSIONED=5, `.bak` backup).
-Validates `{model_state_dict, centroid, config}` keys and `N_FEATURES`/`GRAPH_EMB_DIM`/`N_EDGE_TYPES`
-against `config_v3.py` before any swap. Rollback dispatched via `POST /v3/model/rollback`.
-**Phase:** 2
-
----
-
-## ADR-009 — Feature-level drift monitoring
-
-**Status:** Proposed
-**Context:** The existing KS test (in `retraining_orchestrator.py`) monitors
-`hybrid_anomaly_score` (output). Distribution shift in individual input
-features (e.g., a policy change that inflates all reported incomes by 2×) is
-not caught until it shows up as anomaly score drift — a lagging indicator.
-**Decision:** After each cycle, compute and store mean and standard deviation
-of each of the 44 engineered features. At the next cycle, compute KS
-statistics per feature and flag any feature where p < 0.01. Log to the MLflow
-run as a metric artifact `feature_drift_v3.json`. Alert but do not block
-inference — the supervisor decides whether to proceed or wait for full retrain.
-**Consequences:** Earlier warning of dataset shift. Preserves human-gated
-philosophy of the self-training loop.
-**Files to change:** `retraining_orchestrator.py` (add `_check_feature_drift()`),
-`outputs/feature_drift_v3.json` (new output artifact).
-**Phase:** 2
-
----
-
-## ADR-010 — Docker containerization (single-image strategy)
-
-**Status:** Implemented (2026-07-02)
-**Context:** The application runs only in the developer's Python environment.
-Deployment to the CPU server requires manual environment setup.
-**Decision (revised):** Single Docker image (`nic-fraud-server`) — CPU-only,
-includes FastAPI + Celery worker + full pipeline (`main_v3.py`). The original
-two-image strategy was simplified: a separate GPU trainer image is deferred
-until a GPU server is provisioned. The single image supports both incremental
-fine-tune (~15 min on CPU) and full CPU retrain (8–16 hr via
-`POST /v3/training/full`).
-**Key implementation notes:**
-- Base image: `python:3.12-slim` — NOT 3.11. `shap>=0.52.0` requires Python ≥3.12.
-- `requirements-docker.txt` created with Linux min-version pins. The Windows
-  `requirements.txt` pip freeze cannot be used in Linux containers (Windows-specific
-  wheels cause `ResolutionImpossible`).
-- PyTorch installed separately via CPU index before `requirements-docker.txt`.
-- `WORKDIR /app` ensures all `Path("outputs/...")` calls resolve correctly.
-- `docker-compose.yml` version line omitted (obsolete in Docker Compose v2+).
-**Files changed:** `Dockerfile` (new), `docker-compose.yml` (new),
-`requirements-docker.txt` (new).
-**Phase:** 2 (brought forward from Phase 3 — needed for Phase 2 API testing)
-
----
-
-## ADR-011 — Kubernetes deployment on the CPU server
-
-**Status:** Proposed — do not implement until project lead sign-off. Docker images stable as of 2026-07-02.
-**Context:** Docker Compose has no self-healing or health-check-based restart.
-The CPU server must run unattended for the year between cycles.
-**Decision:** Single-node Kubernetes (k3s) with three deployments:
-- `nic-api`: FastAPI, 2 replicas, request 2 vCPU / 8 GB, limit 4 vCPU / 16 GB
-- `nic-worker`: Celery worker, 1 replica, request 8 vCPU / 32 GB, limit 16 vCPU / 56 GB
-  (concurrency=1 — training must not run concurrently)
-- `mlflow`: 1 replica, limit 1 vCPU / 2 GB (local file-based tracking)
-- `redis`: single pod, 512 MB
-Liveness and readiness probes hit `/health` and `/ready`. Rolling deploy for
-`nic-api` on image update; `nic-worker` is restarted manually after training
-jobs (to avoid splitting a long-running job across deploys).
-**Files to change:** `k8s/` directory (new — Deployment, Service, ConfigMap
-manifests for each component).
-**Phase:** 3
-
----
-
-## ADR-012 — PostgreSQL for ego-graph inference queries
-
-**Status:** Proposed — do not implement until project lead sign-off
-**Context:** At inference time, a new application needs its relational
-neighbors (across 5 edge types) to build a mini-subgraph for the RGCN
-encoder. Querying a `.pt` file for this at inference time is not practical.
-**Decision:** Load `data/raw/data_for_ml_model.csv` into a PostgreSQL table
-(`applications`) with indexed columns for all 5 edge-type fields (`mobile_no`,
-`ip_address`, `father_name`, `mother_name`, `pincode`). At inference time,
-query neighbors per edge type, build a mini-subgraph, run RGCN, return
-`hybrid_anomaly_score` for the new node only.
-**Open question:** cross-cycle schema design — does the `applications` table
-accumulate across years (enabling cross-cycle IP cluster detection) or rebuild
-each year? No decision made. Resolve before Phase 3 implementation.
-**Files to change:** `src/inference_server_v3.py` (new), `db/schema.sql`
-(new), `docker-compose.yml` (postgres service).
-**Phase:** 3
-
----
-
-## ADR-013 — CI/CD pipeline with GitHub Actions
-
-**Status:** Proposed — do not implement until project lead sign-off
-**Context:** No automated validation of code changes. A change to any `src/`
-module goes directly to the main branch with no gate.
-**Decision:** Three GitHub Actions jobs:
-1. `lint` — ruff + mypy on every push to any branch.
-2. `smoke` — `python main_v3.py --smoke` (2-epoch run, CPU) on pull requests
-   to `main`.
-3. `docker-build` — build both Docker images on merge to `main`.
-No GPU in CI — smoke test uses CPU with synthetic data.
-**Consequences:** Breaking changes caught within minutes. Docker images always
-current on `main`.
-**Files to change:** `.github/workflows/ci.yml` (new).
-**Phase:** 3
-
----
-
-## ADR-014 — Human-gated drift simulation and dataset evaluation
-
-**Status:** Implemented (2026-07-02)
-**Context:** There was no way to test a new/unseen dataset against the live
-model before committing it to the pipeline, and no way to trigger retraining
-in response to observed drift without a developer manually editing files and
-running `retraining_orchestrator.py` or `main_v3.py` by hand. A fully
-automatic drift→retrain loop was considered and rejected — it would override
-the documented policy in `docs/API_TESTING_GUIDE.md` §2.2 ("If
-`drift_detected: true` — stop and call the project lead before running any
-update"). ADR-014 keeps the human gate but removes the manual-file-editing
-friction.
-**Decision:** Three-step human-in-the-loop workflow, all new files under
-`src/api/` — no existing `src/*.py` pipeline module modified:
-1. `POST /v3/monitoring/evaluate-dataset` — **read-only**. Temporarily merges
-   the caller-supplied dataset into the canonical raw CSV, reruns
-   `build_base()` / `build_graph()` / `add_degree_features()` unchanged, scores
-   the new rows with the **existing** checkpoint (`src/api/inference.py`,
-   no training), computes a KS test against `outputs/prev_cycle_scores_ks.json`,
-   then restores every canonical file from a pre-merge backup
-   (`src/api/dataset_ops.py`) — leaves no lasting change, safe to re-run.
-2. `GET /v3/monitoring/dataset-xai` — reuses `xai_layer_v3._top_features()` /
-   `_narrative()` (imported, not modified) against the staged scores, so a
-   human can read explanations before deciding anything.
-3. `POST /v3/training/decision` — the only endpoint that can change state.
-   Requires an explicit `action` ∈ `{none, incremental, full_retrain}` and a
-   `decided_by` field. Every call — including `none` — appends one record to
-   `outputs/drift_audit_log.json` (`src/api/audit.py`), so "do nothing" is
-   as auditable as training. `incremental` and `full_retrain` both
-   **permanently** merge the dataset into the raw CSV (backed up first to
-   `data/backups/<timestamp>_decision_<cycle>/`) before dispatching the
-   existing (unmodified) Celery tasks — `incremental` fine-tunes on the
-   combined population, `full_retrain` rebuilds everything from combined
-   old+new data via the existing `main_v3.py` pipeline.
-**Why merge-into-canonical-path instead of a dataset parameter:** the
-pipeline invariant (F.0) prohibits modifying `src/*.py` modules in any phase,
-and `RAW_CSV` / `FINAL_CSV` / `GRAPH_PT` are hardcoded module-level constants
-in `tabular_feature_engine_v3.py`, `graph_builder_v3.py`, and
-`hybrid_graphmcm_v3.py`. Swapping the file at the canonical path (with a
-verified backup/restore or backup/keep cycle) lets every existing pipeline
-function run completely unmodified.
-**Test dataset:** `scripts/generate_drift_dataset.py` builds
-`data/raw/new_cohort_2026.csv` (600 rows) programmatically from real rows —
-an institute-cluster + income-rounding pattern, deliberately not one of the
-5 existing synthetic exposure archetypes, per Appendix B's GAN prohibition
-and the archetype-expansion open item in §11. Verified live: KS test against
-this dataset returned `p≈2.5e-39` (`drift_detected: true`), and the
-`dataset-xai` preview correctly surfaced `inst_verify_by` / `admission_year`
-/ `village_id` as the top anomalous fields.
-**Files changed:** `src/api/dataset_ops.py`, `src/api/inference.py`,
-`src/api/audit.py` (all new); `src/api/schemas.py`,
-`src/api/handlers/monitoring.py`, `src/api/handlers/training.py` (extended,
-no existing endpoint logic changed); `docs/API_TESTING_GUIDE.md` §9 (new,
-step-by-step curl walkthrough); `scripts/generate_drift_dataset.py` (new).
-**Open question:** `evaluate-dataset` is synchronous (blocks the HTTP
-response for ~30–90s on the current 15,600-row scale) rather than dispatched
-as a Celery job. Acceptable at current scale; revisit if dataset size or
-call frequency grows enough that this becomes a real request-timeout risk.
-**Phase:** 2
-
----
-
-## ADR-015 — HAN two-level attention encoder replaces the RGCN graph encoder
-
-**Status:** Accepted (2026-07-03); implementation in progress on
-`v4-han-graphmcm`. Project-lead directed; ML-architecture change (a directed
-exception to the F.0 "no `src/*.py` modification" MLOps invariant).
-**Context:** The RGCN encoder aggregates typed-edge neighborhoods with fixed,
-degree-normalized weights — every neighbor and every relation is weighted the
-same regardless of content. It cannot say *which* neighbor or *which* shared
-attribute mattered for a given node, and it partly washes out the geometry of
-a fraud cluster. It also gives no per-application attribution for XAI.
-**Decision:** Replace `RGCNEncoder` in `hybrid_graphmcm_v3.py` with a HAN-style
-encoder (Wang et al., WWW 2019 / Veličković et al., ICLR 2018):
-- **Level 1 — node-level attention (GAT) per relation.** For each of the 5
-  edge types, attention coefficients α over a node's neighbors in that
-  relation; self-loops handle empty-relation nodes.
-- **Level 2 — semantic attention across relations.** A small MLP + tanh scores
-  each relation's embedding, softmax → β_r weights, β_r-weighted fusion into
-  the final `h_N(i)`. β_r is the per-node "relation mix" (e.g. "80% shared-IP")
-  and is the attention attribution surfaced to XAI (Step D).
-**Invariants preserved (this is what "in place" means):** `h_N(i)` shape stays
-`(None, GRAPH_EMB_DIM=64)`; the isolated-node fallback in `encode_graph()` is
-bit-identical; `compute_score_frame()`'s CSV schema is byte-identical; no
-hand-set relation priority (β_r is learned).
-**Attention export & hard stop #2:** only attention *weights* (per-relation β_r,
-and top-k node-level α for a queried application) leave the model file — never
-the 64-dim embedding. β_r/α are interpretable diagnostics, not embeddings, so
-this respects hard stop #2. Aggregate β_r (mean/std per relation) is logged
-each run; per-application α is computed on demand for XAI/review, not dumped
-wholesale.
-**Backward compatibility:** V4 checkpoints carry `ARCH_VERSION = "han_v1"` in
-`config`; RGCN checkpoints fail `checkpoint_manager.validate_and_hotswap()` by
-design. First deployment needs a FULL retrain (`main_v3.py`); the HAN swap is
-NOT compatible with `train_incremental()`'s frozen-encoder path. A rolled-back
-RGCN checkpoint must be paired with RGCN code.
-**Files to change:** `src/hybrid_graphmcm_v3.py` (encoder + ARCH_VERSION in
-checkpoint), `src/config_v3.py` (HAN constants), `src/checkpoint_manager.py`
-(ARCH_VERSION validation). XAI attention export lands with ADR-016 Step D.
-**Evaluation:** ablation config 2 (HAN + feature exposure) vs config 1 (V3
-baseline). Report per-category PR-AUC deltas.
-**Phase:** — (ML architecture, outside the MLOps phase track)
-
----
-
-## ADR-016 — Topology synthetic exposure + supervisor review-and-promote cycle
-
-**Status:** Accepted (2026-07-03); implementation sequenced after ADR-015 on
-`v4-han-graphmcm`. Project-lead directed ML-architecture change.
-**Context:** Confirmed fraud today enters exposure as a 44-dim *feature vector*
-(`confirmed_fraud_store.get_exposure_tensor`), and in the graph stream even
-that collapses to the single `isolated_embedding` (`_get_synth_h` force-
-isolates every exposure node). So the model never learns fraud *topology* — a
-39-application shared-IP clique and a lone high-degree node look the same once
-reduced to `degree_shares_ip`. Supervisors also had no way to *see* the
-cluster they were confirming, or to batch decisions.
-**Decision:** Capture confirmed fraud as *subgraphs* and let the HAN encoder
-learn their shape, gated by a human review cycle.
-- **Pattern lifecycle:** `FLAGGED` (auto, from scoring: suspicious app + its
-  ego-graph) → `CONFIRMED` (supervisor agrees it is a fraud pattern; enters a
-  pending queue) → `SELECTED` (supervisor picks which pending patterns train
-  next) → `PROMOTED` (selected subset spliced into exposure + one batched
-  retrain) / `REJECTED` (false positive → hard negative). "How many patterns
-  discovered?" = CONFIRMED-not-yet-PROMOTED count.
-- **Topology exposure:** a `confirmed_fraud_graph_store` persists ego-subgraphs
-  (nodes + typed edges + β_r signature). At *promotion* (not continuously),
-  the selected subgraphs are spliced into the exposure set with edges intact
-  and run through the HAN encoder in Stage 1, so the LOE margin is defined over
-  neighborhood *shapes*, not `isolated_embedding`. The canonical exposure set
-  is rebuilt only at promotion — pending patterns never mutate the live set.
-- **No auto-retrain:** discovery accumulates; retraining is one deliberate,
-  supervisor-triggered, batched action (hard stops #5/#7). A freshly discovered
-  pattern is not specifically hardened against until the next promotion — the
-  existing model + subspace IF still flag similar cases meanwhile.
-- **Surfaces:** FastAPI is the only interactive + action surface (view topology,
-  confirm, select, trigger retrain). MLflow is audit/lineage only — it renders
-  a **static SVG** snapshot per suspicious app as a run artifact (its viewer
-  sandboxes JS, so the interactive view cannot live there) and records the
-  decision (which pattern IDs, reviewer, resulting exposure-set version).
-- **Rendering rules:** 1-hop only (2-hop on name/pincode relations exceeds
-  ~1,200 nodes — unreadable); real application_ids kept for traceability;
-  ~50-node cap with an explicit `showing X of N` and IDs-on-hover overflow;
-  edges colored by relation, nodes by risk score. Because IDs are shown, the
-  SVG artifact and pattern library inherit raw-data PII/access controls.
-**What stays identical:** `hybrid_scores_v3.csv` schema; the two-stream model
-math; the anomaly-score formula; all `_v3` names/routes/paths.
-**Files to change (planned):** new `src/confirmed_fraud_graph_store.py`,
-`src/topology_view.py` (ego-graph extraction + SVG/HTML render, read-only);
-`src/synthetic_exposure_builder_v3.py` + `src/hybrid_graphmcm_v3.py` (splice
-subgraph exposure into Stage 1); `src/xai_layer_v3.py` (attention attribution +
-topology evidence); `src/api/handlers/{monitoring,supervisor,training}.py` +
-`src/api/schemas.py` (review queue, topology endpoint, select+promote);
-`main_v3.py` (log topology SVG artifacts to MLflow).
-**Evaluation:** ablation config 3 (HAN + topology exposure) vs config 2 (HAN +
-feature exposure). Report per-category PR-AUC deltas; report the config-2
-degeneracy confound honestly (see the V4 block's ablation note).
-**Open questions:** ego-graph hop depth vs node cap tradeoff at render time;
-how many confirmed subgraphs are needed before topology exposure beats
-synthetic (the current `min_real=5` heuristic may not transfer to subgraphs);
-whether β_r signatures are stored for retrieval-style matching (a new export
-path needing explicit sign-off under hard stop #2).
-**Phase:** — (ML architecture, outside the MLOps phase track)
-
-**Status addendum (2026-07-16, applied under project-lead direction):**
-- **Promote path implemented (2026-07-15).** `promote()` in
-  `confirmed_fraud_graph_store.py` is no longer a stub: it appends each
-  promoted pattern's subgraph to `synthetic_exposure_graph_v3.pt` as one new
-  cluster (real intra-ring typed edges from `identity_graph_v3.pt`; clique
-  fallback on the reviewer-asserted relation when members share no typed
-  attribute), and records `{"appended": ...}` per pattern in an `exposure`
-  field. Retraining remains a separate, supervisor-triggered dispatch
-  (no-auto-retrain decision unchanged).
-- **New entry point into this lifecycle: supervisor CSV pattern intake
-  (2026-07-15).** `src/pattern_ingest_v3.py` +
-  `POST /v3/supervisor/pattern/{test,ingest}` let a supervisor bring in a
-  brand-new relational fraud ring as full raw-schema rows: *test* scores it
-  read-only (merge → rebuild → score → restore); *ingest* permanently merges
-  it, then enters this ADR's lifecycle via
-  `add_confirmed_pattern → select → promote` (the promote step above does the
-  exposure append), plus tabular `add_confirmed` per member. Exposure data is
-  real supervisor-confirmed records, consistent with hard stop #7.
-- **MLflow surface removed.** The audit/lineage surface described under
-  "Surfaces" (static SVG artifacts + decision records in MLflow) was replaced
-  by `model_registry.json` + the admin console's run-history view. The
-  decision record (pattern IDs, reviewer, exposure result) now lives in
-  `confirmed_fraud_graph_store.json`; PII/access-control rules stated above
-  carry over to it.
-
----
-
-## F.1 Open MLOps Questions — Do Not Resolve Autonomously
-
-- **OQ-1:** Where does the MLflow tracking server live in production? Options:
-  co-locate on CPU server (risk: single point of failure), separate VM,
-  or Azure ML as tracking backend. Depends on NIC IT constraints.
-- **OQ-2:** Is the FastAPI server public-facing or internal-only (VPN)?
-  If public: requires TLS termination, authentication, rate limiting.
-  The current API design does not include auth. Resolve before Phase 2.
-- **OQ-3:** Data retention policy for `confirmed_fraud.json` — should
-  confirmed fraud from prior years continue to influence the LOE exposure
-  set? No policy decision has been made.
-- **OQ-4:** Is `data/raw/data_for_ml_model.csv` manually exported or is there
-  an automated data ingestion step? If manual, the yearly pipeline has an
-  undocumented human dependency.
-- **OQ-5:** Should the PostgreSQL `applications` table accumulate cross-cycle
-  (enabling cross-cycle relational pattern detection) or rebuild each year?
-  Resolve before ADR-012 implementation.
-- **OQ-6:** `POST /v3/training/decision` merges the caller-supplied dataset
-  into the raw CSV permanently for `incremental`/`full_retrain` actions.
-  There is no endpoint to *undo* this beyond manually restoring from the
-  `backup_dir` the response returns. Should a `POST /v3/training/undo-decision`
-  endpoint be added, or is manual restore from `data/backups/` sufficient?
-  No decision made (ADR-014).
-
----
-
-## F.2 Migration Roadmap Summary
-
-| Phase | Duration | Key deliverables | Risk | Status |
-|---|---|---|---|---|
-| 1 — Zero-risk | 1–2 weeks | Fix requirements.txt, DVC init, MLflow wrappers, pre-commit | Zero — additive only | **Complete** |
-| 2 — Operational | 2–4 weeks | FastAPI server, Celery worker, checkpoint manager, structured logging, Docker, human-gated drift simulation (ADR-014) | Low — new files only | **Complete (2026-07-02)** |
-| 3 — Infrastructure | 4–8 weeks | Kubernetes, PostgreSQL, CI/CD | Medium — infrastructure | Not started — needs project lead sign-off |
-
-**Invariant across all phases:** no `src/*.py` module is modified.
-
----
-
-# Appendix G — Production Server Environment
-<!-- These are fixed hardware and memory constraints for the target deployment. -->
-<!-- An agent must not make architectural choices that violate these bounds. -->
-
-> **Agent instruction:** read this appendix before choosing batch sizes,
-> deciding whether to load the full graph in memory, or designing any module
-> that runs on the production server. Violating the memory budget causes an
-> OOM kill that terminates the entire training run with no checkpoint saved.
-
-## G.1 Hardware
-
-| Parameter | Value |
-|---|---|
-| CPU | 16 vCPU |
-| RAM | 64 GB |
-| OS | Ubuntu 22.04 LTS |
-| GPU | None — CPU-only PyTorch build required on server |
-| PyTorch install | `pip install torch --index-url https://download.pytorch.org/whl/cpu` |
-| Storage | k3s local-path PersistentVolume mounted at `/app` |
-
-## G.2 Memory Budget
-
-| Operational mode | Peak RSS |
-|---|---|
-| Inference-only (`nic-api`, per replica) | ~1 GB |
-| Full pipeline training (`nic-worker`) | ~8–12 GB |
-| Both running simultaneously | ~14 GB — 4× safety margin within 64 GB |
-
-No module may hold more than one full copy of the feature matrix
-(15,000 × 44 float32 ≈ 2.6 MB) AND the full graph (`identity_graph_v3.pt`,
-≈ 400–800 MB) AND the model weights (≈ 300–600 MB) simultaneously in the
-same process outside of the training window.
-
-**At inference time the graph `.pt` file is not loaded.** Only the model
-weights and the feature schema are needed. The graph is rebuilt from the
-PostgreSQL ego-graph query (ADR-012) for individual-application scoring, or
-loaded once per batch for full-cycle scoring.
-
-## G.3 CPU Full Retrain Time Estimate
-
-| Stage | GPU laptop (CUDA) | Server 16 vCPU (CPU only) |
-|---|---|---|
-| Stage 1: LOE warm-start (80 epochs) | 30–60 min | 2–4 hr |
-| Stage 2: joint reconstruction (120 epochs) | 60–90 min | 4–8 hr |
-| All other pipeline steps combined | ~50 min | ~50 min |
-| **Total** | **~2–4 hr** | **~8–16 hr** |
-
-A full retrain on the server is a blocking operation for the `nic-worker` pod.
-`nic-api` (inference serving) continues uninterrupted in its own pod.
-The smoke test (`--smoke`, 2 epochs) completes in ~5 minutes on CPU and is
-the CI gate for every pull request (ADR-013).
-
-## G.4 PyTorch CPU Thread Configuration
-
-Set these at the top of any module that runs heavy tensor operations on the
-server. Omitting them lets PyTorch default to all 16 vCPU, which causes
-contention with the `nic-api` replicas.
-
-```python
-import torch
-torch.set_num_threads(8)          # intra-op parallelism (BLAS, matmul)
-torch.set_num_interop_threads(4)  # inter-op parallelism (async ops)
-```
-
-Do not call these inside `src/` modules — set them in the Celery task wrapper
-(`src/api/tasks.py`) so the values are applied once per worker process and
-do not affect local development or the GPU laptop.
-
----
-
-# Appendix H — V4 Six-Way Architecture Comparison (canonical results)
-
-**Provenance:** `outputs/ablation/tier_comparison.json`, one CPU-deterministic run
-(RGCN scatter-add non-determinism removed), 3 seeds (42/43/44), connected-cluster
-harness + T9b held-out. Supersedes all earlier GPU runs (±0.03–0.04 noise floor).
-Injected-vs-real PR-AUC per fraud category; higher = better. All fusion classifiers
-fit on the real 15k rows with only **14 pseudo-label positives**; injected fraud is
-never in any fit set.
-
-## H.1 Modes
-
-| Mode | What it is |
-|---|---|
-| baseline | RGCN Hybrid GraphMCM (reconstruction) + subspace IF → LightGBM fusion |
-| tier1 | baseline + 11 attention read-out columns |
-| ring | subgraph ring-classifier projected to nodes |
-| max_fusion | per-node `max(baseline, tier1)` |
-| dense_block_fusion | baseline + FRAUDAR dense-block (per relation) + DevNet deviation |
-| dense_block_only | subspace + dense-block + deviation, GNN columns dropped (tests RGCN retirement) |
-
-## H.2 Aggregate PR-AUC — mean over seeds 42/43/44
-
-| Category | baseline | tier1 | ring | max_fusion | dense_block_fusion | dense_block_only |
-|---|---|---|---|---|---|---|
-| AGE_VIOLATION | **0.402** | 0.141 | 0.182 | 0.286 | 0.163 | 0.091 |
-| INCOME_VIOLATION | **0.638** | 0.180 | 0.212 | 0.586 | 0.262 | 0.052 |
-| IP_CONCENTRATION | 0.155 | 0.413 | 0.186 | 0.404 | **0.673** | 0.453 |
-| MOTHER_NAME_COLLISION | 0.341 | 0.391 | 0.390 | **0.411** | 0.098 | 0.032 |
-| FEE_INFLATION | **0.587** | 0.165 | 0.220 | 0.537 | 0.235 | 0.033 |
-| **MEAN** | 0.425 | 0.258 | 0.238 | **0.445** | 0.286 | 0.132 |
-| (std of mean) | 0.040 | 0.043 | 0.004 | 0.061 | 0.077 | 0.021 |
-
-## H.3 Held-out T9b — novel star/bipartite topologies (seed 42)
-
-| Category | baseline | tier1 | ring | max_fusion | dense_block_fusion | dense_block_only |
-|---|---|---|---|---|---|---|
-| AGE_VIOLATION | **0.444** | 0.105 | 0.149 | 0.304 | 0.226 | 0.058 |
-| INCOME_VIOLATION | **0.675** | 0.101 | 0.210 | 0.545 | 0.293 | 0.064 |
-| IP_CONCENTRATION | 0.271 | 0.424 | 0.157 | 0.387 | 0.285 | 0.230 |
-| MOTHER_NAME_COLLISION | 0.167 | 0.300 | **0.398** | 0.328 | 0.027 | 0.045 |
-| FEE_INFLATION | **0.669** | 0.084 | 0.230 | 0.539 | 0.300 | 0.057 |
-
-## H.4 What each architecture accomplished (verdicts)
-
-- **baseline** — best/near-best on all tabular (AGE/INCOME/FEE); robust; simplest.
-  Weak on IP (0.155): reconstruction is blind to dense cliques (they reconstruct
-  *easily*). The balanced incumbent.
-- **tier1** — recovers relational signal (IP 0.413, MOTHER 0.391) baseline misses,
-  but craters tabular (11 columns overfit 14 positives). Real signal, wrong fusion.
-- **ring** — most stable (std 0.004), best held-out MOTHER (0.398); never wins a
-  category on aggregate (0.238). Under-sold by a clique-only harness.
-- **max_fusion** — highest mean (0.445), marginally over baseline; keeps tabular,
-  gains MOTHER. The +0.02 is within historical noise; a safe lateral.
-- **dense_block_fusion** — **IP 0.673 vs baseline 0.155 (+0.52), the single largest
-  category gain in the project.** Explicit dense-block detection catches dense fraud
-  cliques reconstruction cannot. But regresses everything else, badly on MOTHER
-  (0.098): the real graph already has *legitimate* dense mother-name/pincode blocks
-  (siblings, geography), so the score fires on benign structure there. A specialist.
-- **dense_block_only** — worst overall (0.132); loses tabular entirely.
-  **RGCN retirement is disproven.**
-
-## H.5 Mechanism — why dense-block wins IP but loses MOTHER
-
-Dense-block detection flags density-as-suspicious. It wins on `shares_ip` because
-that relation is *sparse* in the real data, so an injected IP clique stands out.
-It loses on `shares_mother_name`/`shares_pincode` because those relations are
-*legitimately* dense (families, addresses), so the score fires on benign structure
-and misleads the classifier. On held-out star/bipartite topologies the IP edge
-largely evaporates — dense-block detects dense *blocks*, and a star is not dense.
-It is a clique specialist, not a general relational detector.
-
-## H.6 Settled architecture decision (2026-07-05)
-
-**Baseline (RGCN Hybrid GraphMCM + subspace IF + LightGBM fusion) is the backbone**
-— only balanced, tabular-strong, robust option; RGCN retirement disproven. **Add
-dense-block as a per-relation-gated arm on `shares_ip` only** — where its +0.52 win
-lives, gated away from the legitimately-dense relations. Deviation layer stays wired
-but dormant until confirmed patterns accrue. Ring kept as an independent audit
-signal, not a fusion column. Full layered design in `docs/IMPLEMENTATION.md`.
-
-**Do NOT** globally adopt dense-block/tier1/ring, retire the RGCN, or flip any flag
-ON until the IP-gated combination is run and confirmed across >3 seeds — small-seed
-comparisons are where false improvements hide.
-
-## H.7 IP-gated run on a FROZEN detector set (2026-07-05, reproducible)
-
-Dense-block gated to `shares_ip` only (`DENSE_BLOCK_RELATIONS=[1]`); detectors
-**frozen** (reused checkpoints, never retrained per run) — GPU scored. Per-seed
-baseline `[0.275, 0.235, 0.149]` reproduced identically across the CPU and GPU
-runs, confirming the freeze removes the detector-instance variance.
-
-**Aggregate mean (seeds 42/43/44):**
-
-| Category | base | db_fus | db_only | maxfus | tier1 | ring |
-|---|---|---|---|---|---|---|
-| AGE_VIOLATION | 0.147 | 0.124 | **0.469** | 0.150 | 0.082 | 0.188 |
-| INCOME_VIOLATION | 0.315 | 0.147 | **0.556** | 0.408 | 0.399 | 0.179 |
-| IP_CONCENTRATION | 0.169 | 0.224 | 0.278 | **0.364** | 0.356 | 0.195 |
-| MOTHER_NAME_COLLISION | 0.197 | 0.238 | 0.237 | 0.275 | 0.242 | **0.356** |
-| FEE_INFLATION | 0.269 | 0.128 | **0.523** | 0.347 | 0.312 | 0.197 |
-| **MEAN** | 0.220 | 0.172 | **0.413** | 0.309 | 0.278 | 0.223 |
-
-**Strongest per component:** tabular (AGE/INCOME/FEE) → `db_only` (subspace IF,
-GNN dropped); IP → `max_fusion`/`tier1` (attention geometry); MOTHER → `ring`
-(subgraph fingerprint); overall + held-out → `db_only` (held-out AGE 0.505,
-INCOME 0.569, FEE 0.620, MOTHER 0.487).
-
-**CORRECTION (verified 2026-07-05) — "GNN harmful" was a FUSION artifact, not a
-detector fact.** Scoring the *same* frozen detector **raw** via `evaluate_connected`
-(`hybrid_anomaly_score` directly, no LightGBM) gives: AGE 0.112, INCOME 0.083,
-**IP 0.511, MOTHER 0.452**, FEE 0.087 — mean **0.249**, fully consistent with the
-recorded V3 config2_rgcn_topo ablation (mean 0.25–0.30, IP 0.31–0.66, MOTHER
-0.55–0.74). **The detector is healthy and strong on relational fraud.**
-
-The low fusion numbers are the **14-positive LightGBM fusion** degrading that raw
-signal: IP 0.511→0.169, MOTHER 0.452→0.197 through the fusion. The fusion is fit on
-14 real pseudo-label positives whose structure doesn't match injected cliques, so
-it drowns the raw graph score. `db_only` "wins" the fusion comparison only because
-that metric is tabular-dominated (subspace carries AGE/INCOME/FEE) and dropping the
-GNN removes *fusion-fit noise* — NOT because the GNN signal is bad. **The RGCN raw
-score is the strongest relational detector we have.**
-
-**Implications:** (1) the compare-harness fusion baseline is a poor proxy for
-detector quality — the raw detector beats it 3x on IP/MOTHER; (2) the earlier
-"0.42 baseline" (H.2) was a lucky fusion draw above the ~0.25 typical V3 range, not
-the norm; (3) do NOT conclude the GNN should be retired — the real weak link is the
-14-positive fusion. The architecture question is how to preserve the raw IP 0.51 /
-MOTHER 0.45 signal through fusion, not whether to drop the GNN.
-
-## H.8 Score-level fusion of raw components (no LightGBM, no seeds, GPU)
-
-Rank-normalise each raw component score and combine — bypasses the 14-positive fit.
-Frozen detector, one run.
-
-| Category | rgcn_topo | subspace | dense_ip | sl_sum | sl_max |
-|---|---|---|---|---|---|
-| AGE | 0.099 | **0.632** | 0.038 | 0.183 | 0.232 |
-| INCOME | 0.082 | **0.966** | 0.038 | 0.165 | 0.340 |
-| IP | 0.414 | 0.327 | **0.713** | 0.714 | 0.385 |
-| MOTHER | 0.396 | **0.796** | 0.043 | 0.379 | 0.361 |
-| FEE | 0.071 | **0.916** | 0.038 | 0.145 | 0.323 |
-| **MEAN** | 0.212 | **0.727** | 0.174 | 0.317 | 0.328 |
-
-Held-out (star/bipartite): subspace 0.757, rgcn 0.207, dense_ip 0.095, sl_sum 0.272,
-sl_max 0.325. rgcn IP 0.367 > dense_ip 0.282 — RGCN+topology **generalises to novel
-topology better than dense-block** (a clique specialist).
-
-### LightGBM (14-positive fusion) — documented weakness
-
-The learned fusion, fit on only 14 EVT pseudo-label positives, **destroys strong raw
-signals**: subspace INCOME **0.966 → 0.315**; RGCN IP **0.51 → 0.169**. With so few,
-idiosyncratic positives the tree learns "fraud = these 14 points" and discounts any
-feature that didn't happen to separate them — including the two strongest detectors.
-It is a poor combiner in the current label regime.
-
-### Best configuration (per this analysis)
-
-`subspace_if_score` is the backbone (mean 0.727, wins 4/5 categories); IP is its only
-gap, filled by `dense_block_ip` (0.713) and raw RGCN (0.414). **Equal-weight
-score-level fusion under-performs subspace-alone** (0.32 vs 0.73) because it dilutes
-the strong per-category signal — so the target is a **routed/weighted** fusion
-(subspace-dominant + IP-specialist boost), NOT equal-weight, and NOT LightGBM until
-labels grow. Re-evaluate: RGCN+topology (relational + best topology generalisation),
-subspace IF (tabular backbone), dense-block-IP (IP specialist), under weighted score
-fusion.
-
-## H.9 Outlier-exposure (LOE) before/after tests — both exposure layers work
-
-For each component with an exposure layer: test on an anomaly it has NOT been exposed
-to, add that pattern to the exposure, retrain, retest. One run each, GPU.
-
-| Component (exposure) | Novel anomaly | BEFORE | AFTER | Δ |
-|---|---|---|---|---|
-| **RGCN topology exposure** | star/bipartite IP (exposure had only cliques) | 0.309 | **0.457** | **+0.148** |
-| **Deviation synthetic exposure** | IP archetype (leave-one-archetype-out) | 0.034 | **0.126** | **+0.092** |
-
-The RGCN result is corroborated by the variance-controlled config1→config2 ablation
-(topology exposure OFF→ON lifted IP ~0.30→0.46, +0.16) — two independent tests, same
-~+0.15 lift. **Conclusion: outlier/synthetic exposure genuinely teaches each detector
-to catch previously-unseen patterns** — the "show it a fraud shape → it learns to
-detect that shape" mechanism is validated for both the RGCN and the deviation layer.
-(The RGCN Δ includes some retrain-to-retrain variance; the deviation absolute numbers
-are low because it sees only tabular features, not graph structure — but both deltas
-are clearly positive.)
+5. No same-turn resolution — a number generated this turn cannot settle an
+   open question this turn; log as "proposed, pending."
+6. Conflicting numbers halt the task. Surface; re-derive; never reconcile by
+   narrative.
+
+## 6. When to stop and ask the project lead
+
+- A task requires modifying two modules at once.
+- A new dependency not in `requirements.txt`.
+- A result conflicts with a number recorded in `HISTORY.md` or an ablation
+  JSON.
+- A migration-step parity gate fails.
+- You are about to change the Postgres schema (`deploy/postgres/schema.sql` /
+  migrations).
+- A self-training round is ready to advance.
+- Anything would touch the fixed detection architecture (§1) or a locked
+  hyperparameter.
+- A referenced file is missing from the working directory.
+
+## 7. Open decisions (lead-owned; do not resolve autonomously)
+
+Tracked in `TECHNICAL_REFERENCE_AND_SCALING.md` §15:
+1. K_CAP and the group-size ceiling — needs a profiling query on real 3.5M
+   ingest. **Concrete supporting evidence (2026-07-22):** a `stress_testing_1`
+   artifact (382-node shares_ip structure, from sampling 50k rows with
+   replacement out of only 15k real applicants — see the generator's own
+   docstring) demonstrated the exact failure mode this decision guards
+   against: one oversized structure sets the max-anchor for
+   `dense_block_detector_v3`'s per-relation min-max normalization, compressing
+   every genuine IP-fraud ring's score (true rings topped out at 0.52, not
+   1.0) and materially hurting fused IP-cluster detection (PR-AUC 0.095→0.055
+   in that ablation). Confirmed absent from real 15k production data today
+   (max shares_ip degree 38, vs the artifact's 382) — not an active bug — but
+   directly motivates capping the normalization anchor (not just raw edge
+   count) once hub-capping is designed, not just capping edge fan-out.
+2. ~~NeighborLoader fan-out magnitude and shape~~ — **CLOSED (lead,
+   2026-07-21): exact-neighborhood batching adopted** (fanout (-1,-1); ablation
+   in IMPLEMENTATION.md step 5 — truncating fan-outs deviate up to 0.44,
+   exact mode is bit-equal to full-graph for the 2-layer RGCN; memory bounded
+   by the hub cap).
+3. `pg_trgm` vs `difflib` name similarity — equivalence check required.
+4. Postgres HA / warm standby — NIC ops policy call.
+5. Batch cadence (yearly 3.5M vs rolling cohorts) — drives the retrain
+   calendar.
+6. (carried from detection phase) Multi-seed confirmation of the locked
+   fusion — `locked_fusion_validation.json`'s 3-seed record predates the
+   2026-07-22 weighted-sum→max fusion change and the root_weight/LOE-margin
+   fixes to `hybrid_graphmcm_v3`; it validates a formula and an encoder that
+   no longer exist in production. Needs re-running against the CURRENT max
+   fusion + fixed encoder before it can be cited as confirming today's system.
+7. Real-population validation of the 2026-07-23 `LAMBDA_EDGE_SCORE=0.0`
+   change — the synthetic-population evidence (2 independently-seeded
+   stress cohorts) is solid, but on the real 15k population the reorder is
+   substantial (old/new `hybrid_anomaly_score` correlation 0.56, top-100
+   overlap 6/100) and there is no ground truth there to confirm the
+   reordering is actually an improvement, not just a different set of
+   false positives/negatives. Needs a real-outcome check (confirmed-fraud
+   agreement, or a supervisor review pass on the reordered top-N) before
+   this can be called validated end-to-end rather than "validated against
+   synthetic ground truth only."

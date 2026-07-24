@@ -16,6 +16,29 @@
 
 services:
 
+  postgres:
+    # System of record (V4-Scale step 0). Schema applied by `python -m src.db.migrate`.
+    # Host port 5433 (not 5432): avoids colliding with a native/host-installed
+    # PostgreSQL also using 5432 for local dev. Containers still reach this
+    # service at postgres:5432 internally — only the host-side mapping moved.
+    image: postgres:18
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_DB=${NIC_DB_NAME:-nic_fraud}
+      - POSTGRES_USER=${NIC_DB_USER:-nic_app}
+      - POSTGRES_PASSWORD=${NIC_DB_PASSWORD:?set in .env}
+    volumes:
+      # postgres:18 image requires the mount at /var/lib/postgresql (not
+      # .../data) — 18+ stores data in major-version-specific subdirectories
+      # (pg_ctlcluster-compatible layout); mounting at .../data breaks startup.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${NIC_DB_USER:-nic_app} -d ${NIC_DB_NAME:-nic_fraud}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   redis:
     image: redis:7-alpine
     ports:
@@ -25,6 +48,30 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  db-init:
+    # Runs once per `up`: schema migration + primary-batch ingest + JSON-store
+    # replay, so Postgres is authoritative-with-real-data from the moment
+    # nic-api/nic-worker start — not just an optional fallback target.
+    # Idempotent (migrate is IF NOT EXISTS; ingest/replay upsert-or-replace),
+    # so re-running on every `docker compose up` is safe and keeps Postgres
+    # in sync with whatever is currently in data/ and outputs/.
+    build: .
+    command: python -m src.db.bootstrap
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./outputs:/app/outputs
+    environment:
+      - NIC_DB_HOST=postgres
+      - NIC_DB_PORT=5432
+      - NIC_DB_NAME=${NIC_DB_NAME:-nic_fraud}
+      - NIC_DB_USER=${NIC_DB_USER:-nic_app}
+      - NIC_DB_PASSWORD=${NIC_DB_PASSWORD:?set in .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   nic-api:
     build: .
@@ -37,9 +84,19 @@ services:
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - NIC_DB_HOST=postgres
+      - NIC_DB_PORT=5432
+      - NIC_DB_NAME=${NIC_DB_NAME:-nic_fraud}
+      - NIC_DB_USER=${NIC_DB_USER:-nic_app}
+      - NIC_DB_PASSWORD=${NIC_DB_PASSWORD:?set in .env}
+      - NIC_READS_FROM_PG=1   # explicit: Postgres is the default read path, not opportunistic
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
@@ -62,9 +119,19 @@ services:
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - NIC_DB_HOST=postgres
+      - NIC_DB_PORT=5432
+      - NIC_DB_NAME=${NIC_DB_NAME:-nic_fraud}
+      - NIC_DB_USER=${NIC_DB_USER:-nic_app}
+      - NIC_DB_PASSWORD=${NIC_DB_PASSWORD:?set in .env}
+      - NIC_READS_FROM_PG=1
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     deploy:
       replicas: 1   # NEVER increase — concurrent training corrupts fixed-path outputs
 
@@ -80,3 +147,6 @@ services:
     depends_on:
       nic-api:
         condition: service_healthy
+
+volumes:
+  postgres-data:
