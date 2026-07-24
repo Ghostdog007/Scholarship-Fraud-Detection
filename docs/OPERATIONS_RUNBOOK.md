@@ -18,19 +18,24 @@ From the project root:
 docker compose up --build
 ```
 
-This starts six services: `postgres` (system of record, V4-Scale), `db-init`
-(one-shot — applies the schema and ingests the primary dataset + confirmed-fraud/
-pattern/run-history stores into Postgres, then exits), `redis` (broker), `nic-api`
-(FastAPI), `nic-worker` (Celery, does the training), and `nginx` (the front door).
-`nic-api`/`nic-worker` wait for `db-init` to finish successfully before starting, so
-Postgres is schema-current and populated the moment the API accepts a request — not
-just an optional fallback. `db-init` re-runs (idempotently) on every `docker compose
-up`, so Postgres stays in sync with whatever is currently in `data/`/`outputs/`. Wait
-until the logs settle — `nic-api` is ready when you see the health check passing.
+That one command brings up six services. `postgres` is the system of
+record for V4-Scale; `db-init` is a one-shot job that applies the schema
+and ingests the primary dataset plus the confirmed-fraud/pattern/run-history
+stores into Postgres, then exits. `redis` is the broker, `nic-api` is the
+FastAPI app, `nic-worker` is the Celery worker that actually does the
+training, and `nginx` is the front door. `nic-api` and `nic-worker` both
+wait for `db-init` to finish successfully before they start, so by the time
+the API accepts its first request, Postgres is already schema-current and
+populated — not just an optional fallback sitting behind it. `db-init`
+itself re-runs, idempotently, on every `docker compose up`, so Postgres
+stays in sync with whatever is currently sitting in `data/`/`outputs/`.
+Give the logs a moment to settle: `nic-api` is ready once you see its health
+check passing.
 
-Postgres is reachable from the host at `localhost:5433` (not 5432 — chosen to avoid
-colliding with a locally-installed PostgreSQL); connection settings come from a
-git-ignored `.env` at the project root (`NIC_DB_HOST/PORT/NAME/USER/PASSWORD`).
+Postgres is reachable from the host at `localhost:5433` — not 5432, which
+was chosen deliberately to avoid colliding with a locally-installed
+PostgreSQL. Connection settings come from a git-ignored `.env` at the
+project root (`NIC_DB_HOST/PORT/NAME/USER/PASSWORD`).
 
 To stop:
 
@@ -43,10 +48,11 @@ docker compose down          # stop; keep data (including the Postgres volume)
 container's cached IP and every request 502s. Restart it: `docker compose restart
 nginx`.
 
-Data lives in the mounted `./data`, `./models`, `./outputs` folders (files) and the
-`postgres-data` volume (Postgres), so it survives restarts. The console only shows
-content once a pipeline run has produced scores and cards in `outputs/` (a fresh
-checkout with empty `outputs/` shows empty queues — that's expected, not an error).
+Data lives in the mounted `./data`, `./models`, `./outputs` folders (files)
+and in the `postgres-data` volume (Postgres), so it all survives restarts.
+Keep in mind the console only shows content once a pipeline run has actually
+produced scores and cards in `outputs/` — a fresh checkout with an empty
+`outputs/` will show empty queues, and that's expected, not a bug.
 
 ---
 
@@ -71,113 +77,133 @@ and **Model audit & deploy (admin)**.
 
 This is the reviewer's main screen.
 
-- **Dataset switcher** (top-left of the queue): **Primary dataset · 15k scored
-  applications** or any **evaluated cohort** you uploaded (admin → Intake →
-  Evaluate). The primary dataset is the population the unsupervised detector is
-  fit on *and* scores (not a held-out test set — genuinely unseen data is scored
-  via an evaluated cohort). Pick a cohort to review how the model scored that
-  ingested data *read-only*, before committing it. In cohort mode a cyan banner
-  reminds you the scores are **pre-fusion** (`hybrid_anomaly_score`, bucketed by
-  within-cohort percentile). The review tools have **full visual parity** —
-  the reviewer card uses the same identity-network tab, ranked reason codes,
-  and expandable declared-vs-expected fields as the primary card, with a real
-  network preview drawn from the cohort's own graph. **3D ring**, **ego-graph**,
-  and **export** (single / all / selected) all work on cohort apps too. The
-  **Signal drivers** tab also works pre-commit (added 2026-07-22): subspace IF,
-  dense-block, and a preview fusion score are computed read-only over the
-  cohort's own merged population (`POST /evaluate-dataset`), so the same bars
-  and fusion-composition footer render as on a committed card. What's
-  genuinely different pre-commit (labeled "PREVIEW · pre-fusion" on the card,
-  never silently hidden): no EVT-threshold reason codes or model-traceability
-  margins (EVT thresholds are fitted against the canonical population, not
-  this cohort's preview — comparing a preview score to them would be
-  misleading), and
-  no Confirm-fraud / Mark-false-positive buttons (that write to the committed
-  features file, which doesn't have this app yet). Flag-for-LOE and
-  label/retrain stay gated the same way — commit the cohort first (Decide →
-  Merge). Switch back to the **Primary dataset** for those.
-  A **✕ Remove cohort** button (cohort mode only) drops that cohort from the
-  console. It first shows a warning that **all of the cohort's outputs are
-  discarded on the server** — its explanation/reviewer cards, 3D rings,
-  ego-graphs, pre-fusion scores, evidence, and the uploaded CSV — and deletes
-  them only after you accept. The base data and the downloadable sample CSV are
-  untouched. Re-upload + re-evaluate the CSV to bring the cohort back. (Good
-  for a demo: add a dataset, show it, remove it.)
-- **Status tiles** (top): confirmed-fraud count, false-positive count, live
-  checkpoint size, and the current drift recommendation.
-- **Top suspicious applications**: the ranked queue from the last pipeline run,
-  paged **50 per page** with **← Prev / Next →** at the bottom (it covers the full
-  flagged set — ~500 carded applications — not just the top 50). The pager shows
-  "Showing a–b of N flagged · Page x / y". Click any row to open it. Each row
-  carries a colored **risk badge** (High / Medium / Low).
-- **Triage toolbar** (above the queue): tick rows (or **Select all** — which
-  selects the current page), then filter by application-ID or risk level.
-  **Selection persists across pages**, so you can gather members of one ring from
-  several pages before acting. With rows selected you can:
-  - **⚑ Label / retrain selected** — opens a batch dialog where you tag each
-    application confirmed-fraud (with type) or false-positive, enter your name,
-    then either **Record labels only** or **Record + retrain (incremental)**.
-    The retrain is the human gate — recording labels alone changes nothing.
-    Tick **smoke test** for a fast dry run. The job id + live status appear in
-    the dialog.
-  - **◈ Flag for LOE (selected)** — sends every selected application to the
-    Pattern queue together as one candidate ring. Opens the same Flag-for-LOE
-    dialog (below) pre-filled with all the IDs; set the fraud type, shared link,
-    and your name, then **Record pattern**. The console then jumps to the Pattern
-    queue where the new candidate shows as *pending*. (Use this to flag a ring in
-    bulk; use the per-card **⚑ Flag for LOE** to flag a single open application.)
-  - **⤓ Export selected** — downloads one zip of the chosen applications
-    (scorecard CSV + reviewer card + 3D identity ring + evidence, per app,
-    plus a combined `manifest.csv`).
-  - **✕ Remove selected** / **↺ Restore removed** — hide triaged rows for this
-    session only; server data is untouched.
-- **Reviewer card** (opens below the row): the full evidence card for that
-  application — a risk gauge, the ranked reason codes, per-field
-  *declared-vs-model-expected* comparison bars, and an interactive identity
-  network. It has its own built-in buttons to **Confirm fraud**, **Mark false
-  positive**, or **Undo label** — those write straight to the confirmed-fraud
-  store. (After submitting, hit **Refresh** on the queue to update the tiles.)
-- **Topology detail** — the buttons above the card:
-  - **◎ 3D identity ring** — a rotatable 3-D view of the application and everyone
-    it shares an IP / mobile / name / pincode with.
-  - **⌗ Ego-graph** — a flat neighbourhood graph of the same.
-  Both open in a large pop-up with a Ring ⇄ Ego toggle, an **↗ Open in new tab**
-  button, and close on **Esc** or clicking outside.
-- **⚑ Flag for LOE** — records the application (and the ring of IDs you name) as
-  a candidate fraud *pattern*, sending it to the Pattern queue.
-- **"Already flagged?" banner** — when you open a flagged application, the console
-  checks whether its **IP cluster** has already been flagged in a previous session
-  (a soft match on the shared-IP link). If so, an amber banner names the earlier
-  pattern(s) and whether they're already in LOE exposure. It's a **heuristic, not a
-  block** — open the **◎ 3D identity ring** to confirm it's the same ring before
-  re-flagging, so the same cluster isn't added twice. Cross-check under **Pattern
-  queue → Flagged history**.
+At the top-left of the queue sits the **dataset switcher**, which lets you
+choose between the **Primary dataset · 15k scored applications** and any
+**evaluated cohort** you've uploaded (via admin → Intake → Evaluate). The
+primary dataset is the population the unsupervised detector is both fit on
+and scores — it isn't a held-out test set; genuinely unseen data only gets
+scored by way of an evaluated cohort. Picking a cohort lets you review how
+the model scored that ingested data *read-only*, before you commit anything.
+In cohort mode a cyan banner reminds you the scores are **pre-fusion**
+(`hybrid_anomaly_score`, bucketed by within-cohort percentile). The review
+tools have **full visual parity** here — the reviewer card uses the same
+identity-network tab, ranked reason codes, and expandable
+declared-vs-expected fields as the primary card, with a real network preview
+drawn from the cohort's own graph, and **3D ring**, **ego-graph**, and
+**export** (single / all / selected) all work on cohort apps too. The
+**Signal drivers** tab also works pre-commit (added 2026-07-22): subspace
+IF, dense-block, and a preview fusion score are computed read-only over the
+cohort's own merged population (`POST /evaluate-dataset`), so the same bars
+and fusion-composition footer render as on a committed card. What's
+genuinely different pre-commit — and this is labeled "PREVIEW · pre-fusion"
+on the card, never silently hidden — is that there are no EVT-threshold
+reason codes or model-traceability margins (EVT thresholds are fitted
+against the canonical population, not this cohort's preview, so comparing a
+preview score against them would be misleading), and there are no
+Confirm-fraud / Mark-false-positive buttons, since those write to the
+committed features file and this application isn't in it yet.
+Flag-for-LOE and label/retrain stay gated the same way: commit the cohort
+first (Decide → Merge), or switch back to the **Primary dataset** for those.
+A **✕ Remove cohort** button, available in cohort mode only, drops that
+cohort from the console — it first warns that **all of the cohort's outputs
+are discarded on the server** (its explanation/reviewer cards, 3D rings,
+ego-graphs, pre-fusion scores, evidence, and the uploaded CSV) and only
+deletes them once you accept. The base data and the downloadable sample CSV
+are untouched, so re-uploading and re-evaluating the CSV brings the cohort
+back — handy for a demo where you want to add a dataset, show it, and remove
+it again.
+
+Across the top of the queue sit the **status tiles**: confirmed-fraud count,
+false-positive count, live checkpoint size, and the current drift
+recommendation.
+
+Below that is the **Top suspicious applications** list — the ranked queue
+from the last pipeline run, paged **50 per page** with **← Prev / Next →**
+at the bottom. It covers the full flagged set (~500 carded applications),
+not just the top 50, and the pager shows "Showing a–b of N flagged · Page
+x / y." Click any row to open it; each row carries a colored **risk badge**
+(High / Medium / Low).
+
+Above the queue is the **triage toolbar**: tick rows (or use **Select all**,
+which selects the current page), then filter by application-ID or risk
+level. Selection persists across pages, so you can gather members of one
+ring from several pages before acting on them together. With rows selected
+you have four options:
+
+- **⚑ Label / retrain selected** opens a batch dialog where you tag each
+  application confirmed-fraud (with type) or false-positive, enter your
+  name, then either **Record labels only** or **Record + retrain
+  (incremental)**. The retrain is the human gate — recording labels alone
+  changes nothing. Tick **smoke test** for a fast dry run. The job id and
+  live status appear in the dialog.
+- **◈ Flag for LOE (selected)** sends every selected application to the
+  Pattern queue together as one candidate ring. It opens the same
+  Flag-for-LOE dialog described below, pre-filled with all the IDs — set
+  the fraud type, shared link, and your name, then **Record pattern**. The
+  console then jumps to the Pattern queue, where the new candidate shows as
+  *pending*. Use this to flag a ring in bulk; use the per-card **⚑ Flag for
+  LOE** to flag a single open application instead.
+- **⤓ Export selected** downloads one zip of the chosen applications
+  (scorecard CSV + reviewer card + 3D identity ring + evidence, per app,
+  plus a combined `manifest.csv`).
+- **✕ Remove selected** / **↺ Restore removed** hide triaged rows for this
+  session only — server data is untouched either way.
+
+Opening a row expands the **reviewer card** below it: the full evidence
+card for that application, with a risk gauge, the ranked reason codes,
+per-field *declared-vs-model-expected* comparison bars, and an interactive
+identity network. The card has its own built-in buttons to **Confirm
+fraud**, **Mark false positive**, or **Undo label** — these write straight
+to the confirmed-fraud store. After submitting, hit **Refresh** on the
+queue to update the tiles.
+
+Above the card sit two **topology detail** buttons: **◎ 3D identity ring**
+opens a rotatable 3-D view of the application and everyone it shares an
+IP / mobile / name / pincode with, and **⌗ Ego-graph** opens a flat
+neighbourhood graph of the same thing. Both open in a large pop-up with a
+Ring ⇄ Ego toggle, an **↗ Open in new tab** button, and close on **Esc** or
+by clicking outside.
+
+The per-card **⚑ Flag for LOE** button records the application (and the
+ring of IDs you name) as a candidate fraud *pattern*, sending it to the
+Pattern queue.
+
+One more thing worth knowing: when you open a flagged application, the
+console checks whether its **IP cluster** has already been flagged in a
+previous session, using a soft match on the shared-IP link. If it has, an
+amber "Already flagged?" banner names the earlier pattern(s) and whether
+they're already in LOE exposure. This is a **heuristic, not a block** — open
+the **◎ 3D identity ring** to confirm it's genuinely the same ring before
+re-flagging, so the same cluster doesn't get added twice, and cross-check
+under **Pattern queue → Flagged history** if you want to be sure.
 
 ---
 
 ## 4. Pattern queue (LOE) — confirm and promote fraud patterns
 
-Candidate patterns flagged from reviewer cards land here.
+Candidate patterns flagged from reviewer cards land here. Each pending
+pattern shows its id, fraud type, and the sub-graph you flagged. Tick the
+ones you want to act on and click **Promote selected patterns** —
+promotion appends each pattern's ring to the model's **topology-exposure
+set** (extracting the members' real shared-attribute edges, or a clique on
+the relation you asserted) and dispatches an **incremental retrain** so the
+model learns them. Tick **smoke test** first for a fast, no-real-training
+dry run. The job id and live status appear beneath the button.
 
-- Each pending pattern shows its id, fraud type, and the sub-graph you flagged.
-- Tick the ones you want to act on and click **Promote selected patterns**.
-  Promotion appends each pattern's ring to the model's **topology-exposure set**
-  (extracting the members' real shared-attribute edges, or a clique on the
-  relation you asserted) and dispatches an **incremental retrain** so the model
-  learns them. Tick **smoke test** first for a fast, no-real-training dry run.
-- The job id and live status appear beneath the button.
-- **Flagged history** (bottom panel) — the persistent record of **every** ring
-  flagged for LOE across all sessions (survives restarts), with a state badge
-  (pending / promoted / rejected), an **"in LOE exposure"** tag + cluster id once
-  promoted, its members, and who flagged it when. This is the store the
-  "already flagged?" banner matches against — use it to verify before re-adding.
-  - **Delete** — tick rows (or **Select all**) and click **✕ Delete selected** to
-    remove flagged patterns from the history (cleanup of mistaken or test flags).
-    This deletes the **record only**: if a pattern was already **promoted**, its
-    ring may already be in the topology-exposure set and the current checkpoint —
-    deleting the record does **not** un-train the model or remove the exposure
-    cluster (that needs a rebuild/retrain). The confirm dialog warns you when any
-    selected pattern is promoted.
+At the bottom of the screen, **Flagged history** is the persistent record
+of **every** ring flagged for LOE across all sessions — it survives
+restarts — with a state badge (pending / promoted / rejected), an "in LOE
+exposure" tag plus cluster id once promoted, its members, and who flagged
+it when. This is the store the "already flagged?" banner matches against,
+so it's also where you go to verify before re-adding a ring.
+
+To clean up mistaken or test flags, tick rows (or **Select all**) and click
+**✕ Delete selected**. This deletes the **record only**: if a pattern was
+already **promoted**, its ring may already be in the topology-exposure set
+and baked into the current checkpoint, so deleting the record does **not**
+un-train the model or remove the exposure cluster — that needs a rebuild or
+retrain. The confirm dialog warns you when any selected pattern is
+promoted, so you don't delete the record without noticing.
 
 ---
 
@@ -189,27 +215,29 @@ Candidate patterns flagged from reviewer cards land here.
 
 This tab replaces the old MLflow dashboard — all model state lives here.
 
-**Running model — status** (top strip): the live checkpoint (size, feature and
-edge counts), the scored-population size, confirmed / false-positive counts, the
-drift recommendation, the last evaluation's PR-AUC numbers, and the last run.
-Hit **↻ Refresh** to re-read.
+The **Running model — status** strip at the top shows the live checkpoint
+(size, feature and edge counts), the scored-population size, confirmed and
+false-positive counts, the drift recommendation, the last evaluation's
+PR-AUC numbers, and the last run. Hit **↻ Refresh** to re-read it.
 
-**Drift explanation — should you full-retrain?**: plain-English rationale for the
-drift decision, built only from numbers the pipeline already computed — the
-overall score-distribution KS p-value vs the alert threshold, and a table of the
-model features that shifted most. Counts cover the **44 model features** (the 24
-dropped identifier columns are excluded and noted). A red verdict means a full
-retrain is recommended before the next incremental update.
+Below that, **Drift explanation — should you full-retrain?** gives a
+plain-English rationale for the drift decision, built only from numbers the
+pipeline already computed: the overall score-distribution KS p-value versus
+the alert threshold, plus a table of the model features that shifted most.
+The counts cover the **44 model features** — the 24 dropped identifier
+columns are excluded and noted as such. A red verdict means a full retrain
+is recommended before the next incremental update.
 
-**Deployment loop** — four numbered steps, top to bottom:
+### The deployment loop
 
-   A blue **"What your CSV needs"** note at the top of Intake lists the required
-   raw columns (incl. the identity fields — `ip_address`, `mobile_no`,
-   `father_name`, `mother_name`, `permanent_pincode` — that build the 3D ring) and
-   reassures that **the system does its own feature engineering** (raw → 44 model
-   features); you supply raw columns only. **Download sample CSV** there gives a
-   ready-to-fill file (`frontend/sample_cohort.csv`) with fresh IDs and a planted
-   shared-IP ring.
+The deployment loop is four numbered steps, top to bottom. A blue **"What
+your CSV needs"** note at the top of Intake lists the required raw columns
+(including the identity fields — `ip_address`, `mobile_no`, `father_name`,
+`mother_name`, `permanent_pincode` — that build the 3D ring) and reassures
+you that **the system does its own feature engineering** (raw → 44 model
+features); you only ever supply raw columns. **Download sample CSV** there
+gives you a ready-to-fill file (`frontend/sample_cohort.csv`) with fresh IDs
+and a planted shared-IP ring.
 
 1. **Intake** — first pick **what the data is for**:
    - **New cohort to score** (default) — drag a cohort **CSV** onto the drop-zone
@@ -282,11 +310,11 @@ Decide step.
 
 ### 5b. Triggering a full retrain straight from Postgres (no CSV) — added 2026-07-23
 
-Once data is merged (§5a steps 1–4 above, by any route — cohort Merge, LOE
-pattern Ingest/Promote), a full retrain can be dispatched via the API so it
-reads every merged batch **directly from Postgres**, with no CSV file
-involved at all — useful for scripted/portal-triggered retrains that don't
-go through the console's Decide button.
+Once data has been merged — by any route covered in §5a: cohort Merge, or
+LOE pattern Ingest/Promote — a full retrain can be dispatched via the API so
+it reads every merged batch **directly from Postgres**, with no CSV file
+involved at all. This is aimed at scripted or portal-triggered retrains that
+don't go through the console's Decide button.
 
 There is no console button for this yet — it's API-only:
 
@@ -299,20 +327,20 @@ curl -X POST "http://localhost:8080/v3/training/full?data_source=postgres"
 poll it the same way as any other training job (`GET
 /v3/training/jobs/{job_id}`, or Admin → Watch, pasting the job id in).
 
-**What this does and doesn't do:**
-- It only changes **where the retrain reads its raw data from** — Postgres
-  instead of `data/raw/data_for_ml_model.csv`. It does **not** merge,
-  preprocess, or stage anything by itself. If nothing has been merged since
-  the last file-based retrain, a `postgres`-sourced retrain sees the same
-  population as the primary 15k (plus whatever cohorts/patterns are already
-  merged) — it is not a way to skip Evaluate/Decide.
-- Omit `data_source` (or pass `data_source=file`, the default) to keep
-  today's behavior — reads the CSV, exactly as before. Nothing changes for
-  existing callers.
-- Every downstream pipeline step (graph build, training, EVT, fusion, XAI)
-  is unaffected either way — the switch only touches the first two pipeline
-  steps (feature engineering + graph build), and both paths write to the
-  same canonical files those downstream steps already read.
+It's worth being precise about what this does and doesn't do. It only
+changes **where the retrain reads its raw data from** — Postgres instead of
+`data/raw/data_for_ml_model.csv` — and does **not** merge, preprocess, or
+stage anything by itself. If nothing has been merged since the last
+file-based retrain, a `postgres`-sourced retrain sees exactly the same
+population as the primary 15k (plus whatever cohorts/patterns are already
+merged); it is not a way to skip Evaluate/Decide. Omitting `data_source`
+(or passing `data_source=file`, the default) keeps today's behavior —
+reads the CSV, exactly as before — so nothing changes for existing
+callers. And every downstream pipeline step (graph build, training, EVT,
+fusion, XAI) is unaffected either way, since the switch only touches the
+first two pipeline steps (feature engineering + graph build), and both
+paths write to the same canonical files those downstream steps already
+read.
 
 ### 5c. Getting data in without the console at all — CSV-free portal/ETL push (added 2026-07-23)
 
@@ -350,20 +378,22 @@ this runbook.
    step 4) or `POST /v3/training/decision` to Merge + incremental/full
    retrain when you're ready, exactly as with a console-uploaded cohort.
 
-**Run history**: every training run and checkpoint swap (newest first) — when,
-type, cycle, metrics, checkpoint size. This is the audit trail.
+Below the deployment loop, **Run history** lists every training run and
+checkpoint swap, newest first — when, type, cycle, metrics, checkpoint
+size. This is the audit trail.
 
-**Install pretrained checkpoint (.pth)**: trained the model elsewhere (e.g. a
-full GPU retrain on the laptop)? Upload the `.pth` here with a cycle label and
-a source note. The server validates it **before anything changes** — the file
-must contain `{model_state_dict, centroid, config}` with this deployment's
-exact feature/edge dimensions, or it is rejected and the live model stays as
-it was. On success the server backs up the current checkpoint, keeps a
-versioned copy, and hot-swaps atomically; the job status shows in the panel.
-(Same mechanism scripted: `POST /v3/training/upload-checkpoint`.)
+If you trained the model elsewhere — say, a full GPU retrain on a laptop —
+**Install pretrained checkpoint (.pth)** lets you upload the `.pth` here
+with a cycle label and a source note. The server validates it **before
+anything changes**: the file must contain `{model_state_dict, centroid,
+config}` with this deployment's exact feature/edge dimensions, or it is
+rejected outright and the live model stays exactly as it was. On success
+the server backs up the current checkpoint, keeps a versioned copy, and
+hot-swaps atomically; the job status shows in the panel. The same mechanism
+is available scripted, via `POST /v3/training/upload-checkpoint`.
 
-**Rollback checkpoint**: paste a versioned checkpoint path (shown in run
-history) and roll the live model back to it — the undo for a bad install.
+**Rollback checkpoint** is the undo for a bad install: paste a versioned
+checkpoint path (shown in run history) and roll the live model back to it.
 
 ---
 
@@ -385,22 +415,21 @@ every required column.
 | **Confirmed fraud / false positives (individual labels)** | No CSV — reviewer card buttons or the batch Label/retrain dialog | Only an `application_id` that already exists in the scored population. Feature vectors are pulled automatically. |
 | **Bulk / portal ingestion (V4-Scale, in progress)** | Direct to PostgreSQL staging | Same contract: raw-schema rows only into the staging batch; nothing derived until an admin triggers Evaluate/Merge. |
 
-Columns that actually drive detection (get these right first):
-
-- **Identity / graph (the 5 relations + rings):** `ip_address`, `mobile_no`,
-  `father_name`, `mother_name`, `permanent_pincode` — plus `applicant_name`
-  for the name-similarity signals.
-- **Financial:** `annual_family_income`, `admission_fee`, `tution_fee`,
-  `misc_fee`.
-- **Temporal:** `date_of_birth`, `registered_date` (→ age at registration).
-- **Context:** `permanent_district_id`, `domicile_state_id` (income
-  rank/deviation), `c_institution_id` (institute concentration), `gender`,
-  `rural_urban`, and the boolean flags (`disability_flag`, `orphan_flag`,
-  `hosteller`, `is_singlegirlchild`).
-- **Ignored by the model but still required by the schema check:** the
-  null/duplicate/audit columns (`updated_by`, `delete_*`, `state_id-2`, …)
-  and `sanity` / `jwt` (never used — hard stop). Fill them with empty/0
-  values if you have nothing; they just have to exist.
+If you're filling in a CSV by hand, the columns that actually drive
+detection are the ones worth getting right first. On the identity/graph
+side (the 5 relations plus the rings), that's `ip_address`, `mobile_no`,
+`father_name`, `mother_name`, `permanent_pincode`, plus `applicant_name`
+for the name-similarity signals. On the financial side, it's
+`annual_family_income`, `admission_fee`, `tution_fee`, `misc_fee`. On the
+temporal side, `date_of_birth` and `registered_date` (which together give
+age at registration). And for context, `permanent_district_id` and
+`domicile_state_id` (income rank/deviation), `c_institution_id` (institute
+concentration), `gender`, `rural_urban`, and the boolean flags
+(`disability_flag`, `orphan_flag`, `hosteller`, `is_singlegirlchild`).
+Everything else — the null/duplicate/audit columns (`updated_by`,
+`delete_*`, `state_id-2`, …) and `sanity` / `jwt` (never used — hard stop)
+— is ignored by the model but still required by the schema check, so fill
+them with empty/0 values if you have nothing; they just have to exist.
 
 ---
 
@@ -427,3 +456,4 @@ Columns that actually drive detection (get these right first):
 | Install a GPU-laptop-trained model | Admin → Install pretrained checkpoint |
 | Undo a bad checkpoint | Admin → Rollback |
 | Stop everything | `docker compose down` |
+</content>
