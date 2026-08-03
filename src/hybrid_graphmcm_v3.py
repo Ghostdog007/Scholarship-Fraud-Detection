@@ -930,10 +930,34 @@ def _global_edge_target(data, n_nodes: int) -> torch.Tensor:
 
 
 def _make_neighbor_loader(data, fanout: tuple[int, int], batch_size: int,
-                          shuffle: bool, seed: int = RANDOM_SEED):
+                          shuffle: bool, seed: int = RANDOM_SEED,
+                          relation_ids: list[int] | None = None):
+    """fanout: neighbors sampled per hop, per relation, at each of the 2 RGCN
+    layers -- e.g. (25, 10) would sample up to 25 layer-1 neighbors then up to
+    10 layer-2 neighbors per node. This function exists ONLY because at 30-40
+    lakh (3-4M) applications, a full-batch forward/backward pass (today's
+    train(), used for the current 15k rows) no longer fits in memory or a
+    reasonable step time -- NeighborLoader mini-batches by sampling a bounded
+    local neighborhood per node instead of loading the whole graph every step.
+    Fan-out magnitude/shape WAS an open decision (docs/AGENTS.md §7 item 2) --
+    CLOSED 2026-07-21: docs/IMPLEMENTATION.md step 5's 1M-scale ablation
+    showed truncated fan-outs deviate from the full-graph score by up to 0.44,
+    while exact-neighborhood (-1, -1) (sample ALL neighbors, no cap) is
+    bit-equal to full-graph for this 2-layer RGCN, memory-bounded by the hub
+    cap -- callers (score_sampled/train_sampled) default to (-1, -1)
+    accordingly; a caller passing a truncated tuple here is deliberately
+    deviating from the adopted config, not using an unset default.
+    relation_ids: if given, only these EDGE_TYPES indices get real fan-out --
+    every other relation gets [0, 0] (sample nothing), so NeighborLoader never
+    materializes neighbors for a relation the encoder won't consume
+    (ENCODER_RELATION_IDS) -- kept as a dict entry rather than omitted so
+    `data.edge_types` positions stay stable for _batch_inputs."""
     from torch_geometric.loader import NeighborLoader
     torch.manual_seed(seed)
-    num_neighbors = {et: list(fanout) for et in data.edge_types}
+    num_neighbors = {
+        et: (list(fanout) if relation_ids is None or rel_id in relation_ids else [0, 0])
+        for rel_id, et in enumerate(data.edge_types)
+    }
     return NeighborLoader(
         data,
         num_neighbors=num_neighbors,
@@ -943,14 +967,23 @@ def _make_neighbor_loader(data, fanout: tuple[int, int], batch_size: int,
     )
 
 
-def _batch_inputs(batch, data, device: torch.device, iso_global: torch.Tensor):
+def _batch_inputs(batch, data, device: torch.device, iso_global: torch.Tensor,
+                  relation_ids: list[int] | None = None):
     """Per-batch tensors in the exact shape the model's forward expects.
     Relation ids follow enumerate(data.edge_types) — the same ordering
-    _build_edge_index_and_types uses, so β_r indices stay consistent."""
+    _build_edge_index_and_types uses, so β_r indices stay consistent.
+    relation_ids: mirrors _build_edge_index_and_types's param — restricts
+    which relations' sampled edges reach the encoder (ENCODER_RELATION_IDS).
+    _make_neighbor_loader already zeroes fan-out for excluded relations, so
+    batch[edge_type] would be empty for them regardless; this is the
+    belt-and-suspenders check so the encoder's input is correct even if a
+    caller passes a loader built without the same relation_ids."""
     x = batch["application"].x.to(device)
     n_id = batch["application"].n_id
     edge_index_list, type_ids = [], []
     for rel_id, edge_type in enumerate(data.edge_types):
+        if relation_ids is not None and rel_id not in relation_ids:
+            continue
         ei = batch[edge_type].edge_index.to(device)
         if ei.shape[1] > 0:
             edge_index_list.append(ei)
@@ -963,7 +996,7 @@ def _batch_inputs(batch, data, device: torch.device, iso_global: torch.Tensor):
 
 
 @torch.no_grad()
-def score_sampled(fanout: tuple[int, int] = (25, 10), batch_size: int = 1024,
+def score_sampled(fanout: tuple[int, int] = (-1, -1), batch_size: int = 1024,
                   device: torch.device = DEVICE, seed: int = RANDOM_SEED,
                   data=None, x_override=None, model=None) -> pd.DataFrame:
     """hybrid_scores frame via NeighborLoader — same schema/normalisation as
@@ -995,9 +1028,11 @@ def score_sampled(fanout: tuple[int, int] = (25, 10), batch_size: int = 1024,
     prob_all = torch.zeros(n_nodes, N_EDGE_TYPES)
     x_seed_all = torch.zeros(n_nodes, N_FEATURES)
 
-    loader = _make_neighbor_loader(data, fanout, batch_size, shuffle=False, seed=seed)
+    loader = _make_neighbor_loader(data, fanout, batch_size, shuffle=False, seed=seed,
+                                    relation_ids=ENCODER_RELATION_IDS)
     for batch in loader:
-        x, eil, ett, iso, n_id, n_seed = _batch_inputs(batch, data, device, iso_global)
+        x, eil, ett, iso, n_id, n_seed = _batch_inputs(batch, data, device, iso_global,
+                                                         relation_ids=ENCODER_RELATION_IDS)
         pred_x, edge_prob, _, _ = model(x, eil, ett, iso)
         seed_ids = n_id[:n_seed]
         pred_all[seed_ids] = pred_x[:n_seed].cpu()
@@ -1024,7 +1059,7 @@ def score_sampled(fanout: tuple[int, int] = (25, 10), batch_size: int = 1024,
     })
 
 
-def train_sampled(data, x_synth, topo_pack, fanout: tuple[int, int] = (25, 10),
+def train_sampled(data, x_synth, topo_pack, fanout: tuple[int, int] = (-1, -1),
                   batch_size: int = 1024, epochs_s1: int = EPOCHS_STAGE1,
                   epochs_s2: int = EPOCHS_STAGE2, device: torch.device = DEVICE,
                   seed: int = RANDOM_SEED, log_every: int = 1) -> "HybridGraphMCM":
@@ -1044,11 +1079,13 @@ def train_sampled(data, x_synth, topo_pack, fanout: tuple[int, int] = (25, 10),
     model = HybridGraphMCM().to(device)
 
     # Centroid init from sampled embeddings (batched, no full-graph pass).
-    loader = _make_neighbor_loader(data, fanout, batch_size, shuffle=False, seed=seed)
+    loader = _make_neighbor_loader(data, fanout, batch_size, shuffle=False, seed=seed,
+                                    relation_ids=ENCODER_RELATION_IDS)
     hs = []
     with torch.no_grad():
         for batch in loader:
-            x, eil, ett, iso, n_id, n_seed = _batch_inputs(batch, data, device, iso_global)
+            x, eil, ett, iso, n_id, n_seed = _batch_inputs(batch, data, device, iso_global,
+                                                             relation_ids=ENCODER_RELATION_IDS)
             h = model.encode_graph(x, eil, ett, iso)[:n_seed]
             hs.append(h.cpu())
     h_all = torch.cat(hs)
@@ -1068,10 +1105,12 @@ def train_sampled(data, x_synth, topo_pack, fanout: tuple[int, int] = (25, 10),
             t0 = _time.time()
             lam_t = LAMBDA_EXPOSURE * (1.0 - epoch / max(n_epochs, 1))
             loader = _make_neighbor_loader(data, fanout, batch_size,
-                                           shuffle=True, seed=seed + epoch)
+                                           shuffle=True, seed=seed + epoch,
+                                           relation_ids=ENCODER_RELATION_IDS)
             agg = {"loss": 0.0, "n": 0}
             for batch in loader:
-                x, eil, ett, iso, n_id, n_seed = _batch_inputs(batch, data, device, iso_global)
+                x, eil, ett, iso, n_id, n_seed = _batch_inputs(batch, data, device, iso_global,
+                                                                 relation_ids=ENCODER_RELATION_IDS)
                 optimizer.zero_grad()
                 if stage == "S1":
                     h_n = model.encode_graph(x, eil, ett, iso)[:n_seed]

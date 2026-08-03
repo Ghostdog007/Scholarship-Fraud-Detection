@@ -595,6 +595,49 @@ screen-by-screen operator walkthrough see `docs/OPERATIONS_RUNBOOK.md`.
 
 ## Changelog
 
+### 2026-08-03 — NeighborLoader sampled path closes the ENCODER_RELATION_IDS gap; stale fanout default fixed
+
+Follow-up to the entry below: the mini-batch/NeighborLoader path
+(`train_sampled`, `score_sampled`, `_make_neighbor_loader`, `_batch_inputs`
+in `src/hybrid_graphmcm_v3.py` — step-5 scale-migration code, **not yet
+called anywhere in production**, confirmed by repo-wide grep) was the one
+place the father_name/mother_name exclusion below hadn't reached, since it
+samples the graph independently of the full-batch path's edge builder.
+
+- **Why this matters even though nothing calls it today**: this is the code
+  path that *will* train the model once the system moves to 30–40 lakh
+  (3–4M) applications (`docs/IMPLEMENTATION.md` step 5) — a full-batch
+  forward/backward pass over millions of nodes doesn't fit in memory or a
+  reasonable step time, so training switches to sampling a bounded
+  neighborhood per node via PyG's `NeighborLoader` instead of loading the
+  whole graph every step. Left unfixed, the scale-up retrain would have
+  silently reintroduced `shares_father_name`/`shares_mother_name` into the
+  encoder — undoing today's finding at the exact point (larger population,
+  more shared surnames) where those relations would be *most* diffuse and
+  least informative.
+- `_make_neighbor_loader()` and `_batch_inputs()` both take a new
+  `relation_ids` param (default `ENCODER_RELATION_IDS`); the loader sets
+  fan-out to `[0, 0]` for excluded relations so `NeighborLoader` never
+  samples/materializes their neighbors, and `_batch_inputs` skips them again
+  as a second check. `train_sampled()`/`score_sampled()` pass
+  `relation_ids=ENCODER_RELATION_IDS` at all 3 call-site pairs.
+  `_global_edge_target()` is unchanged by design — it builds the
+  edge-*prediction* target (all 5 relations, matching the unchanged
+  5-relation edge-predictor head), not the encoder's input.
+- Verified end-to-end on the real 15k graph (smoke run, both fanout
+  settings): sampled-batch `edge_type` values only ever take `{0, 1, 4}`
+  across a full pass — `2`/`3` (father/mother-name) never leak through.
+- **Separate, pre-existing bug found and fixed in the same pass**: both
+  functions' `fanout` parameter defaulted to `(25, 10)` (truncated,
+  per-hop-capped sampling), but `docs/AGENTS.md` §7 records this as a
+  **CLOSED lead decision since 2026-07-21** — `docs/IMPLEMENTATION.md`
+  step 5's 1M-scale ablation found truncated fan-outs deviate from the
+  full-graph score by up to 0.44, while exact-neighborhood `(-1, -1)`
+  (sample every neighbor, no cap; memory-bounded by the hub cap instead) is
+  bit-equal to the full graph for this 2-layer RGCN. Defaults corrected to
+  `(-1, -1)`. `.claude/CLAUDE.md`'s Open Decisions list still named this as
+  open — corrected to match `AGENTS.md`.
+
 ### 2026-08-03 — Hybrid GraphMCM RGCN encoder drops father_name/mother_name edges (redlined, lead-approved)
 
 `shares_father_name`/`shares_mother_name` **excluded from what the Hybrid
