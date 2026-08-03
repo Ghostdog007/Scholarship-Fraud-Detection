@@ -1,0 +1,147 @@
+{
+  "_meta": {
+    "question": "do shares_father_name/shares_mother_name edges change connected-cluster PR-AUC?",
+    "status": "PROPOSED / PENDING \u2014 architecture (5 edge types) stays LOCKED until lead decision",
+    "topo_exposure": "OFF for both arms (fair internal control; not the production topo-ON baseline)",
+    "noise_floor": "\u00b10.03\u20130.04 (RGCN CUDA scatter-add); deltas within this are null (CPU-only here)",
+    "dropped_relations": [
+      "shares_father_name",
+      "shares_mother_name"
+    ],
+    "seeds_full": [
+      42,
+      43,
+      44
+    ],
+    "seeds_norelfm": [
+      42,
+      43,
+      44
+    ]
+  },
+  "full_mean": {
+    "AGE_VIOLATION": 0.17015342988835672,
+    "INCOME_VIOLATION": 0.24313849501154783,
+    "IP_CONCENTRATION": 0.4219470837018859,
+    "MOTHER_NAME_COLLISION": 0.8917920213927019,
+    "FEE_INFLATION": 0.3358222488325649,
+    "mean": 0.4125706557654114
+  },
+  "norelfm_mean": {
+    "AGE_VIOLATION": 0.24484275298075675,
+    "INCOME_VIOLATION": 0.1785496468072986,
+    "IP_CONCENTRATION": 0.35280935157566407,
+    "MOTHER_NAME_COLLISION": 0.9860368397346839,
+    "FEE_INFLATION": 0.33447188549919765,
+    "mean": 0.41934209531952016
+  },
+  "delta": {
+    "AGE_VIOLATION": 0.07468932309240003,
+    "INCOME_VIOLATION": -0.06458884820424923,
+    "IP_CONCENTRATION": -0.06913773212622182,
+    "MOTHER_NAME_COLLISION": 0.09424481834198206,
+    "FEE_INFLATION": -0.0013503633333672438,
+    "mean": 0.006771439554108749
+  },
+  "runs": [
+    {
+      "arm": "full",
+      "seed": 42,
+      "dropped_relations": [],
+      "topo_exposure": false,
+      "smoke": false,
+      "connected": {
+        "AGE_VIOLATION": 0.15445885474803792,
+        "INCOME_VIOLATION": 0.15093524130715774,
+        "IP_CONCENTRATION": 0.42883035009081405,
+        "MOTHER_NAME_COLLISION": 0.8278313073117727,
+        "FEE_INFLATION": 0.20984058264951708,
+        "mean": 0.3543792672214599
+      }
+    },
+    {
+      "arm": "full",
+      "seed": 43,
+      "dropped_relations": [],
+      "topo_exposure": false,
+      "smoke": false,
+      "connected": {
+        "AGE_VIOLATION": 0.1336366641502757,
+        "INCOME_VIOLATION": 0.3789200552682348,
+        "IP_CONCENTRATION": 0.49601533454276214,
+        "MOTHER_NAME_COLLISION": 0.999074968628458,
+        "FEE_INFLATION": 0.45566698959916563,
+        "mean": 0.4926628024377793
+      }
+    },
+    {
+      "arm": "full",
+      "seed": 44,
+      "dropped_relations": [],
+      "topo_exposure": false,
+      "smoke": false,
+      "connected": {
+        "AGE_VIOLATION": 0.2223647707667565,
+        "INCOME_VIOLATION": 0.1995601884592509,
+        "IP_CONCENTRATION": 0.3409955664720813,
+        "MOTHER_NAME_COLLISION": 0.8484697882378744,
+        "FEE_INFLATION": 0.34195917424901207,
+        "mean": 0.390669897636995
+      }
+    },
+    {
+      "arm": "norelfm",
+      "seed": 42,
+      "dropped_relations": [
+        "shares_father_name",
+        "shares_mother_name"
+      ],
+      "topo_exposure": false,
+      "smoke": false,
+      "connected": {
+        "AGE_VIOLATION": 0.09226517853850517,
+        "INCOME_VIOLATION": 0.09994478255164237,
+        "IP_CONCENTRATION": 0.5040190498407097,
+        "MOTHER_NAME_COLLISION": 0.9681435648694231,
+        "FEE_INFLATION": 0.18104758483962516,
+        "mean": 0.3690840321279811
+      }
+    },
+    {
+      "arm": "norelfm",
+      "seed": 43,
+      "dropped_relations": [
+        "shares_father_name",
+        "shares_mother_name"
+      ],
+      "topo_exposure": false,
+      "smoke": false,
+      "connected": {
+        "AGE_VIOLATION": 0.4633224070957944,
+        "INCOME_VIOLATION": 0.2670983099566453,
+        "IP_CONCENTRATION": 0.3147976894669348,
+        "MOTHER_NAME_COLLISION": 0.9901714304095006,
+        "FEE_INFLATION": 0.42748182712873395,
+        "mean": 0.49257433281152174
+      }
+    },
+    {
+      "arm": "norelfm",
+      "seed": 44,
+      "dropped_relations": [
+        "shares_father_name",
+        "shares_mother_name"
+      ],
+      "topo_exposure": false,
+      "smoke": false,
+      "connected": {
+        "AGE_VIOLATION": 0.17894067330797067,
+        "INCOME_VIOLATION": 0.16860584791360822,
+        "IP_CONCENTRATION": 0.2396113154193477,
+        "MOTHER_NAME_COLLISION": 0.9997955239251282,
+        "FEE_INFLATION": 0.39488624452923377,
+        "mean": 0.3963679210190577
+      }
+    }
+  ]
+}

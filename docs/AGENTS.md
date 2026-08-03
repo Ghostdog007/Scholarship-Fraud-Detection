@@ -1,5 +1,9 @@
 # AGENTS.md — V4-Scale Working Contract
 
+<!-- VERSION: 3.1 (2026-08-03 redline: Hybrid GraphMCM RGCN encoder restricted to
+     ENCODER_RELATION_IDS, dropping shares_father_name/shares_mother_name from
+     what the encoder trains/scores on; applied under explicit project-lead
+     direction — see .claude/CLAUDE.md hard stop #8) -->
 <!-- VERSION: 3.0 (V4-Scale rewrite, 2026-07-21, applied under explicit project-lead
      direction for branch V4-Scale — see .claude/CLAUDE.md hard stop #8) -->
 <!-- OWNER: Project Lead. Agents do not modify this file autonomously; flag and
@@ -29,14 +33,33 @@ Read order for a cold start:
 ```
 raw applications (PostgreSQL `applications` / today: data/raw CSV)
    → tabular_feature_engine_v3  : 44 numeric features, MinMax-scaled
-   → graph_builder_v3           : 5-relation identity graph
-       (shares_mobile, shares_ip, shares_father_name,
-        shares_mother_name, shares_pincode)
+   → graph_builder_v3           : 5-relation identity graph, still built/stored
+       in full (shares_mobile, shares_ip, shares_father_name,
+        shares_mother_name, shares_pincode) — used unrestricted by graph_viz_v3
+        (XAI rings) and dense_block_detector_v3
    → three FUSED detectors, all higher = more anomalous:
        hybrid_graphmcm_v3       : 8-mask feature stream + RGCN graph stream
                                   (root_weight=False since 2026-07-22 — pure
                                   neighbor aggregation, no self-leak around
-                                  the MCM mask)
+                                  the MCM mask). RGCN encoder itself trains/scores
+                                  on ENCODER_RELATION_IDS = shares_mobile,
+                                  shares_ip, shares_pincode ONLY since
+                                  2026-08-03 — shares_father_name/
+                                  shares_mother_name excluded (config_v3.py):
+                                  same dense diffuse-hub degree shape as the
+                                  already-rejected pincode dense-block relation
+                                  (mother_name mean degree 5.09, max 109,
+                                  touching 35.7% of nodes), no risk/normal
+                                  discrimination in locked-checkpoint post-hoc
+                                  relation ablation, and a 6-seed retrain-from-
+                                  scratch ablation never showed harm from
+                                  dropping them (consistently improved
+                                  MOTHER_NAME_COLLISION detection, 3/3 higher-
+                                  precision seeds). N_EDGE_TYPES stays 5
+                                  (architecture unchanged — relations 2/3 just
+                                  never populated for the encoder); full record:
+                                  outputs/ablation/relation_ablation_result.json,
+                                  src/ablation_relation_v3.py.
                                   → hybrid_anomaly_score
                                     = feature_pred_error + LAMBDA_EDGE_SCORE·edge_pred_error
                                     (LAMBDA_EDGE_SCORE=0.0 since 2026-07-23 —

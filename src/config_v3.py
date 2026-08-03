@@ -100,6 +100,24 @@ EDGE_TYPES = [
     "shares_pincode",
 ]
 
+# Relations (by EDGE_TYPES index) the Hybrid GraphMCM's RGCN encoder actually
+# trains/scores on -- 2026-08-03 redline: shares_father_name(2)/shares_mother_name(3)
+# excluded. Evidence: (1) real-15k structural degree stats show the same dense
+# diffuse-hub shape as the already-rejected shares_pincode dense-block relation
+# (mother_name mean degree 5.09, max 109, touching 35.7% of nodes -- vs mobile's
+# 0.9%/degree-5-max); (2) locked-checkpoint post-hoc relation-ablation deltas show
+# no risk/normal discrimination for these two relations (~1.0x ratio) vs mobile
+# (19x) and ip (2.2x); (3) 6-seed retrain-from-scratch ablation (2 cluster-density
+# settings) on the connected-cluster harness never showed harm from dropping them,
+# and consistently (3/3 higher-precision seeds) improved MOTHER_NAME_COLLISION
+# detection. See outputs/ablation/relation_ablation_result.json and
+# outputs/ablation/relation/*_seed4[567].json for the full record; src/ablation_relation_v3.py
+# for the method. The full 5-relation identity graph is still built and stored
+# (graph_builder_v3.py unchanged) -- these two relations remain available for XAI
+# rings (graph_viz_v3.py) and any future relation that needs them; only the
+# encoder's own edge consumption is restricted, via ENCODER_RELATION_IDS.
+ENCODER_RELATION_IDS = [0, 1, 4]  # shares_mobile, shares_ip, shares_pincode
+
 DEGREE_FEATURES = [
     "degree_shares_mobile",
     "degree_shares_ip",

@@ -1,0 +1,15 @@
+{
+  "arm": "full",
+  "seed": 46,
+  "dropped_relations": [],
+  "topo_exposure": false,
+  "smoke": false,
+  "connected": {
+    "AGE_VIOLATION": 0.2704555855554814,
+    "INCOME_VIOLATION": 0.3468964754642777,
+    "IP_CONCENTRATION": 0.38488565427085625,
+    "MOTHER_NAME_COLLISION": 0.9498863756908101,
+    "FEE_INFLATION": 0.41802956259157936,
+    "mean": 0.47403073071460095
+  }
+}

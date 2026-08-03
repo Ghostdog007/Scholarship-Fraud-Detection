@@ -97,6 +97,7 @@ def _score_hybrid(ckpt_path: Path, bundle: dict) -> pd.DataFrame:
         HybridGraphMCM, _build_edge_index_and_types, _compute_isolated_mask,
         compute_score_frame,
     )
+    from src.config_v3 import ENCODER_RELATION_IDS
 
     device = torch.device("cpu")
     ckpt = torch.load(ckpt_path, weights_only=False, map_location=device)
@@ -107,7 +108,7 @@ def _score_hybrid(ckpt_path: Path, bundle: dict) -> pd.DataFrame:
     x_all     = torch.tensor(feat_df[feat_cols].values, dtype=torch.float32).to(device)
     app_ids   = feat_df["application_id"].values
 
-    edge_index_list, edge_type_tensor = _build_edge_index_and_types(bundle["graph"], device)
+    edge_index_list, edge_type_tensor = _build_edge_index_and_types(bundle["graph"], device, relation_ids=ENCODER_RELATION_IDS)
     isolated_mask = _compute_isolated_mask(edge_index_list, x_all.shape[0], device)
 
     model = HybridGraphMCM().to(device)

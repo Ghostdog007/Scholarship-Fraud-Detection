@@ -306,6 +306,7 @@ def evaluate() -> dict[str, float]:
         _build_edge_index_and_types,
         _compute_isolated_mask,
     )
+    from src.config_v3 import ENCODER_RELATION_IDS
 
     print(f"\n{'='*60}")
     print("V3 Hybrid GraphMCM -- Evaluation")
@@ -322,7 +323,7 @@ def evaluate() -> dict[str, float]:
     feat_np = df[feat_cols].values.astype(np.float32)
 
     data = torch.load(GRAPH_PT, weights_only=False)
-    edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, DEVICE)
+    edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, DEVICE, relation_ids=ENCODER_RELATION_IDS)
     isolated_mask = _compute_isolated_mask(edge_index_list, x_all.shape[0], DEVICE)
 
     ckpt  = torch.load(MODEL_PTH, weights_only=False, map_location=DEVICE)
@@ -404,10 +405,11 @@ def evaluate_connected() -> dict[str, float]:
     """
     from src.hybrid_graphmcm_v3 import (
         HybridGraphMCM,
-        _build_edge_index_and_types,
+        build_fixed_slot_edge_index_list,
         _compute_isolated_mask,
         compute_score_frame,
     )
+    from src.config_v3 import ENCODER_RELATION_IDS
 
     print(f"\n{'='*60}")
     print("V4 Hybrid GraphMCM -- Connected Evaluation (T1)")
@@ -423,7 +425,7 @@ def evaluate_connected() -> dict[str, float]:
     n_real = x_real.shape[0]
 
     data = torch.load(GRAPH_PT, weights_only=False)
-    edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, DEVICE)
+    edge_index_list = build_fixed_slot_edge_index_list(data, DEVICE, relation_ids=ENCODER_RELATION_IDS)
 
     ckpt  = torch.load(MODEL_PTH, weights_only=False, map_location=DEVICE)
     model = HybridGraphMCM().to(DEVICE)

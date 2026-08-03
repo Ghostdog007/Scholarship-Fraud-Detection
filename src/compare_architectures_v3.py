@@ -48,11 +48,12 @@ from src.evaluate_model_v3 import (
 )
 import src.evaluate_model_v3 as eval_m
 from src.hybrid_graphmcm_v3 import (
-    HybridGraphMCM, _build_edge_index_and_types, _compute_isolated_mask,
+    HybridGraphMCM, build_fixed_slot_edge_index_list, _compute_isolated_mask,
     compute_score_frame, DEVICE,
 )
 from src.dense_block_detector_v3 import dense_block_scores
 from src.fusion_classifier_v3 import score_level_fusion
+from src.config_v3 import ENCODER_RELATION_IDS
 
 # RELATION_MAP is defined *inside* evaluate_connected() (not module-level), so we
 # replicate it here. Keep in sync with evaluate_model_v3.
@@ -238,7 +239,11 @@ def run_comparison():
     cat_order = list(INJECTION_FNS)
 
     data = torch.load(Path("data/processed/identity_graph_v3.pt"), weights_only=False)
-    base_edge_index_list, base_edge_type_tensor = _build_edge_index_and_types(data, DEVICE)
+    base_edge_index_list = build_fixed_slot_edge_index_list(data, DEVICE, relation_ids=ENCODER_RELATION_IDS)
+    base_edge_type_tensor = torch.cat([
+        torch.full((ei.shape[1],), r, dtype=torch.long, device=DEVICE)
+        for r, ei in enumerate(base_edge_index_list) if ei.shape[1] > 0
+    ]) if any(ei.shape[1] > 0 for ei in base_edge_index_list) else torch.zeros(0, dtype=torch.long, device=DEVICE)
 
     out_json = {}
 

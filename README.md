@@ -595,6 +595,68 @@ screen-by-screen operator walkthrough see `docs/OPERATIONS_RUNBOOK.md`.
 
 ## Changelog
 
+### 2026-08-03 — Hybrid GraphMCM RGCN encoder drops father_name/mother_name edges (redlined, lead-approved)
+
+`shares_father_name`/`shares_mother_name` **excluded from what the Hybrid
+GraphMCM's RGCN encoder trains/scores on**. `graph_builder_v3.py` is
+unchanged — the full 5-relation identity graph is still built and stored,
+and both relations remain available to `graph_viz_v3.py` (XAI 3D rings) and
+`dense_block_detector_v3.py` (unaffected either way — it only ever reads
+mobile/ip).
+
+Evidence (session log, full record in
+`outputs/ablation/relation_ablation_result.json` and
+`src/ablation_relation_v3.py`):
+- **Structural** (real 15k population, no retrain): both relations form
+  large diffuse hubs, the same shape as the already-rejected dense-block
+  `pincode` relation — `shares_mother_name` mean degree 5.09, max 109,
+  touching 35.7% of nodes; `shares_father_name` mean degree 1.22, max 35,
+  touching 23.2% — vs. `shares_mobile`'s 0.9% of nodes / max degree 5.
+- **Behavioral** (locked checkpoint, post-hoc `compute_relation_ablation()`):
+  neither relation separated the top-5%-risk population from the rest
+  (~1.0x ratio), unlike `shares_mobile` (19x) and `shares_ip` (2.2x).
+- **Retrain-based** (6 fresh RGCN trainings, 2 injected-cluster-density
+  settings, seeds 42–47): dropping the two relations never showed harm on
+  the connected-cluster harness, and consistently improved
+  `MOTHER_NAME_COLLISION` detection in all 3 higher-precision-setting seeds
+  (+0.042, +0.050, +0.018 PR-AUC).
+
+Implementation:
+- `src/config_v3.py`: new `ENCODER_RELATION_IDS = [0, 1, 4]` (mobile/ip/
+  pincode) — `N_EDGE_TYPES` stays **5**, architecture unchanged; relations
+  2/3 are simply never populated for the encoder.
+- `src/hybrid_graphmcm_v3.py`: `_build_edge_index_and_types()` takes an
+  optional `relation_ids` filter (default `None` = unrestricted, so
+  `graph_viz_v3`/`dense_block_detector_v3` callers are unaffected); the
+  Hybrid GraphMCM's own consumption points (`train()`, `load_model_and_inputs()`
+  used by `score()`/`compute_relation_ablation()`/`attention_summary`,
+  `train_incremental()`, `_get_synth_h_topology()`'s per-relation exposure
+  grouping, `score_sampled()`/`train_sampled()`) now all pass
+  `relation_ids=ENCODER_RELATION_IDS`. New `build_fixed_slot_edge_index_list()`
+  helper (always returns a length-5 list, empty tensor for excluded/empty
+  relations) fixes a **latent positional-indexing bug** this change would
+  otherwise have exposed: `evaluate_model_v3.evaluate_connected()` and
+  `compare_architectures_v3.py`'s synthetic-cluster injection index the base
+  edge list by `RELATION_MAP[category]` (a fixed relation id, e.g.
+  `MOTHER_NAME_COLLISION: 3`) — `_build_edge_index_and_types()`'s compaction
+  (skips empty relations from the returned list) silently misaligned that
+  positional assumption once a relation had zero real edges; both files now
+  use the fixed-slot builder for their base edge list.
+- `src/evaluate_model_v3.py`, `src/compare_architectures_v3.py`,
+  `src/deploy_gate.py` updated so evaluation/deploy-gate scoring stays
+  consistent with what the retrained model actually consumes.
+- **Known gap**: the NeighborLoader mini-batch path (`train_sampled`,
+  `_make_neighbor_loader`, `_batch_inputs` — step-5 scale work, not yet used
+  in production) still samples all 5 relations per-batch and is not yet
+  wired to `ENCODER_RELATION_IDS`; flag before that path goes live.
+- Production checkpoint (`models/hybrid_graphmcm_v3.pth`) retrained end-to-end
+  (80+120 epochs, topology-exposure ON, production seed) with the new
+  encoder restriction; `compute_relation_ablation()` re-run on the retrained
+  checkpoint confirms `shares_father_name`/`shares_mother_name` deltas are
+  now ~0.000000 (never in the encoder's input), while `shares_mobile`/
+  `shares_ip`/`shares_pincode` retain real deltas.
+- `docs/AGENTS.md` §1 redlined to match (version 3.1).
+
 ### 2026-07-23 — CSV-free portal/ETL push endpoint (auto-preprocess, no auto-merge/retrain)
 
 `POST /v3/monitoring/push-dataset` (new, `src/api/handlers/monitoring.py`):

@@ -58,6 +58,7 @@ from src.config_v3 import (
     ATTN_LEAKY_SLOPE,
     SEMANTIC_ATTN_HIDDEN,
     TOPO_EXPOSURE_ENABLED,
+    ENCODER_RELATION_IDS,
 )
 
 torch.manual_seed(RANDOM_SEED)
@@ -398,10 +399,24 @@ class HybridGraphMCM(nn.Module):
 # Data helpers
 # ---------------------------------------------------------------------------
 
-def _build_edge_index_and_types(data, device: torch.device) -> tuple[list, torch.Tensor]:
+def _build_edge_index_and_types(
+    data, device: torch.device, relation_ids: list[int] | None = None
+) -> tuple[list, torch.Tensor]:
+    """relation_ids: if given, only these EDGE_TYPES indices are read from `data`
+    -- everything else is skipped as if absent (used to restrict what the Hybrid
+    GraphMCM encoder itself consumes, e.g. ENCODER_RELATION_IDS, while `data` /
+    the stored identity graph keeps ALL relations for other consumers such as
+    graph_viz_v3 rings and dense_block_detector_v3, which call this same
+    function unfiltered). Positional list order is not meaningful to callers --
+    only edge_type_ids (the true relation id, unaffected by any skip/compaction
+    here) is; see hybrid_graphmcm_v3 docstring at _build_edge_index_and_types call
+    sites and dense_block_detector_v3.py's own by-index reads of mobile/ip, which
+    always occupy positions 0/1 regardless of any later relation being skipped."""
     edge_index_list = []
     edge_type_ids   = []
     for rel_id, edge_type in enumerate(data.edge_types):
+        if relation_ids is not None and rel_id not in relation_ids:
+            continue
         ei = data[edge_type].edge_index.to(device)
         if ei.shape[1] > 0:
             edge_index_list.append(ei)
@@ -413,6 +428,28 @@ def _build_edge_index_and_types(data, device: torch.device) -> tuple[list, torch
         edge_type_tensor = torch.zeros(0, dtype=torch.long, device=device)
 
     return edge_index_list, edge_type_tensor
+
+
+def build_fixed_slot_edge_index_list(
+    data, device: torch.device, relation_ids: list[int] | None = None
+) -> list:
+    """Like _build_edge_index_and_types but ALWAYS returns a list of length
+    N_EDGE_TYPES (one entry per relation, empty (2,0) tensor for relations with
+    no real edges or excluded by relation_ids) so callers that index by relation
+    id positionally -- e.g. evaluate_model_v3.evaluate_connected()'s and
+    compare_architectures_v3.py's RELATION_MAP-driven synthetic-cluster
+    injection, which does eval_edge_index_list[rel_idx] -- stay correct even
+    when ENCODER_RELATION_IDS excludes some relations. _build_edge_index_and_types
+    compacts (skips empty/excluded relations from the list), which silently
+    breaks that positional assumption once a relation the harness wants to
+    inject into (e.g. rel 3 = shares_mother_name) has no real edges."""
+    out = []
+    for rel_id, edge_type in enumerate(data.edge_types):
+        if relation_ids is not None and rel_id not in relation_ids:
+            out.append(torch.zeros((2, 0), dtype=torch.long, device=device))
+            continue
+        out.append(data[edge_type].edge_index.to(device))
+    return out
 
 
 def _compute_isolated_mask(edge_index_list: list, n_nodes: int, device: torch.device) -> torch.Tensor:
@@ -580,7 +617,7 @@ def load_model_and_inputs(device: torch.device = DEVICE):
     _check_shape(x_all, (None, N_FEATURES), "x_all")
 
     data = torch.load(GRAPH_PT, weights_only=False)
-    edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, device)
+    edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, device, relation_ids=ENCODER_RELATION_IDS)
     isolated_mask = _compute_isolated_mask(edge_index_list, x_all.shape[0], device)
 
     ckpt  = torch.load(MODEL_PTH, weights_only=False, map_location=device)
@@ -719,7 +756,7 @@ def _get_synth_h_topology(
     edge_index_list = []
     grouped_types = []
     for r in range(N_EDGE_TYPES):
-        mask = edge_type == r
+        mask = (edge_type == r) if r in ENCODER_RELATION_IDS else torch.zeros_like(edge_type, dtype=torch.bool)
         if mask.any():
             ei_r = edge_index[:, mask]
             edge_index_list.append(ei_r)
@@ -755,7 +792,7 @@ def train(smoke_test: bool = False) -> None:
     if TOPO_EXPOSURE_ENABLED:
         topo_pack = torch.load(TOPO_PT, weights_only=False)
 
-    edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, DEVICE)
+    edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, DEVICE, relation_ids=ENCODER_RELATION_IDS)
     isolated_mask = _compute_isolated_mask(edge_index_list, x_all.shape[0], DEVICE)
     print(f"[hybrid] Isolated nodes: {isolated_mask.sum().item()} / {x_all.shape[0]}")
 
@@ -950,7 +987,7 @@ def score_sampled(fanout: tuple[int, int] = (25, 10), batch_size: int = 1024,
         x_override = torch.tensor(_df[_cols].values, dtype=torch.float32)
     data["application"].x = x_override
     n_nodes = data["application"].x.shape[0]
-    full_eil, _ = _build_edge_index_and_types(data, torch.device("cpu"))
+    full_eil, _ = _build_edge_index_and_types(data, torch.device("cpu"), relation_ids=ENCODER_RELATION_IDS)
     iso_global = _compute_isolated_mask(full_eil, n_nodes, torch.device("cpu"))
     target_global = _global_edge_target(data, n_nodes)
 
@@ -1000,7 +1037,7 @@ def train_sampled(data, x_synth, topo_pack, fanout: tuple[int, int] = (25, 10),
     import time as _time
     torch.manual_seed(seed)
     n_nodes = data["application"].x.shape[0]
-    full_eil, _ = _build_edge_index_and_types(data, torch.device("cpu"))
+    full_eil, _ = _build_edge_index_and_types(data, torch.device("cpu"), relation_ids=ENCODER_RELATION_IDS)
     iso_global = _compute_isolated_mask(full_eil, n_nodes, torch.device("cpu"))
     target_global = _global_edge_target(data, n_nodes)
 
@@ -1108,7 +1145,7 @@ def train_incremental(
         exposure_tensor = torch.load(EXPOSURE_PT, weights_only=True)
     x_exposure = exposure_tensor.to(DEVICE)
 
-    edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, DEVICE)
+    edge_index_list, edge_type_tensor = _build_edge_index_and_types(data, DEVICE, relation_ids=ENCODER_RELATION_IDS)
     isolated_mask = _compute_isolated_mask(edge_index_list, x_all.shape[0], DEVICE)
 
     # Load existing weights

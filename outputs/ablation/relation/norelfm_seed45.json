@@ -1,0 +1,18 @@
+{
+  "arm": "norelfm",
+  "seed": 45,
+  "dropped_relations": [
+    "shares_father_name",
+    "shares_mother_name"
+  ],
+  "topo_exposure": false,
+  "smoke": false,
+  "connected": {
+    "AGE_VIOLATION": 0.24165422813545165,
+    "INCOME_VIOLATION": 0.27413345540811,
+    "IP_CONCENTRATION": 0.4884119578870124,
+    "MOTHER_NAME_COLLISION": 0.9997088220897216,
+    "FEE_INFLATION": 0.37857748391282736,
+    "mean": 0.4764971894866246
+  }
+}
